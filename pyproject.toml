@@ -1,0 +1,20 @@
+[project]
+name = "boomer"
+version = "0.1.0"
+description = "Flame-backed latent text-to-image research project"
+requires-python = ">=3.10"
+dependencies = [
+  "accelerate",
+  "datasets",
+  "diffusers",
+  "pillow",
+  "safetensors",
+  "sentencepiece",
+  "torch",
+  "torchvision",
+  "transformers",
+  "webdataset",
+]
+
+[tool.setuptools.packages.find]
+include = ["boomer*"]

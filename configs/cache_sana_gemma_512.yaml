@@ -1,0 +1,19 @@
+resolution: 512
+vae:
+  type: AutoencoderDC
+  pretrained: mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers
+  scaling_factor: 0.41407
+text_encoder:
+  type: gemma4
+  pretrained: google/gemma-4-E2B-it
+  max_length: 300
+precision:
+  dtype: bf16
+cache:
+  format: torch_pt
+  fields:
+    - image_latent
+    - text_embedding
+    - attention_mask
+    - caption
+    - metadata
