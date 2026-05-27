@@ -267,6 +267,62 @@ def test_boomer_fla_dit_sana_cross_attention_forward() -> None:
     assert out.shape == latent.shape
 
 
+def test_boomer_fla_parallel_coord_dual_stream_forward() -> None:
+    config = BoomerFLADiTConfig(
+        hidden_dim=64,
+        depth=3,
+        num_heads=4,
+        mlp_ratio=2.0,
+        mixer_type="fallback",
+        cross_attention_backend="sdpa",
+        cross_attention_qk_norm=True,
+        parallel_block=True,
+        dual_stream_depth=2,
+        multimodal_coord_ids=True,
+        use_abs_pos_embed=False,
+    )
+    model = create_model(config)
+
+    assert model.coord_embedder is not None
+    assert getattr(model.blocks[0], "updates_text", False)
+    assert getattr(model.blocks[1], "updates_text", False)
+    assert not getattr(model.blocks[2], "updates_text", False)
+
+    latent = torch.randn(2, 32, 16, 16)
+    timesteps = torch.tensor([0.25, 0.75])
+    text = torch.randn(2, 300, 1536)
+    mask = torch.ones(2, 300)
+    mask[1, 240:] = 0
+    out = model(latent, timesteps, text, mask)
+    assert out.shape == latent.shape
+
+    wide_latent = torch.randn(2, 32, 16, 24)
+    out = model(wide_latent, timesteps, text, mask)
+    assert out.shape == wide_latent.shape
+
+
+def test_boomer_fla_patchifier_forward_unpatches_to_latent_shape() -> None:
+    config = BoomerFLADiTConfig(
+        hidden_dim=64,
+        depth=2,
+        num_heads=4,
+        mlp_ratio=2.0,
+        mixer_type="fallback",
+        cross_attention_backend="sdpa",
+        patch_size=2,
+        use_abs_pos_embed=False,
+    )
+    model = create_model(config)
+
+    latent = torch.randn(2, 32, 16, 16)
+    timesteps = torch.tensor([0.25, 0.75])
+    text = torch.randn(2, 300, 1536)
+    mask = torch.ones(2, 300)
+    out = model(latent, timesteps, text, mask)
+    assert out.shape == latent.shape
+    assert model.out_proj.out_features == 32 * 2 * 2
+
+
 def test_boomer_fla_adaln_gaussian_initialization_keeps_output_head_zero() -> None:
     config = BoomerFLADiTConfig(
         hidden_dim=64,
@@ -280,15 +336,20 @@ def test_boomer_fla_adaln_gaussian_initialization_keeps_output_head_zero() -> No
     )
     model = create_model(config)
 
-    assert model.t_block[1].weight.std().item() > 0.0
-    assert torch.all(model.t_block[1].bias == 0)
     assert torch.all(model.final_t_block[1].weight == 0)
     assert torch.all(model.final_t_block[1].bias == 0)
     assert torch.all(model.out_proj.weight == 0)
     assert torch.all(model.out_proj.bias == 0)
     for block in model.blocks:
+        assert torch.all(block.mod[1].weight == 0)
+        assert torch.all(block.mod[1].bias == 0)
+        assert block.scale_shift_table.shape[0] == 9
         assert block.scale_shift_table.std().item() > 0.0
+        assert isinstance(block.norm3, torch.nn.LayerNorm)
+        assert torch.all(block.mlp.point_conv.conv.weight == 0)
         if block.use_image_attention:
+            assert torch.all(block.image_attn_mod[1].weight == 0)
+            assert torch.all(block.image_attn_mod[1].bias == 0)
             assert block.image_attn_scale_shift_table.std().item() > 0.0
 
     latent = torch.randn(2, 32, 16, 16)
@@ -317,14 +378,15 @@ def test_boomer_fla_cross_qk_norm_rejects_mha_backend() -> None:
         raise AssertionError("expected ValueError when qk_norm is enabled with mha backend")
 
 
-def test_fla_bidirectional_mixer_runs_forward_and_reverse_with_shared_weights() -> None:
+def test_fla_bidirectional_mixer_runs_forward_and_reverse_with_separate_layers() -> None:
     class DummyCausalMixer(torch.nn.Module):
         def forward(self, x: torch.Tensor) -> torch.Tensor:
             return x.cumsum(dim=1)
 
     mixer = FLASelfMixer.__new__(FLASelfMixer)
     torch.nn.Module.__init__(mixer)
-    mixer.mixer = DummyCausalMixer()
+    mixer.mixer_fwd = DummyCausalMixer()
+    mixer.mixer_bwd = DummyCausalMixer()
     mixer.bidirectional = True
 
     x = torch.arange(1, 5, dtype=torch.float32).reshape(1, 4, 1)

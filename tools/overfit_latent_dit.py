@@ -210,9 +210,19 @@ def build_model_config(args: argparse.Namespace, sample_record: Any, resume_chec
         if (
             getattr(args, "resume_weights_only", False)
             and isinstance(config, BoomerFLADiTConfig)
-            and getattr(args, "fla_bidirectional", False)
         ):
-            updates["fla_bidirectional"] = True
+            if getattr(args, "fla_bidirectional", False):
+                updates["fla_bidirectional"] = True
+            if getattr(args, "parallel_block", False):
+                updates["parallel_block"] = True
+            if getattr(args, "multimodal_coord_ids", False):
+                updates["multimodal_coord_ids"] = True
+            if getattr(args, "dual_stream_depth", 0) > 0:
+                updates["dual_stream_depth"] = int(args.dual_stream_depth)
+            if not getattr(args, "abs_pos_embed", True):
+                updates["use_abs_pos_embed"] = False
+            if getattr(args, "patch_size", config.patch_size) != config.patch_size:
+                updates["patch_size"] = int(args.patch_size)
         if "y_norm" in train_args and not getattr(config, "y_norm", False):
             updates["y_norm"] = bool(train_args["y_norm"])
         if "y_norm_scale_factor" in train_args:
@@ -270,6 +280,11 @@ def build_model_config(args: argparse.Namespace, sample_record: Any, resume_chec
             image_rope_theta=args.image_rope_theta,
             cross_attention_backend=args.cross_attn_backend,
             cross_attention_qk_norm=args.cross_attn_qk_norm,
+            parallel_block=args.parallel_block,
+            dual_stream_depth=args.dual_stream_depth,
+            multimodal_coord_ids=args.multimodal_coord_ids,
+            use_abs_pos_embed=args.abs_pos_embed,
+            patch_size=args.patch_size,
         )
 
     return LatentDiTConfig(
@@ -765,6 +780,36 @@ def main() -> None:
         help="Use Sana-style q/k RMSNorm inside BoomerFLA text cross-attention.",
     )
     parser.add_argument(
+        "--parallel-block",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use FLUX/SD3-style parallel residual branches inside BoomerFLA blocks.",
+    )
+    parser.add_argument(
+        "--dual-stream-depth",
+        type=int,
+        default=0,
+        help="Number of early BoomerFLA blocks that update both image and text streams.",
+    )
+    parser.add_argument(
+        "--multimodal-coord-ids",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Add explicit image/text token-type and coordinate embeddings.",
+    )
+    parser.add_argument(
+        "--abs-pos-embed",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use learned absolute latent-token positional embeddings. Disable with --no-abs-pos-embed for RoPE-only variable-size runs.",
+    )
+    parser.add_argument(
+        "--patch-size",
+        type=int,
+        default=1,
+        help="Latent patch size for BoomerFLA ViT patchification. Use 2 for 64x64 f16 latents to reduce sequence length to 32x32.",
+    )
+    parser.add_argument(
         "--cond-dropout",
         type=float,
         default=0.0,
@@ -1025,6 +1070,12 @@ def main() -> None:
         parser.error("--text-attn-every and --anchor-attn-every must be non-negative.")
     if args.image_attn_every < 0:
         parser.error("--image-attn-every must be non-negative.")
+    if args.dual_stream_depth < 0:
+        parser.error("--dual-stream-depth must be non-negative.")
+    if args.dual_stream_depth > args.depth:
+        parser.error("--dual-stream-depth must be <= --depth.")
+    if args.patch_size <= 0:
+        parser.error("--patch-size must be positive.")
     if args.image_rope_theta <= 0.0:
         parser.error("--image-rope-theta must be positive.")
     if args.mamba_d_state <= 0 or args.mamba_headdim <= 0 or args.mamba_chunk_size <= 0:
@@ -1193,6 +1244,11 @@ def main() -> None:
         f"wds_rolling_shards={args.wds_rolling_shards if args.cache_wds else 'n/a'} "
         f"wds_local_dir={args.wds_local_dir if args.cache_wds else 'n/a'} "
         f"seed={args.seed} cond_dropout={args.cond_dropout} fused_adamw={args.fused_adamw} "
+        f"parallel_block={getattr(config, 'parallel_block', False)} "
+        f"dual_stream_depth={getattr(config, 'dual_stream_depth', 0)} "
+        f"multimodal_coord_ids={getattr(config, 'multimodal_coord_ids', False)} "
+        f"abs_pos_embed={getattr(config, 'use_abs_pos_embed', True)} "
+        f"patch_size={getattr(config, 'patch_size', 1)} "
         f"ema_decay={args.ema_decay} ema_update_every={args.ema_update_every} "
         f"t_sampler={args.t_sampler} t_bias={args.t_bias} flow_shift={args.flow_shift} "
         f"logit_mean={args.logit_mean} logit_std={args.logit_std} "

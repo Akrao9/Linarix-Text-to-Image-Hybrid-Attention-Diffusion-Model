@@ -40,6 +40,10 @@ class BoomerFLADiTConfig:
     image_rope_theta: float = 10000.0
     cross_attention_backend: str = "sdpa"
     cross_attention_qk_norm: bool = True
+    parallel_block: bool = False
+    dual_stream_depth: int = 0
+    multimodal_coord_ids: bool = False
+    use_abs_pos_embed: bool = True
     patch_size: int = 1
 
 
@@ -106,6 +110,7 @@ class GLUMBConv(nn.Module):
         self.inverted_conv = ConvLayer(hidden_dim, inner_dim * 2, 1, bias=True, act="silu")
         self.depth_conv = ConvLayer(inner_dim * 2, inner_dim * 2, 3, groups=inner_dim * 2, bias=True)
         self.point_conv = ConvLayer(inner_dim, hidden_dim, 1, bias=False)
+        nn.init.zeros_(self.point_conv.conv.weight)
         self.glu_act = nn.SiLU()
 
     def forward(self, x: torch.Tensor, *, height: int, width: int) -> torch.Tensor:
@@ -128,6 +133,93 @@ class TorchSelfAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.attn(x, x, x, need_weights=False)[0]
+
+
+class TokenMLP(nn.Module):
+    def __init__(self, hidden_dim: int, mlp_ratio: float) -> None:
+        super().__init__()
+        inner_dim = int(hidden_dim * mlp_ratio)
+        self.net = nn.Sequential(
+            nn.Linear(hidden_dim, inner_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(inner_dim, hidden_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class MultimodalCoordinateRoPE(nn.Module):
+    """FLUX-style coordinate-ID RoPE for joint text/image attention."""
+
+    def __init__(self, head_dim: int, *, image_size: int, text_seq_len: int, theta: float = 10000.0) -> None:
+        super().__init__()
+        if head_dim < 6 or head_dim % 2 != 0:
+            raise ValueError(f"head_dim={head_dim} must be even and at least 6 for multimodal RoPE")
+        if theta <= 0.0:
+            raise ValueError(f"theta must be positive, got {theta}")
+        type_dim = max(2, (head_dim // 4) // 2 * 2)
+        while type_dim > 2 and (head_dim - type_dim) % 4 != 0:
+            type_dim -= 2
+        remaining = head_dim - type_dim
+        row_dim = max(2, (remaining // 2) // 2 * 2)
+        col_dim = remaining - row_dim
+        if col_dim < 2 or col_dim % 2 != 0:
+            raise ValueError(f"could not split head_dim={head_dim} into even multimodal RoPE axes")
+        self.axes_dim = (type_dim, row_dim, col_dim)
+        self.head_dim = head_dim
+        self.image_size = image_size
+        self.text_seq_len = text_seq_len
+
+        for index, dim in enumerate(self.axes_dim):
+            inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+            self.register_buffer(f"inv_freq_{index}", inv_freq, persistent=False)
+
+    @staticmethod
+    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+        x1, x2 = x.chunk(2, dim=-1)
+        return torch.cat((-x2, x1), dim=-1)
+
+    def image_ids(self, batch_size: int, *, height: int, width: int, device: torch.device | str) -> torch.Tensor:
+        token_idx = torch.arange(height * width, device=device)
+        rows = token_idx // width
+        cols = token_idx % width
+        token_type = torch.ones_like(rows)
+        ids = torch.stack([token_type, rows, cols], dim=-1)
+        return ids.unsqueeze(0).expand(batch_size, -1, -1)
+
+    def text_ids(self, batch_size: int, token_count: int, *, device: torch.device | str) -> torch.Tensor:
+        positions = torch.arange(token_count, device=device)
+        token_type = torch.zeros_like(positions)
+        zeros = torch.zeros_like(positions)
+        ids = torch.stack([token_type, positions, zeros], dim=-1)
+        return ids.unsqueeze(0).expand(batch_size, -1, -1)
+
+    def _axis_apply(self, x: torch.Tensor, axis_ids: torch.Tensor, axis_index: int) -> torch.Tensor:
+        inv_freq = getattr(self, f"inv_freq_{axis_index}")
+        angles = axis_ids.float().unsqueeze(-1) * inv_freq.to(device=x.device).view(1, 1, -1)
+        cos = torch.cat([angles.cos(), angles.cos()], dim=-1).unsqueeze(2).to(dtype=x.dtype)
+        sin = torch.cat([angles.sin(), angles.sin()], dim=-1).unsqueeze(2).to(dtype=x.dtype)
+        return x * cos + self._rotate_half(x) * sin
+
+    def apply(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if q.shape[-1] != self.head_dim or k.shape[-1] != self.head_dim:
+            raise ValueError(f"expected head_dim={self.head_dim}, got q={q.shape[-1]} k={k.shape[-1]}")
+        if ids.shape[:2] != q.shape[:2] or ids.shape[-1] != len(self.axes_dim):
+            raise ValueError(f"expected ids shape (B, T, {len(self.axes_dim)}), got {tuple(ids.shape)}")
+        q_chunks = q.split(self.axes_dim, dim=-1)
+        k_chunks = k.split(self.axes_dim, dim=-1)
+        q_out = []
+        k_out = []
+        for index, (q_axis, k_axis) in enumerate(zip(q_chunks, k_chunks, strict=True)):
+            q_out.append(self._axis_apply(q_axis, ids[..., index], index))
+            k_out.append(self._axis_apply(k_axis, ids[..., index], index))
+        return torch.cat(q_out, dim=-1), torch.cat(k_out, dim=-1)
 
 
 class RoPE2D(nn.Module):
@@ -486,38 +578,42 @@ class FLASelfMixer(nn.Module):
 
         hidden_dim = config.hidden_dim
         self.bidirectional = config.fla_bidirectional
-        if config.mixer_type == "fla_linear":
-            self.mixer = fla_layers.LinearAttention(
-                hidden_size=hidden_dim,
-                num_heads=config.num_heads,
-                mode=config.fla_mode,
-                feature_map=config.fla_feature_map,
-                output_norm="rmsnorm",
-                layer_idx=layer_idx,
-            )
-        elif config.mixer_type == "fla_gated_deltanet":
-            self.mixer = fla_layers.GatedDeltaNet(
-                hidden_size=hidden_dim,
-                num_heads=config.num_heads,
-                head_dim=hidden_dim // config.num_heads,
-                expand_v=1,
-                mode=config.fla_mode,
-                use_short_conv=config.use_short_conv,
-                conv_size=config.conv_size,
-                layer_idx=layer_idx,
-            )
-        elif config.mixer_type == "fla_gla":
-            self.mixer = fla_layers.GatedLinearAttention(
-                hidden_size=hidden_dim,
-                num_heads=config.num_heads,
-                mode=config.fla_mode,
-                feature_map=config.fla_feature_map,
-                use_short_conv=config.use_short_conv,
-                conv_size=config.conv_size,
-                layer_idx=layer_idx,
-            )
-        else:
+
+        def make_mixer() -> nn.Module:
+            if config.mixer_type == "fla_linear":
+                return fla_layers.LinearAttention(
+                    hidden_size=hidden_dim,
+                    num_heads=config.num_heads,
+                    mode=config.fla_mode,
+                    feature_map=config.fla_feature_map,
+                    output_norm="rmsnorm",
+                    layer_idx=layer_idx,
+                )
+            if config.mixer_type == "fla_gated_deltanet":
+                return fla_layers.GatedDeltaNet(
+                    hidden_size=hidden_dim,
+                    num_heads=config.num_heads,
+                    head_dim=hidden_dim // config.num_heads,
+                    expand_v=1,
+                    mode=config.fla_mode,
+                    use_short_conv=config.use_short_conv,
+                    conv_size=config.conv_size,
+                    layer_idx=layer_idx,
+                )
+            if config.mixer_type == "fla_gla":
+                return fla_layers.GatedLinearAttention(
+                    hidden_size=hidden_dim,
+                    num_heads=config.num_heads,
+                    mode=config.fla_mode,
+                    feature_map=config.fla_feature_map,
+                    use_short_conv=config.use_short_conv,
+                    conv_size=config.conv_size,
+                    layer_idx=layer_idx,
+                )
             raise ValueError(f"Unsupported FLA mixer_type: {config.mixer_type}")
+
+        self.mixer_fwd = make_mixer()
+        self.mixer_bwd = make_mixer() if self.bidirectional else None
 
     @staticmethod
     def _run_mixer(mixer: nn.Module, x: torch.Tensor) -> torch.Tensor:
@@ -527,10 +623,12 @@ class FLASelfMixer(nn.Module):
         return y
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self._run_mixer(self.mixer, x)
+        y = self._run_mixer(self.mixer_fwd, x)
         if not self.bidirectional:
             return y
-        y_rev = self._run_mixer(self.mixer, x.flip(1)).flip(1)
+        if self.mixer_bwd is None:
+            raise RuntimeError("bidirectional FLASelfMixer is missing the backward mixer")
+        y_rev = self._run_mixer(self.mixer_bwd, x.flip(1)).flip(1)
         return 0.5 * (y + y_rev)
 
 
@@ -538,6 +636,7 @@ class BoomerFLABlock(nn.Module):
     def __init__(self, config: BoomerFLADiTConfig, *, layer_idx: int) -> None:
         super().__init__()
         hidden_dim = config.hidden_dim
+        self.parallel_block = config.parallel_block
         self.use_image_attention = (
             config.image_attention_every > 0 and (layer_idx + 1) % config.image_attention_every == 0
         )
@@ -548,11 +647,12 @@ class BoomerFLABlock(nn.Module):
             self.self_attn = FLASelfMixer(config, layer_idx=layer_idx)
         if self.use_image_attention:
             self.image_attn_norm = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
+            self.image_attn_mod = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 3))
             self.image_attn = FullImageSelfAttention(
                 hidden_dim,
                 config.num_heads,
                 backend=config.image_attention_backend,
-                grid_size=config.latent_size,
+                grid_size=config.latent_size // config.patch_size,
                 rope=config.image_attention_rope,
                 rope_theta=config.image_rope_theta,
             )
@@ -572,42 +672,249 @@ class BoomerFLABlock(nn.Module):
                 backend=cross_backend,
                 qk_norm=config.cross_attention_qk_norm,
             )
+        self.mod = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 9))
         self.norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
+        self.norm3 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
         self.mlp = GLUMBConv(hidden_dim, config.mlp_ratio)
-        self.scale_shift_table = nn.Parameter(torch.zeros(6, hidden_dim))
+        self.scale_shift_table = nn.Parameter(torch.zeros(9, hidden_dim))
 
-    def forward(
+    def _cross_attention(
         self,
         x: torch.Tensor,
         text_tokens: torch.Tensor,
-        timestep_mod: torch.Tensor,
         text_key_padding_mask: torch.Tensor,
         text_attn_bias: torch.Tensor | None,
-        *,
-        height: int,
-        width: int,
     ) -> torch.Tensor:
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            self.scale_shift_table[None] + timestep_mod.reshape(x.shape[0], 6, -1)
-        ).chunk(6, dim=1)
-        x = x + gate_msa * self.self_attn(modulate(self.norm1(x), shift_msa, scale_msa))
-        if self.use_image_attention:
-            shift_img, scale_img, gate_img = (
-                self.image_attn_scale_shift_table[None] + timestep_mod.reshape(x.shape[0], 6, -1)[:, :3]
-            ).chunk(3, dim=1)
-            x = x + gate_img * self.image_attn(modulate(self.image_attn_norm(x), shift_img, scale_img))
         if isinstance(self.cross_attn, nn.MultiheadAttention):
-            x = x + self.cross_attn(
+            return self.cross_attn(
                 x,
                 text_tokens,
                 text_tokens,
                 key_padding_mask=text_key_padding_mask,
                 need_weights=False,
             )[0]
-        else:
-            x = x + self.cross_attn(x, text_tokens, text_key_padding_mask, text_attn_bias)
+        return self.cross_attn(x, text_tokens, text_key_padding_mask, text_attn_bias)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        text_tokens: torch.Tensor,
+        t_emb: torch.Tensor,
+        text_key_padding_mask: torch.Tensor,
+        text_attn_bias: torch.Tensor | None,
+        *,
+        height: int,
+        width: int,
+    ) -> torch.Tensor:
+        timestep_mod = self.mod(t_emb)
+        (
+            shift_msa,
+            scale_msa,
+            gate_msa,
+            shift_cross,
+            scale_cross,
+            gate_cross,
+            shift_mlp,
+            scale_mlp,
+            gate_mlp,
+        ) = (self.scale_shift_table[None] + timestep_mod.reshape(x.shape[0], 9, -1)).chunk(9, dim=1)
+        if self.parallel_block:
+            base = x
+            branches = [
+                gate_msa * self.self_attn(modulate(self.norm1(base), shift_msa, scale_msa)),
+                gate_cross
+                * self._cross_attention(
+                    modulate(self.norm3(base), shift_cross, scale_cross),
+                    text_tokens,
+                    text_key_padding_mask,
+                    text_attn_bias,
+                ),
+                gate_mlp * self.mlp(modulate(self.norm2(base), shift_mlp, scale_mlp), height=height, width=width),
+            ]
+            if self.use_image_attention:
+                image_attn_mod = self.image_attn_mod(t_emb)
+                shift_img, scale_img, gate_img = (
+                    self.image_attn_scale_shift_table[None] + image_attn_mod.reshape(x.shape[0], 3, -1)
+                ).chunk(3, dim=1)
+                branches.append(
+                    gate_img * self.image_attn(modulate(self.image_attn_norm(base), shift_img, scale_img))
+                )
+            return base + sum(branches)
+
+        x = x + gate_msa * self.self_attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        if self.use_image_attention:
+            image_attn_mod = self.image_attn_mod(t_emb)
+            shift_img, scale_img, gate_img = (
+                self.image_attn_scale_shift_table[None] + image_attn_mod.reshape(x.shape[0], 3, -1)
+            ).chunk(3, dim=1)
+            x = x + gate_img * self.image_attn(modulate(self.image_attn_norm(x), shift_img, scale_img))
+        x = x + gate_cross * self._cross_attention(
+            modulate(self.norm3(x), shift_cross, scale_cross),
+            text_tokens,
+            text_key_padding_mask,
+            text_attn_bias,
+        )
         x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp), height=height, width=width)
         return x
+
+
+class BoomerFLADualStreamBlock(nn.Module):
+    """FLUX-style early block with one joint text+image attention operation."""
+
+    updates_text = True
+
+    def __init__(self, config: BoomerFLADiTConfig, *, layer_idx: int) -> None:
+        super().__init__()
+        hidden_dim = config.hidden_dim
+        if hidden_dim % config.num_heads != 0:
+            raise ValueError(f"hidden_dim={hidden_dim} must be divisible by num_heads={config.num_heads}")
+        self.num_heads = config.num_heads
+        self.head_dim = hidden_dim // config.num_heads
+        self.hidden_dim = hidden_dim
+        self.parallel_block = config.parallel_block
+
+        self.image_mod = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
+        self.image_norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
+        self.image_qkv = nn.Linear(hidden_dim, hidden_dim * 3)
+        self.image_q_norm = AttentionRMSNorm(self.head_dim, scale_factor=1.0, eps=1e-6)
+        self.image_k_norm = AttentionRMSNorm(self.head_dim, scale_factor=1.0, eps=1e-6)
+        self.image_out_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.image_norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
+        self.image_mlp = GLUMBConv(hidden_dim, config.mlp_ratio)
+        self.image_scale_shift_table = nn.Parameter(torch.zeros(6, hidden_dim))
+
+        self.text_mod = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
+        self.text_norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
+        self.text_qkv = nn.Linear(hidden_dim, hidden_dim * 3)
+        self.text_q_norm = AttentionRMSNorm(self.head_dim, scale_factor=1.0, eps=1e-6)
+        self.text_k_norm = AttentionRMSNorm(self.head_dim, scale_factor=1.0, eps=1e-6)
+        self.text_out_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.text_norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
+        self.text_mlp = TokenMLP(hidden_dim, config.mlp_ratio)
+        self.text_scale_shift_table = nn.Parameter(torch.zeros(6, hidden_dim))
+
+    def _qkv(
+        self,
+        x: torch.Tensor,
+        qkv: nn.Linear,
+        q_norm: AttentionRMSNorm,
+        k_norm: AttentionRMSNorm,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch, tokens, _ = x.shape
+        q, k, v = qkv(x).reshape(batch, tokens, 3, self.num_heads, self.head_dim).unbind(dim=2)
+        q = q_norm(q)
+        k = k_norm(k)
+        return q, k, v
+
+    def _joint_attention(
+        self,
+        image_tokens: torch.Tensor,
+        text_tokens: torch.Tensor,
+        text_key_padding_mask: torch.Tensor,
+        coord_rope: MultimodalCoordinateRoPE | None,
+        image_coord_ids: torch.Tensor | None,
+        text_coord_ids: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        image_q, image_k, image_v = self._qkv(
+            image_tokens,
+            self.image_qkv,
+            self.image_q_norm,
+            self.image_k_norm,
+        )
+        text_q, text_k, text_v = self._qkv(
+            text_tokens,
+            self.text_qkv,
+            self.text_q_norm,
+            self.text_k_norm,
+        )
+        q = torch.cat([text_q, image_q], dim=1)
+        k = torch.cat([text_k, image_k], dim=1)
+        v = torch.cat([text_v, image_v], dim=1)
+        if coord_rope is not None:
+            if image_coord_ids is None or text_coord_ids is None:
+                raise ValueError("coordinate ids are required when multimodal coord RoPE is enabled")
+            coord_ids = torch.cat([text_coord_ids, image_coord_ids], dim=1)
+            q, k = coord_rope.apply(q, k, coord_ids)
+
+        image_mask = torch.zeros(
+            image_tokens.shape[0],
+            image_tokens.shape[1],
+            device=image_tokens.device,
+            dtype=text_key_padding_mask.dtype,
+        )
+        key_padding_mask = torch.cat([text_key_padding_mask, image_mask], dim=1)
+        attn_bias = key_padding_mask[:, None, None, :].to(dtype=q.dtype)
+        attn_bias = attn_bias.masked_fill(attn_bias > 0, -10000.0)
+        out = F.scaled_dot_product_attention(
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
+            attn_mask=attn_bias,
+            dropout_p=0.0,
+            is_causal=False,
+        )
+        out = out.transpose(1, 2).reshape(image_tokens.shape[0], text_tokens.shape[1] + image_tokens.shape[1], -1)
+        text_out, image_out = out.split([text_tokens.shape[1], image_tokens.shape[1]], dim=1)
+        return self.image_out_proj(image_out), self.text_out_proj(text_out)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        text_tokens: torch.Tensor,
+        t_emb: torch.Tensor,
+        text_key_padding_mask: torch.Tensor,
+        text_attn_bias: torch.Tensor | None,
+        *,
+        height: int,
+        width: int,
+        coord_rope: MultimodalCoordinateRoPE | None = None,
+        image_coord_ids: torch.Tensor | None = None,
+        text_coord_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del text_attn_bias
+        image_timestep_mod = self.image_mod(t_emb)
+        text_timestep_mod = self.text_mod(t_emb)
+        image_shift_attn, image_scale_attn, image_gate_attn, image_shift_mlp, image_scale_mlp, image_gate_mlp = (
+            self.image_scale_shift_table[None] + image_timestep_mod.reshape(x.shape[0], 6, -1)
+        ).chunk(6, dim=1)
+        text_shift_attn, text_scale_attn, text_gate_attn, text_shift_mlp, text_scale_mlp, text_gate_mlp = (
+            self.text_scale_shift_table[None] + text_timestep_mod.reshape(text_tokens.shape[0], 6, -1)
+        ).chunk(6, dim=1)
+
+        image_base = x
+        text_base = text_tokens
+        image_attn_in = modulate(self.image_norm1(image_base), image_shift_attn, image_scale_attn)
+        text_attn_in = modulate(self.text_norm1(text_base), text_shift_attn, text_scale_attn)
+        image_attn, text_attn = self._joint_attention(
+            image_attn_in,
+            text_attn_in,
+            text_key_padding_mask,
+            coord_rope,
+            image_coord_ids,
+            text_coord_ids,
+        )
+        if self.parallel_block:
+            x = image_base + image_gate_attn * image_attn + image_gate_mlp * self.image_mlp(
+                modulate(self.image_norm2(image_base), image_shift_mlp, image_scale_mlp),
+                height=height,
+                width=width,
+            )
+            text_tokens = text_base + text_gate_attn * text_attn + text_gate_mlp * self.text_mlp(
+                modulate(self.text_norm2(text_base), text_shift_mlp, text_scale_mlp)
+            )
+            return x, text_tokens
+
+        x = image_base + image_gate_attn * image_attn
+        text_tokens = text_base + text_gate_attn * text_attn
+        x = x + image_gate_mlp * self.image_mlp(
+            modulate(self.image_norm2(x), image_shift_mlp, image_scale_mlp),
+            height=height,
+            width=width,
+        )
+        text_tokens = text_tokens + text_gate_mlp * self.text_mlp(
+            modulate(self.text_norm2(text_tokens), text_shift_mlp, text_scale_mlp)
+        )
+        return x, text_tokens
 
 
 class BoomerFLADiT(nn.Module):
@@ -615,35 +922,82 @@ class BoomerFLADiT(nn.Module):
 
     def __init__(self, config: BoomerFLADiTConfig = BoomerFLADiTConfig()) -> None:
         super().__init__()
-        if config.patch_size != 1:
-            raise ValueError("BoomerFLADiT currently supports patch_size=1 for DC-AE f32c32 latents.")
+        if config.patch_size <= 0:
+            raise ValueError(f"patch_size must be positive, got {config.patch_size}")
+        if config.latent_size % config.patch_size != 0:
+            raise ValueError(
+                f"latent_size={config.latent_size} must be divisible by patch_size={config.patch_size}"
+            )
+        if config.dual_stream_depth < 0:
+            raise ValueError(f"dual_stream_depth must be non-negative, got {config.dual_stream_depth}")
+        if config.dual_stream_depth > config.depth:
+            raise ValueError(f"dual_stream_depth={config.dual_stream_depth} exceeds depth={config.depth}")
         self.config = config
         hidden_dim = config.hidden_dim
-        token_count = config.latent_size * config.latent_size
-        self.x_embedder = nn.Linear(config.latent_channels, hidden_dim)
-        self.pos_embed = nn.Parameter(torch.zeros(1, token_count, hidden_dim))
+        self.patch_size = config.patch_size
+        self.token_grid_size = config.latent_size // config.patch_size
+        token_count = self.token_grid_size * self.token_grid_size
+        self.x_embedder = (
+            nn.Linear(config.latent_channels, hidden_dim)
+            if config.patch_size == 1
+            else nn.Conv2d(
+                config.latent_channels,
+                hidden_dim,
+                kernel_size=config.patch_size,
+                stride=config.patch_size,
+            )
+        )
+        self.pos_embed = nn.Parameter(torch.zeros(1, token_count, hidden_dim)) if config.use_abs_pos_embed else None
         self.t_embedder = TimestepEmbedder(hidden_dim)
-        self.t_block = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
         self.caption_embedder = CaptionEmbedder(config.text_dim, hidden_dim, config.text_seq_len)
         self.attention_y_norm = (
             AttentionRMSNorm(hidden_dim, scale_factor=config.y_norm_scale_factor) if config.y_norm else None
         )
-        self.blocks = nn.ModuleList([BoomerFLABlock(config, layer_idx=i) for i in range(config.depth)])
+        self.coord_embedder = (
+            MultimodalCoordinateRoPE(
+                hidden_dim // config.num_heads,
+                image_size=self.token_grid_size,
+                text_seq_len=config.text_seq_len,
+                theta=config.image_rope_theta,
+            )
+            if config.multimodal_coord_ids
+            else None
+        )
+        self.blocks = nn.ModuleList(
+            [
+                (
+                    BoomerFLADualStreamBlock(config, layer_idx=i)
+                    if i < config.dual_stream_depth
+                    else BoomerFLABlock(config, layer_idx=i)
+                )
+                for i in range(config.depth)
+            ]
+        )
         self.final_norm = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
         self.final_t_block = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 2))
-        self.out_proj = nn.Linear(hidden_dim, config.latent_channels)
+        self.out_proj = nn.Linear(hidden_dim, config.latent_channels * config.patch_size * config.patch_size)
         self.initialize_weights()
 
     def initialize_weights(self) -> None:
-        nn.init.normal_(self.pos_embed, std=0.02)
-
-        nn.init.normal_(self.t_block[1].weight, std=0.02)
-        nn.init.zeros_(self.t_block[1].bias)
+        if self.pos_embed is not None:
+            nn.init.normal_(self.pos_embed, std=0.02)
 
         for block in self.blocks:
-            nn.init.normal_(block.scale_shift_table, std=0.02)
-            if block.use_image_attention:
-                nn.init.normal_(block.image_attn_scale_shift_table, std=0.02)
+            if isinstance(block, BoomerFLADualStreamBlock):
+                nn.init.zeros_(block.image_mod[1].weight)
+                nn.init.zeros_(block.image_mod[1].bias)
+                nn.init.zeros_(block.text_mod[1].weight)
+                nn.init.zeros_(block.text_mod[1].bias)
+                nn.init.normal_(block.image_scale_shift_table, std=0.02)
+                nn.init.normal_(block.text_scale_shift_table, std=0.02)
+            else:
+                nn.init.zeros_(block.mod[1].weight)
+                nn.init.zeros_(block.mod[1].bias)
+                nn.init.normal_(block.scale_shift_table, std=0.02)
+                if block.use_image_attention:
+                    nn.init.zeros_(block.image_attn_mod[1].weight)
+                    nn.init.zeros_(block.image_attn_mod[1].bias)
+                    nn.init.normal_(block.image_attn_scale_shift_table, std=0.02)
 
         nn.init.zeros_(self.final_t_block[1].weight)
         nn.init.zeros_(self.final_t_block[1].bias)
@@ -706,11 +1060,21 @@ class BoomerFLADiT(nn.Module):
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
         batch, channels, height, width = noisy_latent.shape
-        expected = self.config.latent_size
-        if channels != self.config.latent_channels or height != expected or width != expected:
+        if channels != self.config.latent_channels:
             raise ValueError(
-                "Expected latent shape "
-                f"(B, {self.config.latent_channels}, {expected}, {expected}), got {tuple(noisy_latent.shape)}"
+                f"Expected latent_channels={self.config.latent_channels}, got shape {tuple(noisy_latent.shape)}"
+            )
+        if height % self.patch_size != 0 or width % self.patch_size != 0:
+            raise ValueError(
+                f"latent height/width must be divisible by patch_size={self.patch_size}, got {(height, width)}"
+            )
+        token_height = height // self.patch_size
+        token_width = width // self.patch_size
+        token_count = token_height * token_width
+        if self.pos_embed is not None and token_count != self.pos_embed.shape[1]:
+            raise ValueError(
+                f"absolute pos_embed expects {self.pos_embed.shape[1]} latent tokens, got {token_count}. "
+                "Disable it with --no-abs-pos-embed for variable latent sizes."
             )
         if text_embedding.shape[-1] != self.config.text_dim:
             raise ValueError(f"text_embedding last dim must be {self.config.text_dim}, got {text_embedding.shape[-1]}")
@@ -719,24 +1083,57 @@ class BoomerFLADiT(nn.Module):
         text_tokens = self.apply_y_norm(text_tokens)
         text_key_padding_mask = attention_mask == 0
 
-        x = noisy_latent.flatten(2).transpose(1, 2)
-        x = self.x_embedder(x) + self.pos_embed
+        if self.patch_size == 1:
+            x = noisy_latent.flatten(2).transpose(1, 2)
+            x = self.x_embedder(x)
+        else:
+            x = self.x_embedder(noisy_latent).flatten(2).transpose(1, 2)
+        if self.pos_embed is not None:
+            x = x + self.pos_embed
+        image_coord_ids = None
+        text_coord_ids = None
+        if self.coord_embedder is not None:
+            image_coord_ids = self.coord_embedder.image_ids(
+                batch,
+                height=token_height,
+                width=token_width,
+                device=x.device,
+            )
+            text_coord_ids = self.coord_embedder.text_ids(batch, text_tokens.shape[1], device=text_tokens.device)
         text_attn_bias = text_key_padding_mask[:, None, None, :].to(dtype=x.dtype)
         text_attn_bias = text_attn_bias.masked_fill(text_attn_bias > 0, -10000.0)
         t_emb = self.t_embedder(timesteps)
-        timestep_mod = self.t_block(t_emb)
         for block in self.blocks:
-            x = block(
-                x,
-                text_tokens,
-                timestep_mod,
-                text_key_padding_mask,
-                text_attn_bias,
-                height=height,
-                width=width,
-            )
+            if getattr(block, "updates_text", False):
+                x, text_tokens = block(
+                    x,
+                    text_tokens,
+                    t_emb,
+                    text_key_padding_mask,
+                    text_attn_bias,
+                    height=token_height,
+                    width=token_width,
+                    coord_rope=self.coord_embedder,
+                    image_coord_ids=image_coord_ids,
+                    text_coord_ids=text_coord_ids,
+                )
+            else:
+                x = block(
+                    x,
+                    text_tokens,
+                    t_emb,
+                    text_key_padding_mask,
+                    text_attn_bias,
+                    height=token_height,
+                    width=token_width,
+                )
         final_mod = self.final_t_block(t_emb)
         shift, scale = final_mod.reshape(batch, 2, -1).chunk(2, dim=1)
         x = modulate(self.final_norm(x), shift, scale)
         x = self.out_proj(x)
-        return x.transpose(1, 2).reshape(batch, channels, height, width)
+        if self.patch_size == 1:
+            return x.transpose(1, 2).reshape(batch, channels, height, width)
+        patch = self.patch_size
+        x = x.reshape(batch, token_height, token_width, channels, patch, patch)
+        x = x.permute(0, 3, 1, 4, 2, 5).contiguous()
+        return x.reshape(batch, channels, height, width)

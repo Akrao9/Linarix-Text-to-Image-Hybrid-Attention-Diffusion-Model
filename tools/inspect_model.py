@@ -64,6 +64,11 @@ def build_config(args: argparse.Namespace):
             image_rope_theta=args.image_rope_theta,
             cross_attention_backend=args.cross_attn_backend,
             cross_attention_qk_norm=args.cross_attn_qk_norm,
+            parallel_block=args.parallel_block,
+            dual_stream_depth=args.dual_stream_depth,
+            multimodal_coord_ids=args.multimodal_coord_ids,
+            use_abs_pos_embed=args.abs_pos_embed,
+            patch_size=args.patch_size,
         )
     raise ValueError(f"Unsupported model type: {args.model_type}")
 
@@ -120,6 +125,11 @@ def main() -> None:
     parser.add_argument("--image-rope-theta", type=float, default=10000.0)
     parser.add_argument("--cross-attn-backend", choices=["sdpa", "xformers", "auto", "mha"], default="sdpa")
     parser.add_argument("--cross-attn-qk-norm", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--parallel-block", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--dual-stream-depth", type=int, default=0)
+    parser.add_argument("--multimodal-coord-ids", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--abs-pos-embed", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--patch-size", type=int, default=1)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     parser.add_argument("--forward", action="store_true", help="Run one tiny random forward pass.")
