@@ -306,7 +306,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resolution", type=int, default=512)
     parser.add_argument("--vae-id", default=CacheConfig.vae_id)
     parser.add_argument("--text-encoder-id", default=CacheConfig.text_encoder_id)
-    parser.add_argument("--max-length", type=int, default=300)
+    parser.add_argument("--max-length", type=int, default=CacheConfig.max_length)
     parser.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--scaling-factor", type=float, default=CacheConfig.scaling_factor)

@@ -31,6 +31,7 @@ class BoomerFLADiTConfig:
     mixer_type: str = "fla_linear"
     fla_mode: str = "chunk"
     fla_feature_map: str = "relu"
+    fla_bidirectional: bool = False
     use_short_conv: bool = False
     conv_size: int = 4
     image_attention_every: int = 0
@@ -484,6 +485,7 @@ class FLASelfMixer(nn.Module):
             import fla.layers as fla_layers
 
         hidden_dim = config.hidden_dim
+        self.bidirectional = config.fla_bidirectional
         if config.mixer_type == "fla_linear":
             self.mixer = fla_layers.LinearAttention(
                 hidden_size=hidden_dim,
@@ -517,11 +519,19 @@ class FLASelfMixer(nn.Module):
         else:
             raise ValueError(f"Unsupported FLA mixer_type: {config.mixer_type}")
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.mixer(x)
+    @staticmethod
+    def _run_mixer(mixer: nn.Module, x: torch.Tensor) -> torch.Tensor:
+        y = mixer(x)
         if isinstance(y, tuple):
             y = y[0]
         return y
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self._run_mixer(self.mixer, x)
+        if not self.bidirectional:
+            return y
+        y_rev = self._run_mixer(self.mixer, x.flip(1)).flip(1)
+        return 0.5 * (y + y_rev)
 
 
 class BoomerFLABlock(nn.Module):
@@ -652,8 +662,15 @@ class BoomerFLADiT(nn.Module):
         device: torch.device | str,
         dtype: torch.dtype,
         mask_dtype: torch.dtype | None = None,
+        token_num: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.caption_embedder.null_condition(batch_size, device=device, dtype=dtype, mask_dtype=mask_dtype)
+        return self.caption_embedder.null_condition(
+            batch_size,
+            device=device,
+            dtype=dtype,
+            mask_dtype=mask_dtype,
+            token_num=token_num,
+        )
 
     def apply_condition_dropout(
         self,
@@ -669,6 +686,7 @@ class BoomerFLADiT(nn.Module):
             device=text_embedding.device,
             dtype=text_embedding.dtype,
             mask_dtype=attention_mask.dtype,
+            token_num=text_embedding.shape[-2],
         )
         # torch.where over a per-sample bool. Avoids the bool(drop.any()) CUDA
         # sync (which would defeat the training-loop sync removal) and skips

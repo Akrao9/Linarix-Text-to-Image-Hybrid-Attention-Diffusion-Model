@@ -84,7 +84,7 @@ def main() -> None:
     parser.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--vae-id", default=CacheConfig.vae_id)
     parser.add_argument("--text-encoder-id", default=CacheConfig.text_encoder_id)
-    parser.add_argument("--max-length", type=int, default=300)
+    parser.add_argument("--max-length", type=int, default=CacheConfig.max_length)
     parser.add_argument("--scaling-factor", type=float, default=CacheConfig.scaling_factor)
     parser.add_argument("--latent-mean", type=float, help="Override checkpoint latent normalization mean.")
     parser.add_argument("--latent-std", type=float, help="Override checkpoint latent normalization std.")

@@ -10,7 +10,7 @@ from boomer.datasets.wds_latents import (
     sample_to_record,
     split_urls_for_worker,
 )
-from tools.cache_hf_wds_to_boomer_wds import npy_bytes, raw_bytes
+from tools.cache_hf_wds_to_boomer_wds import npy_bytes, raw_bytes, storage_dtype_to_numpy
 
 
 def _sample(**fields):
@@ -77,6 +77,54 @@ def test_sample_to_record_npy_fp8_text():
     assert record.text_embedding.shape == (300, 1152)
 
 
+def test_sample_to_record_npy_bf16_with_manifest():
+    manifest = WdsCacheManifest(
+        latents_shape=(32, 16, 16),
+        text_shape=(300, 1152),
+        latents_dtype="bfloat16",
+        text_dtype="bfloat16",
+    )
+    latents = torch.randn(32, 16, 16, dtype=torch.float32)
+    text = torch.randn(300, 1152, dtype=torch.float32)
+    mask = np.zeros((300,), dtype=np.uint8)
+    record = sample_to_record(
+        _sample(
+            **{
+                "latents.npy": npy_bytes(storage_dtype_to_numpy(latents, "bfloat16")),
+                "text.npy": npy_bytes(storage_dtype_to_numpy(text, "bfloat16")),
+                "text_mask.npy": npy_bytes(mask),
+            }
+        ),
+        manifest=manifest,
+    )
+    assert record.image_latent.dtype == torch.bfloat16
+    assert record.text_embedding.dtype == torch.bfloat16
+    assert torch.allclose(record.image_latent.float(), latents.to(torch.bfloat16).float(), atol=0, rtol=0)
+
+
+def test_sample_to_record_npy_bf16_rejects_wrong_physical_dtype():
+    manifest = WdsCacheManifest(
+        latents_shape=(32, 16, 16),
+        text_shape=(300, 1152),
+        latents_dtype="bfloat16",
+        text_dtype="bfloat16",
+    )
+    latents = np.random.randn(32, 16, 16).astype(np.float16)
+    text = storage_dtype_to_numpy(torch.randn(300, 1152), "bfloat16")
+    mask = np.zeros((300,), dtype=np.uint8)
+    with pytest.raises(ValueError, match="bfloat16 cache payload must be stored as uint16"):
+        sample_to_record(
+            _sample(
+                **{
+                    "latents.npy": npy_bytes(latents),
+                    "text.npy": npy_bytes(text),
+                    "text_mask.npy": npy_bytes(mask),
+                }
+            ),
+            manifest=manifest,
+        )
+
+
 def test_sample_to_record_raw_bin_with_manifest():
     manifest = WdsCacheManifest(
         raw_tensors=True,
@@ -100,6 +148,31 @@ def test_sample_to_record_raw_bin_with_manifest():
     assert record.image_latent.shape == (32, 16, 16)
     assert record.text_embedding.shape == (300, 1152)
     assert record.attention_mask.shape == (300,)
+
+
+def test_sample_to_record_raw_bin_bf16_with_manifest():
+    manifest = WdsCacheManifest(
+        raw_tensors=True,
+        latents_shape=(32, 16, 16),
+        text_shape=(300, 1152),
+        latents_dtype="bfloat16",
+        text_dtype="bfloat16",
+    )
+    latents = torch.randn(32, 16, 16, dtype=torch.float32)
+    text = torch.randn(300, 1152, dtype=torch.float32)
+    mask = np.zeros((300,), dtype=np.uint8)
+    record = sample_to_record(
+        _sample(
+            **{
+                "latents.bin": raw_bytes(storage_dtype_to_numpy(latents, "bfloat16")),
+                "text.bin": raw_bytes(storage_dtype_to_numpy(text, "bfloat16")),
+                "text_mask.bin": raw_bytes(mask),
+            }
+        ),
+        manifest=manifest,
+    )
+    assert record.image_latent.dtype == torch.bfloat16
+    assert record.text_embedding.dtype == torch.bfloat16
 
 
 def test_sample_to_record_bin_requires_manifest():

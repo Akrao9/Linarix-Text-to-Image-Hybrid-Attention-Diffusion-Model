@@ -28,7 +28,7 @@ class CacheConfig:
     vae_id: str = DEFAULT_VAE_ID
     text_encoder_id: str = DEFAULT_TEXT_ENCODER_ID
     text_attn_implementation: str | None = None
-    max_length: int = 300
+    max_length: int = 340
     dtype: str = "bf16"
     device: str = "cuda"
     scaling_factor: float = DEFAULT_SCALING_FACTOR
@@ -354,7 +354,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resolution", type=int, default=512)
     parser.add_argument("--vae-id", default=DEFAULT_VAE_ID)
     parser.add_argument("--text-encoder-id", default=DEFAULT_TEXT_ENCODER_ID)
-    parser.add_argument("--max-length", type=int, default=300)
+    parser.add_argument("--max-length", type=int, default=CacheConfig.max_length)
     parser.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--scaling-factor", type=float, default=DEFAULT_SCALING_FACTOR)

@@ -55,6 +55,7 @@ def build_config(args: argparse.Namespace):
             mixer_type=args.mixer_type,
             fla_mode=args.fla_mode,
             fla_feature_map=args.fla_feature_map,
+            fla_bidirectional=args.fla_bidirectional,
             use_short_conv=args.use_short_conv,
             conv_size=args.conv_size,
             image_attention_every=args.image_attn_every,
@@ -105,6 +106,12 @@ def main() -> None:
     parser.add_argument("--mamba-mimo", action="store_true")
     parser.add_argument("--fla-mode", choices=["chunk", "fused_chunk"], default="chunk")
     parser.add_argument("--fla-feature-map", default="relu")
+    parser.add_argument(
+        "--fla-bidirectional",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run FLA image mixers forward and backward over the token sequence, sharing weights.",
+    )
     parser.add_argument("--use-short-conv", action="store_true")
     parser.add_argument("--conv-size", type=int, default=4)
     parser.add_argument("--image-attn-every", type=int, default=0)

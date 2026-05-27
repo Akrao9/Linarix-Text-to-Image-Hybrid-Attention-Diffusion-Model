@@ -353,8 +353,15 @@ class MambaAnchorDiT(nn.Module):
         device: torch.device | str,
         dtype: torch.dtype,
         mask_dtype: torch.dtype | None = None,
+        token_num: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.caption_embedder.null_condition(batch_size, device=device, dtype=dtype, mask_dtype=mask_dtype)
+        return self.caption_embedder.null_condition(
+            batch_size,
+            device=device,
+            dtype=dtype,
+            mask_dtype=mask_dtype,
+            token_num=token_num,
+        )
 
     def apply_condition_dropout(
         self,
@@ -373,6 +380,7 @@ class MambaAnchorDiT(nn.Module):
             device=text_embedding.device,
             dtype=text_embedding.dtype,
             mask_dtype=attention_mask.dtype,
+            token_num=text_embedding.shape[-2],
         )
         text_embedding = text_embedding.clone()
         attention_mask = attention_mask.clone()

@@ -23,8 +23,11 @@ from boomer.sana_latent_cache import hf_token_value
 
 _NUMPY_DTYPES: dict[str, np.dtype] = {
     "float16": np.dtype("float16"),
+    "bfloat16": np.dtype("uint16"),
     "float32": np.dtype("float32"),
+    "float8_e4m3fn": np.dtype("uint8"),
     "uint8": np.dtype("uint8"),
+    "uint16": np.dtype("uint16"),
 }
 
 
@@ -275,6 +278,7 @@ class RollingLocalWdsCache:
         dest.parent.mkdir(parents=True, exist_ok=True)
         os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
         # Download directly under local_dir so shards are not duplicated in ~/.cache/huggingface.
+        print(f"[wds-roll] downloading {shard.path_in_repo} -> {dest}", flush=True)
         downloaded = Path(
             hf_hub_download(
                 repo_id=shard.repo_id,
@@ -288,6 +292,7 @@ class RollingLocalWdsCache:
             if dest.exists():
                 dest.unlink()
             downloaded.replace(dest)
+        print(f"[wds-roll] ready {dest}", flush=True)
         return dest
 
     def _download_remote_index(self, remote_index: int) -> Path:
@@ -337,7 +342,7 @@ class RollingLocalWdsCache:
 
     def _schedule_prefetch(self) -> None:
         with self._lock:
-            if self._prefetch_thread is not None and self._prefetch_thread.is_alive():
+            if self._prefetch_thread is not None:
                 return
             remote_index = self._next_epoch_remote_index(exclude=set(self._window_indices))
             target = self._local_path_for(self.remote_shards[remote_index])
@@ -351,6 +356,10 @@ class RollingLocalWdsCache:
             self._prefetch_target = target
             self._prefetch_remote_index = remote_index
         thread.start()
+
+    def schedule_prefetch(self) -> None:
+        """Start downloading one replacement shard outside the current window."""
+        self._schedule_prefetch()
 
     def advance_after(self, finished_url: str) -> None:
         finished_name = _normalize_shard_name(finished_url)
@@ -427,17 +436,23 @@ def _bin_to_numpy(data: bytes, *, dtype_name: str, shape: tuple[int, ...]) -> np
     return array.reshape(shape).copy()
 
 
-def _text_array_to_tensor(array: np.ndarray, *, text_dtype: str) -> torch.Tensor:
-    if text_dtype == "float8_e4m3fn":
+def _array_to_logical_tensor(array: np.ndarray, *, dtype_name: str) -> torch.Tensor:
+    if dtype_name == "bfloat16":
+        if array.dtype != np.uint16:
+            raise ValueError(
+                f"bfloat16 cache payload must be stored as uint16 bit patterns, got {array.dtype}."
+            )
+        return torch.from_numpy(array).view(torch.bfloat16)
+    if dtype_name == "float8_e4m3fn":
         if not hasattr(torch, "float8_e4m3fn"):
             raise RuntimeError(
-                "Cache text_dtype is float8_e4m3fn but this PyTorch build lacks float8 support."
+                "Cache dtype is float8_e4m3fn but this PyTorch build lacks float8 support."
             )
         if array.dtype != np.uint8:
-            array = array.astype(np.uint8, copy=False)
+            raise ValueError(
+                f"float8_e4m3fn cache payload must be stored as uint8 bit patterns, got {array.dtype}."
+            )
         return torch.from_numpy(array).view(torch.float8_e4m3fn).to(torch.float16)
-    if array.dtype != np.float16:
-        array = array.astype(np.float16, copy=False)
     return torch.from_numpy(array)
 
 
@@ -453,13 +468,13 @@ def _latents_to_tensor(
     *,
     manifest: WdsCacheManifest | None,
 ) -> torch.Tensor:
-    if fmt == "npy":
-        return torch.from_numpy(_load_npy_array(value)).contiguous()
-    shape = _require_shape(manifest, "latents_shape", "latents")
     dtype_name = manifest.latents_dtype if manifest is not None else "float16"
+    if fmt == "npy":
+        return _array_to_logical_tensor(_load_npy_array(value), dtype_name=dtype_name).contiguous()
+    shape = _require_shape(manifest, "latents_shape", "latents")
     payload = value if isinstance(value, (bytes, bytearray)) else bytes(value)
     array = _bin_to_numpy(payload, dtype_name=dtype_name, shape=shape)
-    return torch.from_numpy(array).contiguous()
+    return _array_to_logical_tensor(array, dtype_name=dtype_name).contiguous()
 
 
 def _text_to_tensor(
@@ -470,12 +485,11 @@ def _text_to_tensor(
 ) -> torch.Tensor:
     text_dtype = manifest.text_dtype if manifest is not None else "float16"
     if fmt == "npy":
-        return _text_array_to_tensor(_load_npy_array(value), text_dtype=text_dtype).contiguous()
+        return _array_to_logical_tensor(_load_npy_array(value), dtype_name=text_dtype).contiguous()
     shape = _require_shape(manifest, "text_shape", "text")
     payload = value if isinstance(value, (bytes, bytearray)) else bytes(value)
-    on_disk_dtype = "uint8" if text_dtype == "float8_e4m3fn" else text_dtype
-    array = _bin_to_numpy(payload, dtype_name=on_disk_dtype, shape=shape)
-    return _text_array_to_tensor(array, text_dtype=text_dtype).contiguous()
+    array = _bin_to_numpy(payload, dtype_name=text_dtype, shape=shape)
+    return _array_to_logical_tensor(array, dtype_name=text_dtype).contiguous()
 
 
 def _mask_to_tensor(
@@ -691,6 +705,7 @@ class RollingStreamingWdsLatentCacheDataset(IterableDataset[LatentRecord]):
             if shard_path is None:
                 return
 
+            self.cache.schedule_prefetch()
             shard_name = shard_path.name
             dataset = wds.WebDataset([str(shard_path)], shardshuffle=False).decode()
             if self.shuffle_buffer > 0:
@@ -699,6 +714,7 @@ class RollingStreamingWdsLatentCacheDataset(IterableDataset[LatentRecord]):
             for sample in dataset:
                 yield sample_to_record(sample, manifest=self.manifest)
 
+            print(f"[wds-roll] finished {shard_name}; rotating local shard window", flush=True)
             self.cache.advance_after(shard_name)
 
 

@@ -62,14 +62,24 @@ class CaptionEmbedder(nn.Module):
         device: torch.device | str,
         dtype: torch.dtype,
         mask_dtype: torch.dtype | None = None,
+        token_num: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        text = self.null_text_embedding.expand(batch_size, -1, -1).to(device=device, dtype=dtype)
+        text = self.null_text_embedding
+        if token_num is not None and token_num != text.shape[1]:
+            if token_num < text.shape[1]:
+                text = text[:, :token_num]
+            else:
+                pad = text.new_zeros(text.shape[0], token_num - text.shape[1], text.shape[2])
+                text = torch.cat([text, pad], dim=1)
+        text = text.expand(batch_size, -1, -1).to(device=device, dtype=dtype)
         mask = torch.ones(
             batch_size,
             text.shape[1],
             device=device,
             dtype=mask_dtype or torch.long,
         )
+        if token_num is not None and token_num > self.null_text_embedding.shape[1]:
+            mask[:, self.null_text_embedding.shape[1] :] = 0
         return text, mask
 
 
@@ -136,6 +146,7 @@ class LatentDiT(nn.Module):
         device: torch.device | str,
         dtype: torch.dtype,
         mask_dtype: torch.dtype | None = None,
+        token_num: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Learned raw null caption with all-ones mask for CFG cross-attn."""
         return self.caption_embedder.null_condition(
@@ -143,6 +154,7 @@ class LatentDiT(nn.Module):
             device=device,
             dtype=dtype,
             mask_dtype=mask_dtype,
+            token_num=token_num,
         )
 
     def apply_condition_dropout(
@@ -164,6 +176,7 @@ class LatentDiT(nn.Module):
             device=text_embedding.device,
             dtype=text_embedding.dtype,
             mask_dtype=attention_mask.dtype,
+            token_num=text_embedding.shape[-2],
         )
         dropped_embedding = text_embedding.clone()
         dropped_mask = attention_mask.clone()

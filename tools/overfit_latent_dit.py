@@ -118,6 +118,24 @@ def sample_flow_batch(
     return x_t, t, velocity
 
 
+def sigma_bin_means(per_sample_loss: torch.Tensor, sigma: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Return low/mid/high sigma loss means without syncing to host."""
+    sigma_f = sigma.float()
+    loss_f = per_sample_loss.float()
+    masks = {
+        "low": sigma_f < 0.33,
+        "mid": (sigma_f >= 0.33) & (sigma_f < 0.66),
+        "high": sigma_f >= 0.66,
+    }
+    means: dict[str, torch.Tensor] = {}
+    for name, mask in masks.items():
+        weight = mask.to(dtype=loss_f.dtype)
+        # Empty bins are reported as 0.0 to avoid a Python-side mask.any()
+        # CUDA sync in the hot path.
+        means[name] = (loss_f * weight).sum() / weight.sum().clamp_min(1.0)
+    return means
+
+
 def lr_multiplier(
     step: int,
     total_steps: int,
@@ -237,6 +255,7 @@ def build_model_config(args: argparse.Namespace, sample_record: Any, resume_chec
             mixer_type=args.mixer_type,
             fla_mode=args.fla_mode,
             fla_feature_map=args.fla_feature_map,
+            fla_bidirectional=args.fla_bidirectional,
             use_short_conv=args.use_short_conv,
             conv_size=args.conv_size,
             image_attention_every=args.image_attn_every,
@@ -541,6 +560,11 @@ def log_wandb_metrics(
     elapsed_s: float | None = None,
     eta_s: float | None = None,
     grad_norm: float | None = None,
+    raw_loss: float | None = None,
+    sigma_low_loss: float | None = None,
+    sigma_mid_loss: float | None = None,
+    sigma_high_loss: float | None = None,
+    sigma_mean: float | None = None,
 ) -> None:
     import wandb
 
@@ -557,6 +581,16 @@ def log_wandb_metrics(
         metrics["train/eta_s"] = eta_s
     if grad_norm is not None:
         metrics["train/grad_norm"] = grad_norm
+    if raw_loss is not None:
+        metrics["train/raw_mse"] = raw_loss
+    if sigma_low_loss is not None:
+        metrics["train/raw_mse_sigma_low"] = sigma_low_loss
+    if sigma_mid_loss is not None:
+        metrics["train/raw_mse_sigma_mid"] = sigma_mid_loss
+    if sigma_high_loss is not None:
+        metrics["train/raw_mse_sigma_high"] = sigma_high_loss
+    if sigma_mean is not None:
+        metrics["train/sigma_mean"] = sigma_mean
     wandb.log(metrics, step=step)
 
 
@@ -680,6 +714,12 @@ def main() -> None:
     parser.add_argument("--mamba-mimo", action="store_true", help="Use Mamba3 MIMO mode. Start without this.")
     parser.add_argument("--fla-mode", choices=["chunk", "fused_chunk"], default="chunk")
     parser.add_argument("--fla-feature-map", default="relu")
+    parser.add_argument(
+        "--fla-bidirectional",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run FLA image mixers forward and backward over the token sequence, sharing weights.",
+    )
     parser.add_argument("--use-short-conv", action="store_true")
     parser.add_argument("--conv-size", type=int, default=4)
     parser.add_argument(
@@ -761,6 +801,14 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--resume", help="Optional checkpoint to resume from. --steps is the total target step.")
+    parser.add_argument(
+        "--resume-weights-only",
+        action="store_true",
+        help=(
+            "With --resume, load model/EMA/config weights but reset optimizer, scheduler, "
+            "and start_step to 0. Use this for dataset continuation/fine-tuning."
+        ),
+    )
     parser.add_argument("--save", help="Optional checkpoint path.")
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--loss-window", type=int, default=50)
@@ -826,7 +874,7 @@ def main() -> None:
     )
     parser.add_argument("--vae-id", default=CacheConfig.vae_id)
     parser.add_argument("--text-encoder-id", default=CacheConfig.text_encoder_id)
-    parser.add_argument("--max-length", type=int, default=300)
+    parser.add_argument("--max-length", type=int, default=CacheConfig.max_length)
     parser.add_argument("--scaling-factor", type=float, default=CacheConfig.scaling_factor)
     parser.add_argument("--latent-mean", type=float, help="Optional scalar mean used to normalize cached image latents.")
     parser.add_argument("--latent-std", type=float, help="Optional scalar std used to normalize cached image latents.")
@@ -921,17 +969,34 @@ def main() -> None:
 
     set_seed(args.seed)
 
-    if args.resume and Path(args.resume).suffix == ".safetensors":
+    if args.resume_weights_only and not args.resume:
+        parser.error("--resume-weights-only requires --resume.")
+    if args.resume and Path(args.resume).suffix == ".safetensors" and not args.resume_weights_only:
         parser.error("--resume requires a full .pt checkpoint with optimizer state, not a .safetensors file.")
-    resume_checkpoint = load_checkpoint(args.resume, map_location=device) if args.resume else None
-    start_step = int(resume_checkpoint.get("steps", 0)) if resume_checkpoint else 0
+    resume_map_location = "cpu" if args.resume_weights_only else device
+    resume_checkpoint = load_checkpoint(args.resume, map_location=resume_map_location) if args.resume else None
+    if resume_checkpoint is not None and args.resume_weights_only and "optimizer" in resume_checkpoint:
+        # Dataset continuation only needs model/EMA/config/train_args. Keeping
+        # the old Adam moments around can waste many GB, especially when the
+        # checkpoint was saved from a large fp32-master run.
+        del resume_checkpoint["optimizer"]
+    start_step = 0 if args.resume_weights_only else int(resume_checkpoint.get("steps", 0)) if resume_checkpoint else 0
     resume_train_args = (resume_checkpoint.get("train_args") or {}) if resume_checkpoint is not None else {}
-    if resume_checkpoint is not None:
+    if resume_checkpoint is not None and not args.resume_weights_only:
         apply_resume_train_args(args, parser, resume_train_args)
     elif args.y_norm is None:
         args.y_norm = False
 
     latent_mean, latent_std = load_latent_normalizer(args, resume_train_args)
+    if resume_checkpoint is not None and args.resume_weights_only and resume_train_args:
+        old_mean = resume_train_args.get("latent_mean")
+        old_std = resume_train_args.get("latent_std")
+        if old_mean != latent_mean or old_std != latent_std:
+            print(
+                "warning: weights-only continuation is using a new latent normalizer "
+                f"old_mean=({latent_stat_summary(old_mean)}) old_std=({latent_stat_summary(old_std)}) "
+                f"new_mean=({latent_stat_summary(latent_mean)}) new_std=({latent_stat_summary(latent_std)})"
+            )
     if args.t_bias <= 0.0:
         parser.error("--t-bias must be positive.")
     if args.flow_shift <= 0.0:
@@ -1061,11 +1126,13 @@ def main() -> None:
         skipped = load_compatible_state_dict(model, resume_checkpoint["model"])
         if skipped:
             print(f"warning: skipped {len(skipped)} incompatible model tensors from resume checkpoint")
-        if "optimizer" in resume_checkpoint:
+        if "optimizer" in resume_checkpoint and not args.resume_weights_only:
             try:
                 optimizer.load_state_dict(resume_checkpoint["optimizer"])
             except ValueError as exc:
                 print(f"warning: skipped incompatible optimizer state from resume checkpoint: {exc}")
+        elif args.resume_weights_only:
+            print("resume-weights-only: optimizer and LR schedule reset to step 0")
         if ema_model is not None and "ema_model" in resume_checkpoint:
             skipped = load_compatible_state_dict(ema_model, resume_checkpoint["ema_model"])
             if skipped:
@@ -1090,7 +1157,10 @@ def main() -> None:
     csv_file = None
     csv_writer = None
     if args.log_csv:
-        csv_file, csv_writer, _ = open_loss_csv(args.log_csv, resume=resume_checkpoint is not None)
+        csv_file, csv_writer, _ = open_loss_csv(
+            args.log_csv,
+            resume=resume_checkpoint is not None and not args.resume_weights_only,
+        )
 
     if not preview_records and args.preview_every and not args.cache_wds:
         preview_records = [str(dataset.files[0])]
@@ -1128,18 +1198,24 @@ def main() -> None:
     )
     wandb_run: Any | None = None
     if resume_checkpoint is not None:
-        print(f"resumed checkpoint: {args.resume} start_step={start_step} target_step={args.steps}")
+        mode = "weights-only" if args.resume_weights_only else "full"
+        print(f"resumed checkpoint ({mode}): {args.resume} start_step={start_step} target_step={args.steps}")
     wandb_run = init_wandb_run(
         args,
         config=config,
         start_step=start_step,
-        resume=resume_checkpoint is not None,
+        resume=resume_checkpoint is not None and not args.resume_weights_only,
     )
     losses: deque[float] = deque(maxlen=args.loss_window)
     # Per-step values are accumulated as GPU tensors and only synced to host on
     # log_every boundaries. This removes ~1 cudaStreamSynchronize per step.
     pending_steps: list[int] = []
     pending_losses: list[torch.Tensor] = []
+    pending_raw_losses: list[torch.Tensor] = []
+    pending_sigma_means: list[torch.Tensor] = []
+    pending_sigma_low_losses: list[torch.Tensor] = []
+    pending_sigma_mid_losses: list[torch.Tensor] = []
+    pending_sigma_high_losses: list[torch.Tensor] = []
     pending_grad_norms: list[torch.Tensor] = []
     pending_lrs: list[float] = []
     last_step = start_step
@@ -1208,7 +1284,9 @@ def main() -> None:
             with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=autocast_enabled):
                 pred_velocity = model(x_t, t, text_embedding, attention_mask)
             # Loss math stays in fp32 outside autocast for numerical stability.
-            per_sample_loss = (pred_velocity.float() - target_velocity.float()).pow(2).mean(dim=(1, 2, 3))
+            raw_per_sample_loss = (pred_velocity.float() - target_velocity.float()).pow(2).mean(dim=(1, 2, 3))
+            bin_losses = sigma_bin_means(raw_per_sample_loss, t)
+            per_sample_loss = raw_per_sample_loss
             if args.timestep_weight:
                 per_sample_loss = per_sample_loss * flow_training_loss_weight(t, target_velocity).mean(dim=(1, 2, 3))
             if args.min_snr_gamma > 0.0:
@@ -1228,6 +1306,11 @@ def main() -> None:
 
             pending_steps.append(step)
             pending_losses.append(loss.detach())
+            pending_raw_losses.append(raw_per_sample_loss.mean().detach())
+            pending_sigma_means.append(t.float().mean().detach())
+            pending_sigma_low_losses.append(bin_losses["low"].detach())
+            pending_sigma_mid_losses.append(bin_losses["mid"].detach())
+            pending_sigma_high_losses.append(bin_losses["high"].detach())
             pending_grad_norms.append(grad_norm_tensor.detach())
             pending_lrs.append(optimizer.param_groups[0]["lr"])
 
@@ -1235,6 +1318,11 @@ def main() -> None:
             if should_log:
                 # One device->host transfer for all buffered steps.
                 loss_vals = torch.stack(pending_losses).to("cpu", non_blocking=False).tolist()
+                raw_loss_vals = torch.stack(pending_raw_losses).to("cpu", non_blocking=False).tolist()
+                sigma_mean_vals = torch.stack(pending_sigma_means).to("cpu", non_blocking=False).tolist()
+                sigma_low_vals = torch.stack(pending_sigma_low_losses).to("cpu", non_blocking=False).tolist()
+                sigma_mid_vals = torch.stack(pending_sigma_mid_losses).to("cpu", non_blocking=False).tolist()
+                sigma_high_vals = torch.stack(pending_sigma_high_losses).to("cpu", non_blocking=False).tolist()
                 grad_vals = torch.stack(pending_grad_norms).to("cpu", non_blocking=False).tolist()
                 if csv_writer is not None:
                     for s, lv, lr_v in zip(pending_steps, loss_vals, pending_lrs):
@@ -1251,6 +1339,11 @@ def main() -> None:
                 lr = pending_lrs[-1]
                 pending_steps.clear()
                 pending_losses.clear()
+                pending_raw_losses.clear()
+                pending_sigma_means.clear()
+                pending_sigma_low_losses.clear()
+                pending_sigma_mid_losses.clear()
+                pending_sigma_high_losses.clear()
                 pending_grad_norms.clear()
                 pending_lrs.clear()
 
@@ -1272,6 +1365,11 @@ def main() -> None:
                         elapsed_s=elapsed,
                         eta_s=eta,
                         grad_norm=grad_norm,
+                        raw_loss=raw_loss_vals[-1],
+                        sigma_low_loss=sigma_low_vals[-1],
+                        sigma_mid_loss=sigma_mid_vals[-1],
+                        sigma_high_loss=sigma_high_vals[-1],
+                        sigma_mean=sigma_mean_vals[-1],
                     )
 
             if args.save_every and args.checkpoint_dir and step % args.save_every == 0:

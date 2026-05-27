@@ -1,7 +1,7 @@
 """Stream HF WebDataset image/caption shards into Boomer latent WebDataset shards.
 
-Optimized variant. Drop-in replacement for cache_latents.py with the same output
-schema (latents.npy / text.npy / text_mask.npy / caption.txt / meta.json) and
+Optimized variant. Drop-in replacement for cache_latents.py with the Boomer
+latent WDS schema (latents/text/text_mask + caption.txt + meta.json) and
 manifest format, but with the following speed knobs:
 
   --gpu-decode            Batch-decode JPEGs on GPU via nvJPEG (torchvision).
@@ -10,9 +10,12 @@ manifest format, but with the following speed knobs:
                           only — keeps --batch-size and --resolution constant.
   --compile-mode          "default" | "reduce-overhead" | "max-autotune".
   --channels-last         Use channels_last memory format for the VAE.
-  --text-dtype            "fp16" (default) | "fp8" — fp8 halves text payload.
-  --raw-tensors           Skip the .npy header; store raw bytes + per-shard dtype
-                          /shape in meta. Smaller files, faster writes.
+  --source-preset         Built-in HF WebDataset source presets, including
+                          FineT2I enhanced square.
+  --storage-dtype         "bf16" (default) | "fp16" | "fp32" for latents/text.
+  --text-storage-dtype    Override text payload with "fp8" when desired.
+  --raw-tensors           Skip the .npy header by default; store raw bytes plus
+                          dtype/shape in manifest. Smaller files, faster writes.
   --world-size / --rank   Manual multi-rank sharding (or use torchrun and they
                           are read from env). Each rank handles urls[rank::world].
   --resume                Resume from output_dir/resume.json if present.
@@ -57,6 +60,13 @@ from boomer.sana_latent_cache import (  # noqa: E402
 
 
 DEFAULT_SOURCE_GLOB = "hf://datasets/BLIP3o/BLIP3o-Pretrain-JourneyDB/**/*.tar"
+FINE_T2I_ENHANCED_SQUARE_GLOB = (
+    "hf://datasets/ma-xu/fine-t2i/synthetic_enhanced_prompt_square_resolution/train-*.tar"
+)
+SOURCE_PRESETS = {
+    "journeydb": DEFAULT_SOURCE_GLOB,
+    "fine-t2i-enhanced-square": FINE_T2I_ENHANCED_SQUARE_GLOB,
+}
 
 # JPEG magic numbers — fast type sniff so we route to nvJPEG only when valid.
 _JPEG_SOI = b"\xff\xd8\xff"
@@ -82,32 +92,56 @@ def raw_bytes(array: np.ndarray) -> bytes:
     return np.ascontiguousarray(array).tobytes()
 
 
-def tensor_to_fp16_npy(tensor: torch.Tensor) -> bytes:
-    return npy_bytes(tensor.detach().cpu().to(torch.float16).numpy())
+def normalize_storage_dtype(value: str) -> str:
+    normalized = value.lower()
+    aliases = {
+        "fp16": "float16",
+        "float16": "float16",
+        "half": "float16",
+        "bf16": "bfloat16",
+        "bfloat16": "bfloat16",
+        "fp32": "float32",
+        "float32": "float32",
+        "fp8": "float8_e4m3fn",
+        "float8": "float8_e4m3fn",
+        "float8_e4m3fn": "float8_e4m3fn",
+    }
+    if normalized not in aliases:
+        raise ValueError(f"Unsupported storage dtype: {value}")
+    return aliases[normalized]
+
+
+def storage_dtype_to_numpy(tensor: torch.Tensor, dtype_name: str) -> np.ndarray:
+    """Return a NumPy payload for a logical storage dtype.
+
+    NumPy has no portable bfloat16 dtype, so bf16 is stored as uint16 bit
+    patterns and decoded using the manifest's logical dtype.
+    """
+    dtype_name = normalize_storage_dtype(dtype_name)
+    detached = tensor.detach()
+    if dtype_name == "float16":
+        return detached.to(torch.float16).cpu().numpy()
+    if dtype_name == "bfloat16":
+        return detached.to(torch.bfloat16).view(torch.uint16).cpu().numpy()
+    if dtype_name == "float32":
+        return detached.to(torch.float32).cpu().numpy()
+    if dtype_name == "float8_e4m3fn":
+        if not hasattr(torch, "float8_e4m3fn"):
+            raise RuntimeError("This PyTorch build does not support float8_e4m3fn storage.")
+        return detached.to(torch.float8_e4m3fn).view(torch.uint8).cpu().numpy()
+    raise ValueError(f"Unsupported storage dtype: {dtype_name}")
+
+
+def tensor_to_storage_npy(tensor: torch.Tensor, dtype_name: str) -> bytes:
+    return npy_bytes(storage_dtype_to_numpy(tensor, dtype_name))
 
 
 def tensor_to_u8_npy(tensor: torch.Tensor) -> bytes:
     return npy_bytes(tensor.detach().cpu().to(torch.uint8).numpy())
 
 
-def batch_to_fp16_numpy(tensor: torch.Tensor) -> np.ndarray:
-    return tensor.detach().to(torch.float16).cpu().numpy()
-
-
 def batch_to_u8_numpy(tensor: torch.Tensor) -> np.ndarray:
     return tensor.detach().to(torch.uint8).cpu().numpy()
-
-
-def batch_to_fp8_numpy(tensor: torch.Tensor) -> np.ndarray:
-    """Cast to float8_e4m3fn then view as uint8 for serialization.
-
-    Frozen text encoder outputs tolerate fp8 round-trip with negligible quality
-    loss for diffusion training. Halves the per-sample text payload.
-    """
-    if not hasattr(torch, "float8_e4m3fn"):
-        # Old PyTorch — fall back to fp16.
-        return batch_to_fp16_numpy(tensor)
-    return tensor.detach().to(torch.float8_e4m3fn).view(torch.uint8).cpu().numpy()
 
 
 def write_json(path: str | Path, payload: dict[str, Any]) -> None:
@@ -288,10 +322,27 @@ def prepare_source_chunk(
 
 
 def hf_wds_urls(source_glob: str, token: str | bool | None) -> list[str]:
-    from huggingface_hub import HfFileSystem, get_token, hf_hub_url
+    from fnmatch import fnmatch
+
+    from huggingface_hub import HfApi, HfFileSystem, get_token, hf_hub_url
 
     fs = HfFileSystem(token=token)
-    files = [fs.resolve_path(path) for path in fs.glob(source_glob)]
+    try:
+        paths = fs.glob(source_glob)
+    except FileNotFoundError:
+        paths = []
+    if not paths and source_glob.startswith("hf://datasets/"):
+        repo_and_path = source_glob[len("hf://datasets/") :]
+        repo_id, _, pattern = repo_and_path.partition("/")
+        prefix = pattern.split("*", 1)[0].rstrip("/")
+        api = HfApi(token=token if isinstance(token, str) else None)
+        repo_files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
+        paths = [
+            f"hf://datasets/{repo_id}/{path}"
+            for path in repo_files
+            if path.startswith(prefix) and fnmatch(path, pattern)
+        ]
+    files = [fs.resolve_path(path) for path in sorted(paths)]
     urls = [hf_hub_url(file.repo_id, file.path_in_repo, repo_type="dataset") for file in files]
     if not urls:
         raise FileNotFoundError(f"No source tar files matched: {source_glob}")
@@ -299,7 +350,7 @@ def hf_wds_urls(source_glob: str, token: str | bool | None) -> list[str]:
     resolved_token = get_token() if token is True else token
     if resolved_token:
         header = shlex.quote(f"Authorization:Bearer {resolved_token}")
-        return [f"pipe:curl -s -L -H {header} {shlex.quote(url)}" for url in urls]
+        return [f"pipe:curl -sSL --fail --retry 5 --retry-delay 2 -H {header} {shlex.quote(url)}" for url in urls]
     return urls
 
 
@@ -549,6 +600,11 @@ class UploadingShardWriter:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Stream HF WDS shards into Boomer latent/text WDS cache shards.")
+    parser.add_argument(
+        "--source-preset",
+        choices=sorted(SOURCE_PRESETS),
+        help="Built-in source glob preset. Use fine-t2i-enhanced-square for ma-xu/fine-t2i square enhanced prompts.",
+    )
     parser.add_argument("--source-glob", default=DEFAULT_SOURCE_GLOB)
     parser.add_argument("--split", default="train")
     parser.add_argument("--output-dir", required=True)
@@ -560,7 +616,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--text-encode-batch", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--prefetch-factor", type=int, default=2)
-    parser.add_argument("--source-chunk-size", type=int, default=16)
+    parser.add_argument("--source-chunk-size", type=int, default=64)
     parser.add_argument("--pin-memory", action="store_true")
     parser.add_argument("--async-flush", action="store_true")
     parser.add_argument("--async-flush-depth", type=int, default=2)
@@ -580,7 +636,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         choices=["eager", "sdpa", "flash_attention_2", "flash_attention_3"],
     )
-    parser.add_argument("--max-length", type=int, default=300)
+    parser.add_argument("--max-length", type=int, default=CacheConfig.max_length)
     parser.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--scaling-factor", type=float, default=DEFAULT_SCALING_FACTOR)
@@ -614,15 +670,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Use channels_last memory format for the VAE.",
     )
     parser.add_argument(
+        "--storage-dtype",
+        default="bf16",
+        choices=["fp16", "bf16", "fp32"],
+        help="On-disk dtype for both latents and text unless overridden. bf16 stores uint16 bit patterns.",
+    )
+    parser.add_argument(
+        "--latent-storage-dtype",
+        default=None,
+        choices=["fp16", "bf16", "fp32"],
+        help="Override on-disk latent dtype. Defaults to --storage-dtype.",
+    )
+    parser.add_argument(
         "--text-storage-dtype",
-        default="fp16",
-        choices=["fp16", "fp8"],
-        help="On-disk dtype for text embeddings. fp8 halves payload.",
+        default=None,
+        choices=["fp16", "bf16", "fp32", "fp8"],
+        help="Override on-disk text dtype. Defaults to --storage-dtype; fp8 halves payload.",
     )
     parser.add_argument(
         "--raw-tensors",
-        action="store_true",
-        help="Write raw bytes instead of .npy. Smaller files; loader needs dtype/shape from manifest.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write raw bytes instead of .npy. Smaller files and faster writes; disable with --no-raw-tensors.",
     )
     parser.add_argument("--world-size", type=int, default=None)
     parser.add_argument("--rank", type=int, default=None)
@@ -716,13 +785,17 @@ def main() -> None:  # noqa: C901 — single-file script, complexity is fine.
     if args.pin_memory and not pin_memory:
         print("warning: --pin-memory is ignored when not encoding on CUDA")
 
+    source_glob = SOURCE_PRESETS[args.source_preset] if args.source_preset else args.source_glob
+    latent_storage_dtype = normalize_storage_dtype(args.latent_storage_dtype or args.storage_dtype)
+    text_storage_dtype = normalize_storage_dtype(args.text_storage_dtype or args.storage_dtype)
+
     hf_token = hf_token_value(args.hf_token)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if rank == 0:
         print("Resolving source tar URLs...")
-    urls_all = hf_wds_urls(args.source_glob, hf_token)
+    urls_all = hf_wds_urls(source_glob, hf_token)
     # Per-rank URL shard. Stable so resume works.
     urls = urls_all[rank::world_size]
     rank_tag = f"r{rank:02d}" if world_size > 1 else ""
@@ -738,7 +811,8 @@ def main() -> None:  # noqa: C901 — single-file script, complexity is fine.
             f"chunk={args.source_chunk_size} pin_memory={pin_memory} "
             f"async_flush={args.async_flush}/{args.async_flush_depth} "
             f"gpu_decode={args.gpu_decode} compile={args.compile} "
-            f"channels_last={args.channels_last} text_dtype={args.text_storage_dtype} "
+            f"channels_last={args.channels_last} latent_dtype={latent_storage_dtype} "
+            f"text_dtype={text_storage_dtype} "
             f"raw_tensors={args.raw_tensors}"
         )
 
@@ -807,7 +881,7 @@ def main() -> None:  # noqa: C901 — single-file script, complexity is fine.
         )
         null_text_path = output_dir / "null_text.npy"
         null_mask_path = output_dir / "null_mask.npy"
-        null_text_path.write_bytes(tensor_to_fp16_npy(null_text[0]))
+        null_text_path.write_bytes(tensor_to_storage_npy(null_text[0], text_storage_dtype))
         null_mask_path.write_bytes(tensor_to_u8_npy(null_mask[0]))
         uploader.upload_path(null_text_path)
         uploader.upload_path(null_mask_path)
@@ -834,7 +908,6 @@ def main() -> None:  # noqa: C901 — single-file script, complexity is fine.
     pending: list[dict[str, Any]] = []
     latent_shape: list[int] | None = None
     text_shape: list[int] | None = None
-    text_storage_dtype = "float8_e4m3fn" if args.text_storage_dtype == "fp8" else "float16"
 
     stats_lock = threading.Lock()
     flush_futures: set[concurrent.futures.Future[None]] = set()
@@ -920,11 +993,8 @@ def main() -> None:  # noqa: C901 — single-file script, complexity is fine.
         if text_shape is None:
             text_shape = list(text_embeddings.shape[1:])
 
-        latents_np = batch_to_fp16_numpy(latents)
-        if args.text_storage_dtype == "fp8":
-            text_np = batch_to_fp8_numpy(text_embeddings)
-        else:
-            text_np = batch_to_fp16_numpy(text_embeddings)
+        latents_np = storage_dtype_to_numpy(latents, latent_storage_dtype)
+        text_np = storage_dtype_to_numpy(text_embeddings, text_storage_dtype)
         masks_np = batch_to_u8_numpy(attention_masks)
 
         encoder_fn = raw_bytes if args.raw_tensors else npy_bytes
@@ -942,7 +1012,8 @@ def main() -> None:  # noqa: C901 — single-file script, complexity is fine.
                     {
                         "index": item["global_index"],
                         "source_key": item["source_key"],
-                        "source_glob": args.source_glob,
+                        "source_glob": source_glob,
+                        "source_preset": args.source_preset,
                         "split": args.split,
                         "rank": rank,
                     }
@@ -1125,7 +1196,8 @@ def main() -> None:  # noqa: C901 — single-file script, complexity is fine.
     manifest = {
         "format_version": 2,
         "format": "boomer_wds_latent_text_cache",
-        "source_glob": args.source_glob,
+        "source_glob": source_glob,
+        "source_preset": args.source_preset,
         "split": args.split,
         "rank": rank,
         "world_size": world_size,
@@ -1154,9 +1226,17 @@ def main() -> None:  # noqa: C901 — single-file script, complexity is fine.
             if args.raw_tensors
             else ["latents.npy", "text.npy", "text_mask.npy", "caption.txt", "meta.json"]
         ),
-        "latents_dtype": "float16",
+        "latents_dtype": latent_storage_dtype,
+        "latents_physical_dtype": "uint16" if latent_storage_dtype == "bfloat16" else latent_storage_dtype,
         "latents_shape": latent_shape,
         "text_dtype": text_storage_dtype,
+        "text_physical_dtype": (
+            "uint16"
+            if text_storage_dtype == "bfloat16"
+            else "uint8"
+            if text_storage_dtype == "float8_e4m3fn"
+            else text_storage_dtype
+        ),
         "text_shape": text_shape,
         "text_mask_dtype": "uint8",
         "cache_config": asdict(config),

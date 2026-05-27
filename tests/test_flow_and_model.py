@@ -20,7 +20,7 @@ from boomer.datasets.latent_shards import is_cache_record_path, looks_like_cache
 from boomer.models.factory import create_model
 from boomer.models.latent_dit import LatentDiT, LatentDiTConfig  # noqa: E402
 from boomer.models.mamba_anchor_dit import MambaAnchorDiTConfig
-from boomer.models.boomer_fla_dit import BoomerFLADiTConfig, RoPE2D
+from boomer.models.boomer_fla_dit import BoomerFLADiTConfig, FLASelfMixer, RoPE2D
 from boomer.sana_flow import (  # noqa: E402
     flow_min_snr_loss_weight,
     flow_training_loss_weight,
@@ -162,6 +162,28 @@ def test_boomer_fla_dit_fallback_forward() -> None:
     assert out.shape == latent.shape
 
 
+def test_boomer_fla_condition_dropout_pads_short_checkpoint_null_condition() -> None:
+    config = BoomerFLADiTConfig(
+        hidden_dim=64,
+        depth=2,
+        num_heads=4,
+        mlp_ratio=2.5,
+        mixer_type="fallback",
+        text_seq_len=300,
+    )
+    model = create_model(config)
+    text = torch.randn(2, 340, 1536)
+    mask = torch.ones(2, 340)
+
+    dropped_text, dropped_mask = model.apply_condition_dropout(text, mask, 1.0)
+
+    assert dropped_text.shape == text.shape
+    assert dropped_mask.shape == mask.shape
+    assert torch.all(dropped_text[:, 300:] == 0)
+    assert torch.all(dropped_mask[:, :300] == 1)
+    assert torch.all(dropped_mask[:, 300:] == 0)
+
+
 def test_boomer_fla_dit_periodic_image_attention_forward() -> None:
     config = BoomerFLADiTConfig(
         hidden_dim=64,
@@ -292,6 +314,23 @@ def test_boomer_fla_cross_qk_norm_rejects_mha_backend() -> None:
         assert "cross_attention_qk_norm" in str(exc)
     else:
         raise AssertionError("expected ValueError when qk_norm is enabled with mha backend")
+
+
+def test_fla_bidirectional_mixer_runs_forward_and_reverse_with_shared_weights() -> None:
+    class DummyCausalMixer(torch.nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return x.cumsum(dim=1)
+
+    mixer = FLASelfMixer.__new__(FLASelfMixer)
+    torch.nn.Module.__init__(mixer)
+    mixer.mixer = DummyCausalMixer()
+    mixer.bidirectional = True
+
+    x = torch.arange(1, 5, dtype=torch.float32).reshape(1, 4, 1)
+    out = mixer(x)
+    expected = 0.5 * (x.cumsum(dim=1) + x.flip(1).cumsum(dim=1).flip(1))
+
+    assert torch.allclose(out, expected)
 
 
 def test_linear_warmup_cosine_lr_multiplier() -> None:
