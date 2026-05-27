@@ -207,6 +207,12 @@ def build_model_config(args: argparse.Namespace, sample_record: Any, resume_chec
         config = config_from_checkpoint(resume_checkpoint)
         train_args = resume_checkpoint.get("train_args") or {}
         updates: dict[str, Any] = {}
+        if (
+            getattr(args, "resume_weights_only", False)
+            and isinstance(config, BoomerFLADiTConfig)
+            and getattr(args, "fla_bidirectional", False)
+        ):
+            updates["fla_bidirectional"] = True
         if "y_norm" in train_args and not getattr(config, "y_norm", False):
             updates["y_norm"] = bool(train_args["y_norm"])
         if "y_norm_scale_factor" in train_args:

@@ -31,6 +31,7 @@ from boomer.sana_flow import (  # noqa: E402
 )
 from boomer.sana_latent_cache import gemma_token_select_index  # noqa: E402
 from tools.overfit_latent_dit import apply_resume_train_args, init_wandb_run, lr_multiplier  # noqa: E402
+from tools.overfit_latent_dit import build_model_config  # noqa: E402
 
 
 def test_flow_shift_roundtrip() -> None:
@@ -331,6 +332,27 @@ def test_fla_bidirectional_mixer_runs_forward_and_reverse_with_shared_weights() 
     expected = 0.5 * (x.cumsum(dim=1) + x.flip(1).cumsum(dim=1).flip(1))
 
     assert torch.allclose(out, expected)
+
+
+def test_weights_only_resume_can_enable_boomer_fla_bidirectional() -> None:
+    checkpoint_config = BoomerFLADiTConfig(
+        hidden_dim=64,
+        depth=2,
+        num_heads=4,
+        mixer_type="fla_gated_deltanet",
+        fla_bidirectional=False,
+    )
+    checkpoint = {"config": checkpoint_config.__dict__, "train_args": {}}
+    args = argparse.Namespace(resume_weights_only=True, fla_bidirectional=True)
+    sample_record = argparse.Namespace(
+        text_embedding=torch.empty(384, 1536),
+        image_latent=torch.empty(32, 16, 16),
+    )
+
+    config = build_model_config(args, sample_record, checkpoint)
+
+    assert isinstance(config, BoomerFLADiTConfig)
+    assert config.fla_bidirectional is True
 
 
 def test_linear_warmup_cosine_lr_multiplier() -> None:
