@@ -614,6 +614,9 @@ class FLASelfMixer(nn.Module):
 
         self.mixer_fwd = make_mixer()
         self.mixer_bwd = make_mixer() if self.bidirectional else None
+        if self.bidirectional:
+            self.out_proj = nn.Linear(hidden_dim * 2, hidden_dim, bias=False)
+            nn.init.zeros_(self.out_proj.weight)
 
     @staticmethod
     def _run_mixer(mixer: nn.Module, x: torch.Tensor) -> torch.Tensor:
@@ -629,7 +632,7 @@ class FLASelfMixer(nn.Module):
         if self.mixer_bwd is None:
             raise RuntimeError("bidirectional FLASelfMixer is missing the backward mixer")
         y_rev = self._run_mixer(self.mixer_bwd, x.flip(1)).flip(1)
-        return 0.5 * (y + y_rev)
+        return self.out_proj(torch.cat([y, y_rev], dim=-1))
 
 
 class BoomerFLABlock(nn.Module):

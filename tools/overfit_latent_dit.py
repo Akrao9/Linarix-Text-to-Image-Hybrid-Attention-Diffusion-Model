@@ -223,6 +223,25 @@ def build_model_config(args: argparse.Namespace, sample_record: Any, resume_chec
                 updates["use_abs_pos_embed"] = False
             if getattr(args, "patch_size", config.patch_size) != config.patch_size:
                 updates["patch_size"] = int(args.patch_size)
+            # Resolution continuation: let latent geometry update from the new data.
+            # RoPE2D/coord-RoPE rebuild their grid tables from latent_size; persistent
+            # RoPE buffers that changed shape are silently skipped by load_compatible_state_dict,
+            # so the model gets freshly-initialised tables for the new grid.
+            new_latent_size = int(sample_record.image_latent.shape[-1])
+            if new_latent_size != getattr(config, "latent_size", new_latent_size):
+                updates["latent_size"] = new_latent_size
+                print(
+                    f"[resume-weights-only] latent_size override: "
+                    f"{config.latent_size} -> {new_latent_size} "
+                    f"(RoPE tables will be re-initialised for the new grid)",
+                    flush=True,
+                )
+            new_latent_channels = int(sample_record.image_latent.shape[0])
+            if new_latent_channels != getattr(config, "latent_channels", new_latent_channels):
+                updates["latent_channels"] = new_latent_channels
+            new_text_seq_len = int(sample_record.text_embedding.shape[-2])
+            if new_text_seq_len != getattr(config, "text_seq_len", new_text_seq_len):
+                updates["text_seq_len"] = new_text_seq_len
         if "y_norm" in train_args and not getattr(config, "y_norm", False):
             updates["y_norm"] = bool(train_args["y_norm"])
         if "y_norm_scale_factor" in train_args:

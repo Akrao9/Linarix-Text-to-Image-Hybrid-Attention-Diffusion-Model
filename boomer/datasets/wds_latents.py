@@ -381,7 +381,18 @@ class RollingLocalWdsCache:
             ):
                 remote_index = self._prefetch_remote_index
                 next_path = self._prefetch_target
-                self._prefetch_thread.join()
+                _PREFETCH_TIMEOUT = 300  # 5 min; HF download should never take longer
+                self._prefetch_thread.join(timeout=_PREFETCH_TIMEOUT)
+                if self._prefetch_thread.is_alive():
+                    # Prefetch hung (HF network stall). Abandon the daemon thread and
+                    # fall through to the synchronous download path below.
+                    print(
+                        f"[wds-roll] WARNING: prefetch thread timed out after "
+                        f"{_PREFETCH_TIMEOUT}s (shard {next_path}). "
+                        "Falling back to synchronous download.",
+                        flush=True,
+                    )
+                    next_path = None  # forces re-download in the check below
                 self._prefetch_thread = None
                 self._prefetch_target = None
                 self._prefetch_remote_index = None
@@ -389,9 +400,9 @@ class RollingLocalWdsCache:
                 remote_index = self._next_epoch_remote_index(exclude=set(self._window_indices))
                 next_path = self._local_path_for(self.remote_shards[remote_index])
 
-            if next_path is None or remote_index is None:
+            if remote_index is None:
                 return
-            if not next_path.exists() or next_path.stat().st_size == 0:
+            if next_path is None or not next_path.exists() or next_path.stat().st_size == 0:
                 next_path = self._download_remote_index(remote_index)
 
             if finished_path.exists():
