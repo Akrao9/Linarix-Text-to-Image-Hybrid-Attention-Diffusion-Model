@@ -23,6 +23,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from boomer.checkpoint_utils import (  # noqa: E402
+    CheckpointOffloader,
     collect_train_args,
     config_from_checkpoint,
     load_checkpoint,
@@ -242,6 +243,15 @@ def build_model_config(args: argparse.Namespace, sample_record: Any, resume_chec
             new_text_seq_len = int(sample_record.text_embedding.shape[-2])
             if new_text_seq_len != getattr(config, "text_seq_len", new_text_seq_len):
                 updates["text_seq_len"] = new_text_seq_len
+            new_text_dim = int(sample_record.text_embedding.shape[-1])
+            if new_text_dim != getattr(config, "text_dim", new_text_dim):
+                updates["text_dim"] = new_text_dim
+                print(
+                    f"[resume-weights-only] text_dim override: "
+                    f"{config.text_dim} -> {new_text_dim} "
+                    f"(cross-attention K/V projections will be re-initialised for new text encoder)",
+                    flush=True,
+                )
         if "y_norm" in train_args and not getattr(config, "y_norm", False):
             updates["y_norm"] = bool(train_args["y_norm"])
         if "y_norm_scale_factor" in train_args:
@@ -304,6 +314,7 @@ def build_model_config(args: argparse.Namespace, sample_record: Any, resume_chec
             multimodal_coord_ids=args.multimodal_coord_ids,
             use_abs_pos_embed=args.abs_pos_embed,
             patch_size=args.patch_size,
+            gradient_checkpointing=getattr(args, "gradient_checkpointing", False),
         )
 
     return LatentDiTConfig(
@@ -760,6 +771,17 @@ def main() -> None:
         default=False,
         help="Run FLA image mixers forward and backward over the token sequence, sharing weights.",
     )
+    parser.add_argument(
+        "--grad-checkpoint",
+        action="store_true",
+        dest="gradient_checkpointing",
+        default=False,
+        help=(
+            "Recompute block activations during backward instead of storing them. "
+            "Saves ~70%% of activation memory at ~30%% extra compute. "
+            "Critical for large batches on memory-limited GPUs."
+        ),
+    )
     parser.add_argument("--use-short-conv", action="store_true")
     parser.add_argument("--conv-size", type=int, default=4)
     parser.add_argument(
@@ -904,6 +926,32 @@ def main() -> None:
         help="Save a checkpoint every N steps. Large runs often use 4000.",
     )
     parser.add_argument("--checkpoint-dir", help="Directory for periodic checkpoints.")
+    parser.add_argument(
+        "--checkpoint-upload-remote",
+        help=(
+            "Optional background upload destination. Use an rclone remote "
+            "(e.g. 'gdrive:BoomerMain4/checkpoints/run1') or an absolute local path "
+            "such as a Colab mounted Drive folder "
+            "('/content/drive/MyDrive/BoomerMain9/checkpoints/run1'). "
+            "Checkpoints are always written to --checkpoint-dir first."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-local-retain",
+        type=int,
+        default=2,
+        help="Keep this many uploaded checkpoints on local disk; older uploaded copies are deleted.",
+    )
+    parser.add_argument(
+        "--checkpoint-rclone-bin",
+        default="rclone",
+        help="rclone executable used by --checkpoint-upload-remote.",
+    )
+    parser.add_argument(
+        "--checkpoint-upload-chunk-size",
+        default="128M",
+        help="Passed to rclone as --drive-chunk-size for Google Drive uploads.",
+    )
     parser.add_argument(
         "--preview-every",
         type=int,
@@ -1136,6 +1184,11 @@ def main() -> None:
 
     if args.cache_wds:
         if args.wds_rolling_shards:
+            print(
+                f"building rolling WDS dataset: shards={args.wds_rolling_shards} "
+                f"local_dir={args.wds_local_dir} remote={args.cache_wds}",
+                flush=True,
+            )
             dataset = RollingStreamingWdsLatentCacheDataset(
                 args.cache_wds,
                 local_dir=args.wds_local_dir,
@@ -1151,6 +1204,7 @@ def main() -> None:
                 shardshuffle=args.wds_shard_shuffle or False,
                 shuffle_buffer=args.wds_shuffle_buffer,
             )
+        print("probing first training sample (may take a minute after initial shard download) ...", flush=True)
         probe_record = next(iter(dataset))
         records_label = "streaming"
     else:
@@ -1287,7 +1341,24 @@ def main() -> None:
         start_step=start_step,
         resume=resume_checkpoint is not None and not args.resume_weights_only,
     )
+    checkpoint_offloader: CheckpointOffloader | None = None
+    if args.checkpoint_upload_remote:
+        if not args.checkpoint_dir or not args.save_every:
+            raise ValueError("--checkpoint-upload-remote requires --checkpoint-dir and --save-every.")
+        checkpoint_offloader = CheckpointOffloader(
+            upload_remote=args.checkpoint_upload_remote,
+            local_retain=args.checkpoint_local_retain,
+            rclone_bin=args.checkpoint_rclone_bin,
+            drive_chunk_size=args.checkpoint_upload_chunk_size,
+            checkpoint_dir=args.checkpoint_dir,
+        )
+        print(
+            f"checkpoint offload enabled: local={args.checkpoint_dir} "
+            f"remote={args.checkpoint_upload_remote} local_retain={args.checkpoint_local_retain}"
+        )
     losses: deque[float] = deque(maxlen=args.loss_window)
+    # Rolling window of recent step wall-clock times for ETA (excludes compile spikes).
+    _recent_step_times: deque[float] = deque(maxlen=200)
     # Per-step values are accumulated as GPU tensors and only synced to host on
     # log_every boundaries. This removes ~1 cudaStreamSynchronize per step.
     pending_steps: list[int] = []
@@ -1385,6 +1456,7 @@ def main() -> None:
             if ema_model is not None and step % args.ema_update_every == 0:
                 update_ema_model(ema_model, raw_model, args.ema_decay)
 
+            _recent_step_times.append(time.perf_counter() - step_started)
             pending_steps.append(step)
             pending_losses.append(loss.detach())
             pending_raw_losses.append(raw_per_sample_loss.mean().detach())
@@ -1396,6 +1468,7 @@ def main() -> None:
             pending_lrs.append(optimizer.param_groups[0]["lr"])
 
             should_log = step == 1 or (args.log_every and step % args.log_every == 0)
+            log_snapshot: dict[str, Any] | None = None
             if should_log:
                 # One device->host transfer for all buffered steps.
                 loss_vals = torch.stack(pending_losses).to("cpu", non_blocking=False).tolist()
@@ -1414,10 +1487,17 @@ def main() -> None:
                 else:
                     for lv in loss_vals:
                         losses.append(lv)
-                loss_value = loss_vals[-1]
-                grad_norm = grad_vals[-1]
-                loss_ma = sum(losses) / len(losses)
-                lr = pending_lrs[-1]
+                log_snapshot = {
+                    "loss_value": loss_vals[-1],
+                    "grad_norm": grad_vals[-1],
+                    "loss_ma": sum(losses) / len(losses),
+                    "lr": pending_lrs[-1],
+                    "raw_loss": raw_loss_vals[-1],
+                    "sigma_low_loss": sigma_low_vals[-1],
+                    "sigma_mid_loss": sigma_mid_vals[-1],
+                    "sigma_high_loss": sigma_high_vals[-1],
+                    "sigma_mean": sigma_mean_vals[-1],
+                }
                 pending_steps.clear()
                 pending_losses.clear()
                 pending_raw_losses.clear()
@@ -1428,44 +1508,30 @@ def main() -> None:
                 pending_grad_norms.clear()
                 pending_lrs.clear()
 
-                elapsed = time.perf_counter() - train_started
-                step_s = time.perf_counter() - step_started
-                done = step - start_step
-                eta = (elapsed / done) * max(args.steps - step, 0) if done else 0.0
-                print(
-                    f"step={step:05d} loss={loss_value:.6f} loss_ma={loss_ma:.6f} "
-                    f"step_s={step_s:.2f}s elapsed={format_duration(elapsed)} eta={format_duration(eta)}"
-                )
-                if wandb_run is not None:
-                    log_wandb_metrics(
-                        step=step,
-                        loss=loss_value,
-                        loss_ma=loss_ma,
-                        lr=lr,
-                        step_s=step_s,
-                        elapsed_s=elapsed,
-                        eta_s=eta,
-                        grad_norm=grad_norm,
-                        raw_loss=raw_loss_vals[-1],
-                        sigma_low_loss=sigma_low_vals[-1],
-                        sigma_mid_loss=sigma_mid_vals[-1],
-                        sigma_high_loss=sigma_high_vals[-1],
-                        sigma_mean=sigma_mean_vals[-1],
-                    )
-
             if args.save_every and args.checkpoint_dir and step % args.save_every == 0:
                 try:
                     ckpt_path = Path(args.checkpoint_dir) / f"latent_dit_step_{step:06d}.pt"
                     train_args = build_train_args(args, config, latent_mean=latent_mean, latent_std=latent_std)
-                    resume_path, inference_path = save_training_checkpoints(
-                        ckpt_path,
-                        raw_model,
-                        config,
-                        optimizer,
-                        step,
-                        ema_model=ema_model,
-                        train_args=train_args,
-                    )
+                    if checkpoint_offloader is not None:
+                        resume_path, inference_path = checkpoint_offloader.save(
+                            ckpt_path,
+                            raw_model,
+                            config,
+                            optimizer,
+                            step,
+                            ema_model=ema_model,
+                            train_args=train_args,
+                        )
+                    else:
+                        resume_path, inference_path = save_training_checkpoints(
+                            ckpt_path,
+                            raw_model,
+                            config,
+                            optimizer,
+                            step,
+                            ema_model=ema_model,
+                            train_args=train_args,
+                        )
                     print(f"saved resume checkpoint: {resume_path}")
                     print(f"saved inference checkpoint: {inference_path}")
                 except Exception as exc:
@@ -1524,24 +1590,73 @@ def main() -> None:
                 finally:
                     if preview_model is raw_model:
                         raw_model.train()
+
+            if log_snapshot is not None:
+                elapsed = time.perf_counter() - train_started
+                step_s = time.perf_counter() - step_started
+                done = step - start_step
+                # Use median of recent step times to exclude compile spikes from ETA.
+                if _recent_step_times:
+                    _sorted = sorted(_recent_step_times)
+                    _med = _sorted[len(_sorted) // 2]
+                    eta = _med * max(args.steps - step, 0)
+                elif done:
+                    eta = (elapsed / done) * max(args.steps - step, 0)
+                else:
+                    eta = 0.0
+                print(
+                    f"step={step:05d} loss={log_snapshot['loss_value']:.6f} "
+                    f"loss_ma={log_snapshot['loss_ma']:.6f} "
+                    f"step_s={step_s:.2f}s elapsed={format_duration(elapsed)} eta={format_duration(eta)}"
+                )
+                if wandb_run is not None:
+                    log_wandb_metrics(
+                        step=step,
+                        loss=log_snapshot["loss_value"],
+                        loss_ma=log_snapshot["loss_ma"],
+                        lr=log_snapshot["lr"],
+                        step_s=step_s,
+                        elapsed_s=elapsed,
+                        eta_s=eta,
+                        grad_norm=log_snapshot["grad_norm"],
+                        raw_loss=log_snapshot["raw_loss"],
+                        sigma_low_loss=log_snapshot["sigma_low_loss"],
+                        sigma_mid_loss=log_snapshot["sigma_mid_loss"],
+                        sigma_high_loss=log_snapshot["sigma_high_loss"],
+                        sigma_mean=log_snapshot["sigma_mean"],
+                    )
     finally:
         if csv_file is not None:
             csv_file.flush()
             csv_file.close()
+        if checkpoint_offloader is not None:
+            checkpoint_offloader.finish()
         finish_wandb_run(wandb_run)
 
     if args.save:
         try:
             train_args = build_train_args(args, config, latent_mean=latent_mean, latent_std=latent_std)
-            resume_path, inference_path = save_training_checkpoints(
-                args.save,
-                raw_model,
-                config,
-                optimizer,
-                last_step,
-                ema_model=ema_model,
-                train_args=train_args,
-            )
+            if checkpoint_offloader is not None:
+                resume_path, inference_path = checkpoint_offloader.save(
+                    args.save,
+                    raw_model,
+                    config,
+                    optimizer,
+                    last_step,
+                    ema_model=ema_model,
+                    train_args=train_args,
+                )
+                checkpoint_offloader.finish()
+            else:
+                resume_path, inference_path = save_training_checkpoints(
+                    args.save,
+                    raw_model,
+                    config,
+                    optimizer,
+                    last_step,
+                    ema_model=ema_model,
+                    train_args=train_args,
+                )
             print(f"saved resume checkpoint: {resume_path}")
             print(f"saved inference checkpoint: {inference_path}")
         except Exception as exc:

@@ -1,494 +1,200 @@
-# Boomer
+---
+license: other
+tags:
+  - text-to-image
+  - diffusion
+  - linear-attention
+  - pytorch
+  - safetensors
+language:
+  - en
+pipeline_tag: text-to-image
+---
 
-Boomer is a Flame-backed text-to-image research project. The first milestone is a
-Sana-compatible latent cache pipeline using Hugging Face models:
+# Boomer FLA
 
-- image encoder/decoder: `mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers`
-- text encoder: `google/gemma-4-E2B-it`
+Boomer FLA is a 657M parameter text-to-image diffusion model that generates **1024×1024px** images from text prompts.
 
-## First Smoke Test
+Instead of standard quadratic self-attention, it uses **GatedDeltaNet** — a bidirectional Flash Linear Attention mixer — as the backbone of its transformer blocks. This keeps memory flat regardless of sequence length. Every 6th block adds a full SDPA layer for global spatial coherence.
 
-From this folder:
+Text conditioning uses **Gemma 4 2B** (1536-dim embeddings, up to 300 tokens). Decoding uses the **DC-AE f32c32** VAE with 32× spatial compression, producing 32×32 latents from 1024px images. Sampling uses **STORK-2**, a high-order Runge–Kutta flow matching solver that converges in 32 steps.
 
-```bash
-python -m boomer.sana_latent_cache \
-  --image /path/to/image.jpg \
-  --caption "a detailed caption for the image" \
-  --out cache/debug/sample.pt \
-  --decoded-out cache/debug/reconstruction.png
-```
+Fine-tuned from a JourneyDB-pretrained base on 600k high-resolution images at 1024px.
 
-This loads the Hugging Face encoders, creates one cached training record, reloads
-it, and decodes the image latent back to a reconstruction.
+---
 
-Gemma 4 may require a recent Transformers install:
+## Sample outputs
 
-```bash
-pip install -U transformers torch accelerate
-```
+![Model grid — portraits and landscapes](boomer_model_grid.png)
 
-Inspect a cache file before training:
+*Portraits (top) and landscapes (bottom) generated at 1024×1024px, 32 STORK-2 steps, CFG 4.5.*
 
-```bash
-python tools/inspect_latent_cache.py cache/debug/sample.pt
-```
+---
 
-Inspect the Hugging Face JourneyDB mirror before caching:
+## Architecture
 
-```bash
-python tools/inspect_hf_dataset.py \
-  --dataset BLIP3o/BLIP3o-Pretrain-JourneyDB \
-  --split train \
-  --streaming \
-  --save-image /content/drive/MyDrive/Boomer/cache/debug/hf_sample.png
-```
+| Property | Value |
+|---|---|
+| Parameters | 657M |
+| Backbone | Bidirectional GatedDeltaNet (Flash Linear Attention) |
+| Depth | 24 layers |
+| Hidden dim | 896 |
+| Heads | 14 |
+| Image attention | Every 6th layer (full SDPA + 2D RoPE) |
+| Patch size | 1 — one token per latent pixel (256 tokens at 512px, 1024 tokens at 1024px) |
+| Text encoder | Gemma 4 2B (`google/gemma-4-E2B-it`) |
+| VAE | DC-AE f32c32 (`mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers`) |
+| Sampler | STORK-2, 32 steps |
+| Dtype | bfloat16 |
 
-Cache a tiny Hugging Face dataset slice:
+---
 
-```bash
-python tools/cache_hf_dataset.py \
-  --dataset BLIP3o/BLIP3o-Pretrain-JourneyDB \
-  --split train \
-  --streaming \
-  --limit 32 \
-  --out-dir /content/drive/MyDrive/Boomer/cache/journeydb_512_debug \
-  --image-columns jpg,image,png \
-  --caption-columns txt,text,prompt,caption,original_prompt,generated_text
-```
+## Training details
 
-Or cache local WebDataset tar shards:
+| Setting | Value |
+|---|---|
+| Pre-train dataset | JourneyDB (~3.8M images, 512px, patch size 1) |
+| Fine-tune dataset | FineT2I (~600k images, 1024px, patch size 1) |
+| Fine-tune steps | 55,000 |
+| Batch size | 24 |
+| Learning rate | 1e-4, linear warmup (1000 steps) → cosine decay |
+| Flow shift | 1.5 |
+| Timestep sampler | Plateau logit-normal (μ=0, σ=1) |
+| Min-SNR γ | 5.0 |
+| CFG dropout | 0.1 |
+| EMA decay | 0.999 |
+| Gradient clip | 0.3 |
+| Optimizer | Fused AdamW |
+| Hardware | NVIDIA A100 (Google Colab) |
+| Precision | bfloat16 |
 
-```bash
-python tools/cache_hf_dataset.py \
-  --dataset webdataset \
-  --data-files "/content/drive/MyDrive/Boomer/raw_journeydb/*.tar" \
-  --split train \
-  --no-streaming \
-  --num-proc 8 \
-  --cache-dir /content/hf_cache \
-  --limit 32 \
-  --out-dir /content/drive/MyDrive/Boomer/cache/journeydb_512_debug \
-  --image-columns jpg,image,png \
-  --caption-columns txt,text,prompt,caption
-```
+---
 
-Overfit the first LatentDiT baseline on a tiny cache:
+## VRAM and RAM requirements
 
-```bash
-python tools/overfit_latent_dit.py \
-  --cache /content/boomer_debug_cache \
-  --steps 200 \
-  --batch-size 4 \
-  --save /content/boomer_debug_latent_dit.pt
-```
+Measured at 1024×1024px, bfloat16, STORK-2, CFG batch=2.
 
-Longer debug training with logs, periodic checkpoints, and denoise previews:
+| Component | VRAM |
+|---|---|
+| DiT weights (EMA, bf16) | 1.25 GB |
+| Gemma 4 2B text encoder | 8.62 GB |
+| Denoising peak (CFG on) | 1.36 GB |
+| VAE decode peak | 3.51 GB |
 
-```bash
-python tools/overfit_latent_dit.py \
-  --cache /content/boomer_debug_cache \
-  --steps 2000 \
-  --batch-size 4 \
-  --lr 3e-4 \
-  --log-every 20 \
-  --loss-window 100 \
-  --log-csv /content/boomer_train_debug/loss.csv \
-  --save-every 500 \
-  --checkpoint-dir /content/boomer_train_debug/checkpoints \
-  --preview-every 500 \
-  --preview-cache-record /content/boomer_debug_cache/00000000_d8dfa99fb3d6.pt \
-  --preview-out-dir /content/boomer_train_debug/previews \
-  --preview-t 0.3 \
-  --preview-steps 8 \
-  --hf-token true \
-  --save /content/boomer_train_debug/latent_dit_final.pt
-```
+| Mode | Peak VRAM | Minimum GPU |
+|---|---|---|
+| **Condition-cache** — pre-encoded embeddings, no text encoder in VRAM | **4.76 GB** | RTX 3060 8GB, T4 |
+| **Fresh-prompt** — text encoder + DiT + VAE together | **13.38 GB** | RTX 3090, A100 |
 
-Cross-attention variant over full Gemma tokens:
+**System RAM**: loading the text encoder (Gemma 4 2B) requires ~9 GB of system RAM even when using GPU. For condition-cache mode, encoding can be done on CPU with ~9 GB RAM — the generation step then needs only 5 GB VRAM.
+
+---
+
+## Usage
+
+### Install
 
 ```bash
-python tools/overfit_latent_dit.py \
-  --cache /content/boomer_cache_512 \
-  --steps 10000 \
-  --batch-size 16 \
-  --lr 3e-4 \
-  --cross-attn \
-  --cond-dropout 0.1 \
-  --ema-decay 0.999 \
-  --log-every 50 \
-  --loss-window 200 \
-  --log-csv /content/boomer_train_512_cross/loss.csv \
-  --save-every 1000 \
-  --checkpoint-dir /content/boomer_train_512_cross/checkpoints \
-  --preview-every 1000 \
-  --preview-cache-record /content/boomer_cache_512/PASTE_FIRST_CACHE_RECORD.pt \
-  --preview-out-dir /content/boomer_train_512_cross/previews \
-  --preview-t 0.3 \
-  --preview-steps 8 \
-  --hf-token true \
-  --save /content/boomer_train_512_cross/latent_dit_final.pt
+pip install torch diffusers transformers accelerate safetensors
+pip install git+https://github.com/fla-org/flash-linear-attention.git
+# STORK is bundled with the model — no separate install needed
 ```
 
-Recommended Colab notebook-style next run after smudged random samples:
+### Generate
 
 ```python
-from pathlib import Path
+import torch
+from diffusers import DiffusionPipeline
 
-CACHE_DIR = "/content/boomer_cache_2k"
-TRAIN_DIR = "/content/boomer_train_2k_cross_cfg_ema"
-DRIVE_CKPT_DIR = "/content/drive/MyDrive/Boomer/checkpoints/boomer_train_2k_cross_cfg_ema"
+pipe = DiffusionPipeline.from_pretrained(
+    "akrao9/Boomer-T2I",
+    custom_pipeline="pipeline_boomer",
+    trust_remote_code=True,
+    torch_dtype=torch.bfloat16,
+).to("cuda")
+
+image = pipe("a photorealistic portrait of a woman with dark hair")[0]
+image.save("output.png")
 ```
 
-```python
-!python tools/cache_hf_dataset.py \
-  --dataset BLIP3o/BLIP3o-Pretrain-JourneyDB \
-  --split train \
-  --streaming \
-  --limit 2048 \
-  --batch-size 8 \
-  --out-dir "{CACHE_DIR}" \
-  --hf-token true
-```
+> **Note:** The transformer weights (~1.25 GB) are downloaded from this repo. The VAE and Gemma 4 2B text encoder are fetched automatically from their upstream HuggingFace repos on first use (~10 GB total). Make sure you have accepted the [Gemma Terms of Use](https://ai.google.dev/gemma/terms) and are logged in with `huggingface-cli login`.
+
+### Parameters
 
 ```python
-FIRST_CACHE = str(next(Path(CACHE_DIR).glob("*.pt")))
-FIRST_CACHE
+image = pipe(
+    "a rocky coastline at sunset with crashing waves",
+    steps=32,        # denoising steps — 32 is recommended with STORK-2
+    cfg_scale=4.5,   # classifier-free guidance scale (4.0–5.0)
+    cfg_rescale=0.5, # reduces over-saturation at high CFG
+    # seed=42,       # fix a seed for reproducibility; omit for a random image each run
+)[0]
 ```
 
+### Low VRAM — condition cache mode
+
+Encode prompts once on any machine (including CPU), save the embedding, then generate with only the 1.25 GB DiT loaded. Peak VRAM drops from 13.38 GB → 4.76 GB.
+
 ```python
-!python tools/overfit_latent_dit.py \
-  --cache "{CACHE_DIR}" \
-  --steps 20000 \
-  --batch-size 32 \
-  --lr 2e-4 \
-  --cross-attn \
-  --cond-dropout 0.1 \
-  --ema-decay 0.999 \
-  --log-every 50 \
-  --loss-window 200 \
-  --log-csv "{TRAIN_DIR}/loss.csv" \
-  --save-every 1000 \
-  --checkpoint-dir "{DRIVE_CKPT_DIR}/checkpoints" \
-  --preview-every 1000 \
-  --preview-cache-record "{FIRST_CACHE}" \
-  --preview-out-dir "{TRAIN_DIR}/previews" \
-  --preview-t 0.3 \
-  --preview-steps 8 \
-  --hf-token true \
-  --save "{DRIVE_CKPT_DIR}/latent_dit_final.pt"
+# Step 1 — encode on any machine (even CPU with 9GB RAM)
+import torch
+from transformers import AutoModelForCausalLM, AutoProcessor
+
+TE_REPO      = "google/gemma-4-E2B-it"
+tokenizer    = AutoProcessor.from_pretrained(TE_REPO)
+text_encoder = AutoModelForCausalLM.from_pretrained(
+    TE_REPO, torch_dtype=torch.bfloat16
+).get_decoder()
+
+tokens = tokenizer(
+    "a mountain lake surrounded by alpine peaks",
+    max_length=300, padding="max_length",
+    truncation=True, return_tensors="pt",
+)
+with torch.inference_mode():
+    hidden = text_encoder(
+        tokens["input_ids"], attention_mask=tokens["attention_mask"]
+    )[0]
+    idx  = [0] + list(range(-299, 0))
+    emb  = hidden[:, idx]
+    mask = tokens["attention_mask"][:, idx]
+
+torch.save({"emb": emb.cpu(), "mask": mask.cpu()}, "condition.pt")
 ```
 
 ```python
-!python tools/sample_latent_dit.py \
-  --checkpoint "{DRIVE_CKPT_DIR}/latent_dit_final.pt" \
-  --condition-cache "{FIRST_CACHE}" \
-  --out "{TRAIN_DIR}/sample_cfg2.png" \
-  --steps 96 \
-  --sampler euler \
-  --cfg-scale 2.0 \
-  --weights auto \
-  --seed 0 \
-  --hf-token true
+# Step 2 — generate on low-VRAM GPU
+# Load only the DiT weights; skip text encoder by providing embeddings directly
+import torch
+from huggingface_hub import snapshot_download
+import sys
+
+local = snapshot_download("akrao9/Boomer-T2I")
+sys.path.insert(0, local)
+from pipeline_boomer import BoomerPipeline
+from modeling_boomer_fla import BoomerFLADiT
+
+transformer = BoomerFLADiT.from_pretrained(local, subfolder="transformer").to("cuda", dtype=torch.bfloat16)
+pipe = BoomerPipeline(transformer=transformer).to("cuda")
+# pipe.text_encoder and pipe.vae remain None until __call__ — override with pre-encoded emb manually
 ```
 
-Compare Heun against Euler at the same seed. Heun uses two model calls per step, so 48 Heun steps is similar cost to 96 Euler steps:
+---
 
-```python
-!python tools/sample_latent_dit.py \
-  --checkpoint "{DRIVE_CKPT_DIR}/latent_dit_final.pt" \
-  --condition-cache "{FIRST_CACHE}" \
-  --out "{TRAIN_DIR}/sample_heun_cfg2.png" \
-  --steps 48 \
-  --sampler heun \
-  --cfg-scale 2.0 \
-  --weights auto \
-  --seed 0 \
-  --hf-token true
-```
+## Limitations
 
-Sana-style flow run after blurry high-noise samples:
+- **Strong at** — photorealistic human portraits, dramatic landscapes, architectural scenes
+- **Weak at** — animals, text rendering, small detailed objects (limited training data coverage)
+- Landscapes have a painterly/HDR bias inherited from heavily post-processed stock images in the training set
+- Not safety filtered — outputs may reflect biases in the training data
+- Maximum tested resolution: **1024×1024px**
 
-```python
-from pathlib import Path
+---
 
-CACHE_DIR = "/content/boomer_cache_10k"
-STATS_JSON = "/content/boomer_cache_10k_stats.json"
-TRAIN_DIR = "/content/boomer_train_10k_sana_flow"
-DRIVE_CKPT_DIR = "/content/drive/MyDrive/Boomer/checkpoints/boomer_train_10k_sana_flow"
-```
+## License
 
-```python
-!python tools/cache_hf_dataset.py \
-  --dataset BLIP3o/BLIP3o-Pretrain-JourneyDB \
-  --split train \
-  --streaming \
-  --limit 10000 \
-  --batch-size 8 \
-  --out-dir "{CACHE_DIR}" \
-  --hf-token true
-```
+The Boomer FLA model weights are released for research and personal use. Commercial use is not permitted without explicit permission.
 
-```python
-!python tools/inspect_latent_stats.py "{CACHE_DIR}" \
-  --json-out "{STATS_JSON}"
-```
-
-```python
-FIRST_CACHE = str(next(Path(CACHE_DIR).glob("*.pt")))
-FIRST_CACHE
-```
-
-```python
-!python tools/overfit_latent_dit.py \
-  --cache "{CACHE_DIR}" \
-  --steps 50000 \
-  --batch-size 32 \
-  --lr 1e-4 \
-  --hidden-dim 768 \
-  --depth 12 \
-  --num-heads 12 \
-  --cross-attn \
-  --cond-dropout 0.1 \
-  --ema-decay 0.999 \
-  --latent-stats-json "{STATS_JSON}" \
-  --latent-stats-mode channel \
-  --t-sampler logit-normal \
-  --flow-shift 3.0 \
-  --logit-mean 0.0 \
-  --logit-std 1.0 \
-  --y-norm \
-  --y-norm-scale-factor 0.01 \
-  --grad-clip 0.1 \
-  --log-every 50 \
-  --loss-window 200 \
-  --log-csv "{TRAIN_DIR}/loss.csv" \
-  --save-every 1000 \
-  --checkpoint-dir "{DRIVE_CKPT_DIR}/checkpoints" \
-  --preview-every 1000 \
-  --preview-cache-record "{FIRST_CACHE}" \
-  --preview-out-dir "{TRAIN_DIR}/previews" \
-  --preview-t 0.8 \
-  --preview-steps 32 \
-  --hf-token true \
-  --save "{DRIVE_CKPT_DIR}/latent_dit_final.pt"
-```
-
-Sampling automatically reuses the checkpoint's flow shift, latent stats, and y-norm settings:
-
-```python
-!python tools/sample_latent_dit.py \
-  --checkpoint "{DRIVE_CKPT_DIR}/latent_dit_final.pt" \
-  --condition-cache "{FIRST_CACHE}" \
-  --out "{TRAIN_DIR}/sample_heun_cfg2.png" \
-  --steps 96 \
-  --sampler heun \
-  --cfg-scale 2.0 \
-  --weights auto \
-  --seed 0 \
-  --hf-token true
-```
-
-```python
-!python tools/sample_latent_dit.py \
-  --checkpoint "{DRIVE_CKPT_DIR}/latent_dit_final.pt" \
-  --condition-cache "{FIRST_CACHE}" \
-  --out "{TRAIN_DIR}/sample_heun_cfg15.png" \
-  --steps 64 \
-  --sampler heun \
-  --cfg-scale 1.5 \
-  --weights auto \
-  --seed 0 \
-  --hf-token true
-```
-
-If Euler and Heun both remain smudged, check latent scale and move to a 10k cache:
-
-```python
-from pathlib import Path
-
-CACHE_DIR = "/content/boomer_cache_10k"
-TRAIN_DIR = "/content/boomer_train_10k_cross_cfg_ema_norm"
-DRIVE_CKPT_DIR = "/content/drive/MyDrive/Boomer/checkpoints/boomer_train_10k_cross_cfg_ema_norm"
-STATS_JSON = "/content/boomer_cache_10k_stats.json"
-```
-
-```python
-!python tools/cache_hf_dataset.py \
-  --dataset BLIP3o/BLIP3o-Pretrain-JourneyDB \
-  --split train \
-  --streaming \
-  --limit 10000 \
-  --batch-size 8 \
-  --out-dir "{CACHE_DIR}" \
-  --hf-token true
-```
-
-```python
-!python tools/inspect_latent_stats.py "{CACHE_DIR}" --json-out "{STATS_JSON}"
-```
-
-```python
-import json
-
-stats = json.load(open(STATS_JSON))
-FIRST_CACHE = str(next(Path(CACHE_DIR).glob("*.pt")))
-stats["global_std"], stats["channel_std_min"], stats["channel_std_max"], FIRST_CACHE
-```
-
-```python
-!python tools/overfit_latent_dit.py \
-  --cache "{CACHE_DIR}" \
-  --steps 30000 \
-  --batch-size 32 \
-  --lr 2e-4 \
-  --cross-attn \
-  --cond-dropout 0.1 \
-  --ema-decay 0.999 \
-  --latent-stats-json "{STATS_JSON}" \
-  --latent-stats-mode channel \
-  --log-every 50 \
-  --loss-window 200 \
-  --log-csv "{TRAIN_DIR}/loss.csv" \
-  --save-every 1000 \
-  --checkpoint-dir "{DRIVE_CKPT_DIR}/checkpoints" \
-  --preview-every 1000 \
-  --preview-cache-record "{FIRST_CACHE}" \
-  --preview-out-dir "{TRAIN_DIR}/previews" \
-  --preview-t 0.3 \
-  --preview-steps 8 \
-  --hf-token true \
-  --save "{DRIVE_CKPT_DIR}/latent_dit_final.pt"
-```
-
-```python
-!python tools/sample_latent_dit.py \
-  --checkpoint "{DRIVE_CKPT_DIR}/latent_dit_final.pt" \
-  --condition-cache "{FIRST_CACHE}" \
-  --out "{TRAIN_DIR}/sample_heun_cfg2.png" \
-  --steps 64 \
-  --sampler heun \
-  --cfg-scale 2.0 \
-  --weights auto \
-  --seed 0 \
-  --hf-token true
-```
-
-If samples are still blurry, run a known-latent high-noise denoise grid before retraining:
-
-```python
-!python tools/denoise_cached_latent.py \
-  --checkpoint "{DRIVE_CKPT_DIR}/latent_dit_final.pt" \
-  --cache-record "{FIRST_CACHE}" \
-  --out-dir "{TRAIN_DIR}/denoise_grid" \
-  --t-values 0.3,0.6,0.8,0.95 \
-  --steps 32 \
-  --weights auto \
-  --seed 0 \
-  --hf-token true
-```
-
-If `t=0.8` or `t=0.95` still fails, train a high-noise-biased run:
-
-```python
-HIGH_T_DIR = "/content/boomer_train_2k_channel_norm_high_t"
-HIGH_T_CKPT_DIR = "/content/drive/MyDrive/Boomer/checkpoints/boomer_train_2k_channel_norm_high_t"
-```
-
-```python
-!python tools/overfit_latent_dit.py \
-  --cache "{CACHE_DIR}" \
-  --steps 20000 \
-  --batch-size 32 \
-  --lr 2e-4 \
-  --cross-attn \
-  --cond-dropout 0.1 \
-  --ema-decay 0.999 \
-  --latent-stats-json "{STATS_JSON}" \
-  --latent-stats-mode channel \
-  --t-sampler high \
-  --t-bias 2.0 \
-  --log-every 50 \
-  --loss-window 200 \
-  --log-csv "{HIGH_T_DIR}/loss.csv" \
-  --save-every 1000 \
-  --checkpoint-dir "{HIGH_T_CKPT_DIR}/checkpoints" \
-  --preview-every 1000 \
-  --preview-cache-record "{FIRST_CACHE}" \
-  --preview-out-dir "{HIGH_T_DIR}/previews" \
-  --preview-t 0.8 \
-  --preview-steps 32 \
-  --hf-token true \
-  --save "{HIGH_T_CKPT_DIR}/latent_dit_final.pt"
-```
-
-To resume from a saved Drive checkpoint, add `--resume` and keep `--steps` as the total target step:
-
-```python
-RESUME = f"{DRIVE_CKPT_DIR}/checkpoints/latent_dit_step_010000.pt"
-```
-
-```python
-!python tools/overfit_latent_dit.py \
-  --cache "{CACHE_DIR}" \
-  --resume "{RESUME}" \
-  --steps 20000 \
-  --batch-size 32 \
-  --lr 2e-4 \
-  --cond-dropout 0.1 \
-  --ema-decay 0.999 \
-  --log-every 50 \
-  --loss-window 200 \
-  --log-csv "{TRAIN_DIR}/loss_resume.csv" \
-  --save-every 1000 \
-  --checkpoint-dir "{DRIVE_CKPT_DIR}/checkpoints" \
-  --preview-every 1000 \
-  --preview-cache-record "{FIRST_CACHE}" \
-  --preview-out-dir "{TRAIN_DIR}/previews_resume" \
-  --preview-t 0.3 \
-  --preview-steps 8 \
-  --hf-token true \
-  --save "{DRIVE_CKPT_DIR}/latent_dit_final.pt"
-```
-
-Sample and decode from the overfit checkpoint:
-
-```bash
-python tools/sample_latent_dit.py \
-  --checkpoint /content/boomer_debug_latent_dit.pt \
-  --condition-cache /content/boomer_debug_cache/00000000_d8dfa99fb3d6.pt \
-  --out /content/boomer_debug_sample.png \
-  --steps 32 \
-  --seed 0 \
-  --hf-token true
-```
-
-In Colab notebook-style cells:
-
-```python
-from pathlib import Path
-
-FIRST_CACHE = str(next(Path("/content/boomer_cache_512").glob("*.pt")))
-```
-
-```python
-!python tools/sample_latent_dit.py \
-  --checkpoint /content/boomer_train_512_cross/latent_dit_final.pt \
-  --condition-cache "{FIRST_CACHE}" \
-  --out /content/boomer_train_512_cross/sample_final.png \
-  --steps 64 \
-  --seed 0 \
-  --hf-token true
-```
-
-Denoise a known cached latent:
-
-```bash
-python tools/denoise_cached_latent.py \
-  --checkpoint /content/boomer_debug_latent_dit.pt \
-  --cache-record /content/boomer_debug_cache/00000000_d8dfa99fb3d6.pt \
-  --out-dir /content/boomer_denoise_debug \
-  --t 0.3 \
-  --steps 8 \
-  --seed 0 \
-  --hf-token true
-```
+Upstream component licenses:
+- DC-AE VAE: [mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers](https://huggingface.co/mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers)
+- Gemma 4 text encoder: [Gemma Terms of Use](https://ai.google.dev/gemma/terms)

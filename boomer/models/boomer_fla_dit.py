@@ -11,6 +11,7 @@ from pathlib import Path
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as _ckpt
 
 from boomer.models.latent_dit import AttentionRMSNorm, CaptionEmbedder, TimestepEmbedder
 
@@ -45,6 +46,7 @@ class BoomerFLADiTConfig:
     multimodal_coord_ids: bool = False
     use_abs_pos_embed: bool = True
     patch_size: int = 1
+    gradient_checkpointing: bool = False
 
 
 def maybe_add_sibling_fla_repo() -> None:
@@ -62,6 +64,9 @@ def maybe_add_sibling_flash_attention_repo() -> None:
     candidates = [
         Path(__file__).resolve().parents[3] / "flash-attention" / "hopper",
         Path(__file__).resolve().parents[3] / "flash-attention",
+        Path("/work/flash-attention/hopper"),
+        Path("/work/flash-attention"),
+        Path("/home/jovyan/work/flash-attention"),
         Path("/content/flash-attention/hopper"),
         Path("/content/flash-attention"),
     ]
@@ -355,6 +360,8 @@ class FullImageSelfAttention(nn.Module):
         except Exception:
             flash4_paths = [
                 Path(__file__).resolve().parents[3] / "flash-attention" / "flash_attn",
+                Path("/work/flash-attention/flash_attn"),
+                Path("/home/jovyan/work/flash-attention/flash_attn"),
                 Path("/content/flash-attention/flash_attn"),
             ]
             existing_paths = [str(path) for path in flash4_paths if (path / "cute").is_dir()]
@@ -398,6 +405,17 @@ class FullImageSelfAttention(nn.Module):
             out = out[0]
         return out
 
+    @staticmethod
+    def _flash_compute_dtype(x: torch.Tensor) -> torch.dtype | None:
+        """FA kernels need fp16/bf16; fp32 master weights + compile may still pass fp32 activations."""
+        if not x.is_cuda:
+            return None
+        if x.dtype in {torch.float16, torch.bfloat16}:
+            return x.dtype
+        if torch.is_autocast_enabled():
+            return torch.get_autocast_dtype("cuda")
+        return torch.bfloat16
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch, tokens, channels = x.shape
         qkv = self.qkv(x).reshape(batch, tokens, 3, self.num_heads, self.head_dim)
@@ -405,10 +423,11 @@ class FullImageSelfAttention(nn.Module):
         if self.rope is not None:
             q, k = self.rope(q, k)
 
-        use_flash = self.backend in {"flash3", "flash4", "auto"} and x.is_cuda and x.dtype in {
-            torch.float16,
-            torch.bfloat16,
-        }
+        flash_dtype = self._flash_compute_dtype(x)
+        use_flash = self.backend in {"flash3", "flash4", "auto"} and flash_dtype is not None
+        if use_flash and (q.dtype != flash_dtype or k.dtype != flash_dtype or v.dtype != flash_dtype):
+            q, k, v = q.to(flash_dtype), k.to(flash_dtype), v.to(flash_dtype)
+
         if self.backend == "flash4" and use_flash:
             out = self._flash4_attention(q, k, v)
         elif self.backend == "flash3" and use_flash:
@@ -423,8 +442,10 @@ class FullImageSelfAttention(nn.Module):
                     use_flash = False
         if self.backend in {"flash3", "flash4"} and not use_flash:
             raise RuntimeError(
-                f"image_attention_backend='{self.backend}' requires CUDA fp16/bf16 tensors; got {x.device} {x.dtype}"
+                f"image_attention_backend='{self.backend}' requires CUDA fp16/bf16 compute; got {x.device} {x.dtype}"
             )
+        if use_flash and out.dtype != x.dtype:
+            out = out.to(dtype=x.dtype)
         if not use_flash:
             q = q.transpose(1, 2)
             k = k.transpose(1, 2)
@@ -1106,30 +1127,46 @@ class BoomerFLADiT(nn.Module):
         text_attn_bias = text_key_padding_mask[:, None, None, :].to(dtype=x.dtype)
         text_attn_bias = text_attn_bias.masked_fill(text_attn_bias > 0, -10000.0)
         t_emb = self.t_embedder(timesteps)
+        use_ckpt = self.config.gradient_checkpointing and self.training
         for block in self.blocks:
             if getattr(block, "updates_text", False):
-                x, text_tokens = block(
-                    x,
-                    text_tokens,
-                    t_emb,
-                    text_key_padding_mask,
-                    text_attn_bias,
-                    height=token_height,
-                    width=token_width,
-                    coord_rope=self.coord_embedder,
-                    image_coord_ids=image_coord_ids,
-                    text_coord_ids=text_coord_ids,
-                )
+                # Dual-stream block: returns (x, text_tokens).
+                # Non-tensor args (height, width, coord_rope, coord IDs) captured via closure.
+                _h, _w = token_height, token_width
+                _cr, _ii, _ti = self.coord_embedder, image_coord_ids, text_coord_ids
+                if use_ckpt:
+                    def _dual_fn(x, tt, te, mk, bi,
+                                 _blk=block, h=_h, w=_w, cr=_cr, ii=_ii, ti=_ti):
+                        return _blk(x, tt, te, mk, bi,
+                                    height=h, width=w, coord_rope=cr,
+                                    image_coord_ids=ii, text_coord_ids=ti)
+                    x, text_tokens = _ckpt(_dual_fn, x, text_tokens, t_emb,
+                                           text_key_padding_mask, text_attn_bias,
+                                           use_reentrant=False,
+                                           preserve_rng_state=False)
+                else:
+                    x, text_tokens = block(
+                        x, text_tokens, t_emb, text_key_padding_mask, text_attn_bias,
+                        height=token_height, width=token_width,
+                        coord_rope=self.coord_embedder,
+                        image_coord_ids=image_coord_ids, text_coord_ids=text_coord_ids,
+                    )
             else:
-                x = block(
-                    x,
-                    text_tokens,
-                    t_emb,
-                    text_key_padding_mask,
-                    text_attn_bias,
-                    height=token_height,
-                    width=token_width,
-                )
+                # Single-stream block: returns x only.
+                _h, _w = token_height, token_width
+                if use_ckpt:
+                    def _single_fn(x, tt, te, mk, bi,
+                                   _blk=block, h=_h, w=_w):
+                        return _blk(x, tt, te, mk, bi, height=h, width=w)
+                    x = _ckpt(_single_fn, x, text_tokens, t_emb,
+                               text_key_padding_mask, text_attn_bias,
+                               use_reentrant=False,
+                               preserve_rng_state=False)
+                else:
+                    x = block(
+                        x, text_tokens, t_emb, text_key_padding_mask, text_attn_bias,
+                        height=token_height, width=token_width,
+                    )
         final_mod = self.final_t_block(t_emb)
         shift, scale = final_mod.reshape(batch, 2, -1).chunk(2, dim=1)
         x = modulate(self.final_norm(x), shift, scale)

@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from boomer.checkpoint_utils import (  # noqa: E402
+    CheckpointOffloader,
     load_checkpoint,
     save_inference_checkpoint,
     save_resume_checkpoint,
@@ -20,7 +21,7 @@ from boomer.datasets.latent_shards import is_cache_record_path, looks_like_cache
 from boomer.models.factory import create_model
 from boomer.models.latent_dit import LatentDiT, LatentDiTConfig  # noqa: E402
 from boomer.models.mamba_anchor_dit import MambaAnchorDiTConfig
-from boomer.models.boomer_fla_dit import BoomerFLADiTConfig, FLASelfMixer, RoPE2D
+from boomer.models.boomer_fla_dit import BoomerFLADiTConfig, FLASelfMixer, FullImageSelfAttention, RoPE2D
 from boomer.sana_flow import (  # noqa: E402
     flow_min_snr_loss_weight,
     flow_training_loss_weight,
@@ -204,6 +205,13 @@ def test_boomer_fla_dit_periodic_image_attention_forward() -> None:
     assert out.shape == latent.shape
     assert model.blocks[0].use_image_attention is False
     assert model.blocks[1].use_image_attention is True
+
+
+def test_full_image_self_attention_flash_compute_dtype_for_fp32_cuda() -> None:
+    if not torch.cuda.is_available():
+        return
+    x = torch.zeros(2, 256, 64, device="cuda", dtype=torch.float32)
+    assert FullImageSelfAttention._flash_compute_dtype(x) == torch.bfloat16
 
 
 def test_rope2d_preserves_magnitudes() -> None:
@@ -489,3 +497,69 @@ def test_init_wandb_run_disabled_by_default() -> None:
     config = BoomerFLADiTConfig(hidden_dim=64, depth=2, num_heads=4, mixer_type="fallback")
 
     assert init_wandb_run(args, config=config, start_step=0, resume=False) is None
+
+
+def test_checkpoint_offloader_uploads_and_prunes(tmp_path, monkeypatch) -> None:
+    model = LatentDiT(LatentDiTConfig(hidden_dim=32, depth=1, num_heads=4))
+    config = model.config
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    offloader = CheckpointOffloader(upload_remote="testremote:checkpoints", local_retain=1)
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self._done = False
+
+        def poll(self) -> int | None:
+            if self._done:
+                return 0
+            self._done = True
+            return None
+
+        @property
+        def returncode(self) -> int:
+            return 0
+
+    launched_cmds: list[list[str]] = []
+
+    def fake_popen(cmd, stdout, stderr, text):  # noqa: ANN001
+        launched_cmds.append(cmd)
+        log_path = Path(cmd[2]) / ".upload_logs" / "fake.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("ok", encoding="utf-8")
+        return FakeProcess()
+
+    monkeypatch.setattr("boomer.checkpoint_utils.subprocess.Popen", fake_popen)
+
+    for step in (1000, 2000):
+        resume_path = tmp_path / f"latent_dit_step_{step:06d}.pt"
+        offloader.save(resume_path, model, config, optimizer, step)
+        offloader._poll_jobs()
+
+    offloader.finish()
+
+    assert launched_cmds
+    assert launched_cmds[0][0] == "rclone"
+    assert launched_cmds[0][1] == "copy"
+    assert (tmp_path / "latent_dit_step_002000.pt").exists()
+    assert not (tmp_path / "latent_dit_step_001000.pt").exists()
+    assert (tmp_path / "latent_dit_step_002000.safetensors").exists()
+    assert not (tmp_path / "latent_dit_step_001000.safetensors").exists()
+
+
+def test_checkpoint_offloader_local_copy(tmp_path) -> None:
+    model = LatentDiT(LatentDiTConfig(hidden_dim=32, depth=1, num_heads=4))
+    config = model.config
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    dest_dir = tmp_path / "drive" / "checkpoints"
+    offloader = CheckpointOffloader(upload_remote=str(dest_dir), local_retain=1)
+
+    for step in (1000, 2000):
+        resume_path = tmp_path / f"latent_dit_step_{step:06d}.pt"
+        offloader.save(resume_path, model, config, optimizer, step)
+        offloader._poll_jobs()
+
+    offloader.finish()
+
+    assert (dest_dir / "latent_dit_step_002000.pt").is_file()
+    assert (dest_dir / "latent_dit_step_002000.safetensors").is_file()
+    assert not (tmp_path / "latent_dit_step_001000.pt").exists()
