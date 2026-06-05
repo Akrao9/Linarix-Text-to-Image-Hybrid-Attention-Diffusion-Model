@@ -114,7 +114,7 @@ def sample_latent(
     cfg_rescale: float = 0.0,
     sampler: str = "stork2",
     flow_shift: float = 1.0,
-    stork_derivative_order: int = 1,
+    stork_derivative_order: int = 2,
     stork_substeps: int = 50,
 ) -> torch.Tensor:
     generator = torch.Generator(device=device).manual_seed(seed)

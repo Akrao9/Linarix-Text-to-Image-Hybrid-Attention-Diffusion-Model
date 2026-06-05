@@ -200,7 +200,7 @@ python tools/overfit_latent_dit.py \
   --fla-mode chunk \
   --use-short-conv \
   --conv-size 4 \
-  --image-attn-every 4 \
+  --image-attn-every 6 \
   --image-attn-backend sdpa \
   --cross-attn-backend sdpa \
   --cross-attn-qk-norm \

@@ -1,7 +1,7 @@
 """Sana-compatible latent cache utilities using Hugging Face encoders.
 
-This module is intentionally small: it proves image/text encoding, cache
-serialization, reload, and VAE decode before the Boomer training loop exists.
+Adapted from NVlabs/Sana (https://github.com/NVlabs/Sana): resize-to-fill crop,
+BOS + trailing-token text selection, and latent record layout.
 """
 
 from __future__ import annotations

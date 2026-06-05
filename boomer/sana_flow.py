@@ -1,4 +1,9 @@
-"""Sana-style flow-matching schedule and conditioning helpers."""
+"""Sana-style flow-matching schedule and conditioning helpers.
+
+Adapted from NVlabs/Sana (https://github.com/NVlabs/Sana): flow sigma shift,
+logit-normal timestep sampling, forward noising, and per-timestep loss weights.
+Plateau logit-normal sampling follows FLUX.2 (see _sample_plateau_logit_normal).
+"""
 
 from __future__ import annotations
 
@@ -43,6 +48,10 @@ def _sample_plateau_logit_normal(
     mu: float,
     sigma: float,
 ) -> torch.Tensor:
+    """Sample from the plateau logit-normal distribution (Black Forest Labs, 2025).
+
+    See FLUX.2 representation comparison: https://bfl.ai/research/representation-comparison
+    """
     calc_dtype = torch.float32 if dtype in {torch.float16, torch.bfloat16} else dtype
     t_star = _logit_normal_mode(mu, sigma, device=device, dtype=calc_dtype)
     y_star = torch.log(t_star / (1.0 - t_star))

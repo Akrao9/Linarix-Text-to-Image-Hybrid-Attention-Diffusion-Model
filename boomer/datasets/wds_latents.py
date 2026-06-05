@@ -461,15 +461,30 @@ class RollingLocalWdsCache:
             next_path = None
 
         if next_path is None or not self._is_valid_shard(next_path):
-            # Try up to _MAX_FALLBACK_ATTEMPTS shards, each in a daemon thread with
-            # _PREFETCH_TIMEOUT so the main training process is never blocked indefinitely
-            # even when HF is throttling or timing out on multiple consecutive shards.
-            _MAX_FALLBACK_ATTEMPTS = 8
+            # Download ONE shard at a time, patiently. A previous version abandoned a
+            # slow-but-live download every _PREFETCH_TIMEOUT and immediately started a
+            # DIFFERENT shard; the abandoned daemon threads kept running, so consecutive
+            # timeouts stacked into many concurrent 4.3 GB downloads that split the
+            # bandwidth and cascaded into guaranteed failures (the 1/8 -> 8/8 spiral).
+            #
+            # Fix: keep at most ONE in-flight download. Wait for it to finish — a truly
+            # dead connection raises via HF_HUB_DOWNLOAD_TIMEOUT (60 s inactivity), which
+            # ends the thread with an exception. Only switch shards on a real ERROR,
+            # never while the download is still making progress. This way a transient
+            # slowdown can never snowball into concurrent downloads.
+            _MAX_SHARD_ERRORS = 8         # distinct shards allowed to hard-fail before giving up
+            _POLL = 60                    # heartbeat interval while a download is alive
+            _MAX_WAIT_PER_SHARD = 1800    # backstop: abandon a wedged-but-silent download (30 min)
             _excluded: set[int] = set(self._window_indices)
             if remote_index is not None:
                 _excluded.add(remote_index)
 
-            for _attempt in range(_MAX_FALLBACK_ATTEMPTS):
+            _errors = 0
+            while True:
+                if remote_index is None:
+                    with self._lock:
+                        remote_index = self._next_epoch_remote_index(exclude=_excluded)
+
                 _result: list[Path | None] = [None]
                 _exc: list[Exception | None] = [None]
                 _target_index = remote_index
@@ -482,33 +497,47 @@ class RollingLocalWdsCache:
 
                 _dl_thread = threading.Thread(
                     target=_fallback_dl,
-                    name=f"wds-fallback-dl-{_target_index}-try{_attempt}",
+                    name=f"wds-fallback-dl-{_target_index}",
                     daemon=True,
                 )
                 _dl_thread.start()
-                _dl_thread.join(timeout=_PREFETCH_TIMEOUT)
+
+                # Wait on this single download; never spawn a concurrent one.
+                _waited = 0
+                while _dl_thread.is_alive() and _waited < _MAX_WAIT_PER_SHARD:
+                    _dl_thread.join(timeout=_POLL)
+                    if _dl_thread.is_alive():
+                        _waited += _POLL
+                        print(
+                            f"[rolling-wds] shard {_target_index} still downloading "
+                            f"({_waited}s, no concurrent retries) ...",
+                            flush=True,
+                        )
 
                 if not _dl_thread.is_alive() and _result[0] is not None:
                     next_path = _result[0]
                     remote_index = _target_index
                     break
 
-                _err = _exc[0]
-                _reason = "timed out" if _dl_thread.is_alive() else f"failed ({_err})"
+                # Real failure (raised) or blew the per-shard backstop: try a different shard.
+                _errors += 1
+                _reason = (
+                    f"failed ({_exc[0]})"
+                    if not _dl_thread.is_alive()
+                    else f"stuck >{_MAX_WAIT_PER_SHARD}s (abandoned)"
+                )
                 print(
                     f"[rolling-wds] shard {_target_index} {_reason} "
-                    f"(attempt {_attempt + 1}/{_MAX_FALLBACK_ATTEMPTS}); trying another ...",
+                    f"(error {_errors}/{_MAX_SHARD_ERRORS}); trying another ...",
                     flush=True,
                 )
                 _excluded.add(_target_index)
-                with self._lock:
-                    remote_index = self._next_epoch_remote_index(exclude=_excluded)
-            else:
-                raise RuntimeError(
-                    f"[rolling-wds] failed to download any shard after "
-                    f"{_MAX_FALLBACK_ATTEMPTS} attempts — HF may be down. "
-                    "Resume training once connectivity is restored."
-                )
+                remote_index = None
+                if _errors >= _MAX_SHARD_ERRORS:
+                    raise RuntimeError(
+                        f"[rolling-wds] {_MAX_SHARD_ERRORS} shards failed to download "
+                        "— HF may be down. Resume training once connectivity is restored."
+                    )
 
         with self._lock:
             if finished_path.exists():

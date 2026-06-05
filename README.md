@@ -13,59 +13,70 @@ pipeline_tag: text-to-image
 
 # Boomer FLA
 
-Boomer FLA is a 657M parameter text-to-image diffusion model that generates **1024×1024px** images from text prompts.
+Boomer FLA is a **657M-parameter** text-to-image **flow-matching** model that generates **1024×1024px** images from natural-language prompts.
 
-Instead of standard quadratic self-attention, it uses **GatedDeltaNet** — a bidirectional Flash Linear Attention mixer — as the backbone of its transformer blocks. This keeps memory flat regardless of sequence length. Every 6th block adds a full SDPA layer for global spatial coherence.
+**Research project** — Boomer FLA is released for **research and educational purposes** only. It is not a production product; outputs are provided as-is with no guarantees of safety, quality, or fitness for any particular use.
 
-Text conditioning uses **Gemma 4 2B** (1536-dim embeddings, up to 300 tokens). Decoding uses the **DC-AE f32c32** VAE with 32× spatial compression, producing 32×32 latents from 1024px images. Sampling uses **STORK-2**, a high-order Runge–Kutta flow matching solver that converges in 32 steps.
+**Pipeline:** prompt → **Gemma 4 2B** (text) → **BoomerFLADiT** (32 STORK-2 denoising steps in latent space) → **DC-AE f32c32** decode → pixels. Only the DiT is trained; the VAE and text encoder stay frozen.
 
-Fine-tuned from a JourneyDB-pretrained base on 600k high-resolution images at 1024px.
+The DiT never sees pixels directly. DC-AE compresses 1024×1024 RGB to **32×32×32** latents (32× spatial compression). Instead of quadratic self-attention everywhere, blocks use **bidirectional GatedDeltaNet** (Flash Linear Attention) for **O(N)** memory; every 6th block adds full **SDPA + 2D RoPE** for global spatial coherence.
 
----
+**Best for** dramatic landscapes and scenic environments — not reliable for humans or portraits. See [Capabilities and limitations](#capabilities-and-limitations).
 
-## Sample outputs
-
-![Model grid — portraits and landscapes](boomer_model_grid.png)
-
-*Portraits (top) and landscapes (bottom) generated at 1024×1024px, 32 STORK-2 steps, CFG 4.5.*
+Trained on **JourneyDB** (~3.8M images, 512px pretrain) and **FineT2I** (~600k images, 1024px finetune). Inference uses **STORK-2** ([Tan et al., 2025](https://arxiv.org/abs/2505.24210)).
 
 ---
+
+## Sample Outputs
+
+![Boomer-T2I Portfolio Landscape Grid](https://cdn-uploads.huggingface.co/production/uploads/68a39870573ae211ac576be6/fN3TCPf5lGBFCq_thgYkw.png)
+
+1. **Misty Pine Forest:** A cinematic, wide-angle shot of a misty pine forest at sunrise, deep green valleys, soft morning light piercing through fog, photorealistic, 8k resolution.
+2. **Black Sand Beach:** A dramatic black sand beach in Iceland, towering basalt columns, massive white waves crashing on the shore, moody overcast sky, high detail landscape architecture.
+3. **Alpine Lake:** A serene alpine lake reflecting jagged snow-capped mountain peaks, crystal clear turquoise water, vibrant wildflower meadows in the foreground, golden hour lighting.
+4. **Tuscan Hills:** A sweeping view of rolling terracotta hills in Tuscany, isolated cypress trees lining a dirt road, warm late afternoon sun casting long shadows, classic landscape photography.
+5. **Desert Oasis:** A futuristic desert oasis at dusk, neon-infused crystalline structures contrasting with deep orange sand dunes, hyper-detailed, sprawling cinematic atmosphere.
+6. **Hidden Lagoon:** A majestic waterfall cascading down a sheer mossy cliff into a hidden tropical lagoon, lush emerald foliage, sunbeams cutting through the canopy, long exposure water effect.
 
 ## Architecture
 
 | Property | Value |
 |---|---|
 | Parameters | 657M |
+| Objective | Flow matching (velocity prediction in latent space) |
 | Backbone | Bidirectional GatedDeltaNet (Flash Linear Attention) |
-| Depth | 24 layers |
-| Hidden dim | 896 |
-| Heads | 14 |
-| Image attention | Every 6th layer (full SDPA + 2D RoPE) |
-| Patch size | 1 — one token per latent pixel (256 tokens at 512px, 1024 tokens at 1024px) |
-| Text encoder | Gemma 4 2B (`google/gemma-4-E2B-it`) |
-| VAE | DC-AE f32c32 (`mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers`) |
-| Sampler | STORK-2, 32 steps |
+| Depth | 24 transformer blocks |
+| Hidden dim | 896 (14 heads × 64 head dim) |
+| FFN | GLUMBConv — 1×1 expand → depthwise 3×3 → GLU → 1×1 project |
+| Image self-attention | GatedDeltaNet every block; full SDPA + 2D RoPE every 6th block (5, 11, 17, 23) |
+| Text conditioning | Sana-style cross-attention with QK RMSNorm; learned null embedding for CFG |
+| Patch size | 1 — one token per latent pixel (256 tokens at 512px, 1024 at 1024px) |
+| Text encoder | Gemma 4 2B (`google/gemma-4-E2B-it`) — 300 tokens × 1536-dim |
+| VAE | DC-AE f32c32 (`mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers`) — frozen |
+| Timestep conditioning | adaLN-Zero from flow-matching sigma |
+| Inference sampler | STORK-2 — 32 steps, solver order 2, 5 RK substeps per step |
 | Dtype | bfloat16 |
 
----
+Each block applies adaLN-Zero modulation → FLA self-mixer → text cross-attention → GLUMBConv FFN, with optional image SDPA on every 6th layer.
 
 ## Training details
 
+Two-stage training on frozen DC-AE latents with per-channel mean/std normalization.
+
 | Setting | Value |
 |---|---|
-| Pre-train dataset | JourneyDB (~3.8M images, 512px, patch size 1) |
-| Fine-tune dataset | FineT2I (~600k images, 1024px, patch size 1) |
-| Fine-tune steps | 55,000 |
-| Batch size | 24 |
-| Learning rate | 1e-4, linear warmup (1000 steps) → cosine decay |
-| Flow shift | 1.5 |
-| Timestep sampler | Plateau logit-normal (μ=0, σ=1) |
-| Min-SNR γ | 5.0 |
-| CFG dropout | 0.1 |
-| EMA decay | 0.999 |
-| Gradient clip | 0.3 |
+| Pre-train | JourneyDB (~3.8M images, 512px → 16×16 = 256 tokens) — stopped at 52k steps, batch 96, lr 1.2e-4 |
+| Fine-tune | FineT2I (~600k images, 1024px → 32×32 = 1024 tokens) — 75k scheduled, stopped at 55k, batch 24, lr 1e-4 (final published checkpoint) |
+| LR schedule | Linear warmup (1000 steps) → cosine decay to 10% of peak (min_lr_ratio 0.1) |
+| Fine-tune init | `--resume {pretrain step-52k ckpt} --resume-weights-only` (fresh optimizer/step/EMA) |
 | Optimizer | Fused AdamW |
-| Hardware | NVIDIA A100 (Google Colab) |
+| Flow shift | 1.5 ([Sana](https://github.com/NVlabs/Sana)-style sigma shift) |
+| Timestep sampler | Plateau logit-normal (μ=0, σ=1) — [FLUX.2](https://bfl.ai/research/representation-comparison) |
+| Loss weighting | Min-SNR γ = 5.0 |
+| CFG dropout | 0.1 (learned null text embedding) |
+| EMA decay | 0.999 (inference weights, updated every 8 steps) |
+| Gradient clip | 0.3 |
+| Hardware | RTX Pro 6000 Blackwell Server Edition |
 | Precision | bfloat16 |
 
 ---
@@ -95,9 +106,8 @@ Measured at 1024×1024px, bfloat16, STORK-2, CFG batch=2.
 ### Install
 
 ```bash
-pip install torch diffusers transformers accelerate safetensors
+pip install -U torch diffusers transformers accelerate safetensors torchvision scipy
 pip install git+https://github.com/fla-org/flash-linear-attention.git
-# STORK is bundled with the model — no separate install needed
 ```
 
 ### Generate
@@ -113,21 +123,26 @@ pipe = DiffusionPipeline.from_pretrained(
     torch_dtype=torch.bfloat16,
 ).to("cuda")
 
-image = pipe("a photorealistic portrait of a woman with dark hair")[0]
+image = pipe(
+    "a cinematic alpine lake at golden hour, snow-capped peaks reflected in mirror-still water",
+)[0]
 image.save("output.png")
 ```
 
-> **Note:** The transformer weights (~1.25 GB) are downloaded from this repo. The VAE and Gemma 4 2B text encoder are fetched automatically from their upstream HuggingFace repos on first use (~10 GB total). Make sure you have accepted the [Gemma Terms of Use](https://ai.google.dev/gemma/terms) and are logged in with `huggingface-cli login`.
+### Note
+
+The transformer weights (1.25 GB) are downloaded from this repo. The VAE and Gemma 4 2B text encoder are fetched automatically from their upstream HuggingFace repos on first use (~10 GB total). Accept the [Gemma Terms of Use](https://ai.google.dev/gemma/terms) and run `huggingface-cli login` before first use.
 
 ### Parameters
 
 ```python
 image = pipe(
     "a rocky coastline at sunset with crashing waves",
-    steps=32,        # denoising steps — 32 is recommended with STORK-2
+    steps=32,        # denoising steps — 32 recommended with STORK-2
     cfg_scale=4.5,   # classifier-free guidance scale (4.0–5.0)
     cfg_rescale=0.5, # reduces over-saturation at high CFG
-    # seed=42,       # fix a seed for reproducibility; omit for a random image each run
+    substeps=5,      # STORK-2 RK micro-steps per denoising step
+    seed=42,
 )[0]
 ```
 
@@ -181,20 +196,44 @@ pipe = BoomerPipeline(transformer=transformer).to("cuda")
 
 ---
 
-## Limitations
+## Capabilities and limitations
 
-- **Strong at** — photorealistic human portraits, dramatic landscapes, architectural scenes
-- **Weak at** — animals, text rendering, small detailed objects (limited training data coverage)
-- Landscapes have a painterly/HDR bias inherited from heavily post-processed stock images in the training set
+Trained on **JourneyDB** (pretrain, 512px) and **FineT2I** (finetune, 1024px).
+
+- **Strongest at** — dramatic landscapes, natural environments, and scenic/architectural scenes
+- **Also works for** — many everyday objects when embedded in a scene (quality varies)
+- **Not reliable** — humans, portraits, and people (faces and anatomy are inconsistent)
+- **Less reliable** — animals, legible text in images, very fine small details
+- Landscapes can show a painterly/HDR bias from heavily post-processed stock images in the training set
 - Not safety filtered — outputs may reflect biases in the training data
 - Maximum tested resolution: **1024×1024px**
 
 ---
 
+## Acknowledgements
+
+- **STORK-2** — inference sampling ([Tan et al., 2025](https://arxiv.org/abs/2505.24210))
+- **Plateau logit-normal** — training timestep distribution from [FLUX.2 representation comparison](https://bfl.ai/research/representation-comparison) (Black Forest Labs, 2025). Boomer uses μ=0, σ=1 with flow shift 1.5.
+- **Sana** — flow shift, logit-normal sampling, forward noising, and related helpers adapted from [NVlabs/Sana](https://github.com/NVlabs/Sana) (`boomer/sana_flow.py`, `boomer/sana_latent_cache.py`); several DiT blocks follow Sana conventions ([Xie et al., 2024](https://arxiv.org/abs/2410.10629))
+
+---
+
 ## License
 
-The Boomer FLA model weights are released for research and personal use. Commercial use is not permitted without explicit permission.
+This is a **research-purpose project**. Model weights and code are intended for non-commercial research and personal experimentation only.
 
-Upstream component licenses:
-- DC-AE VAE: [mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers](https://huggingface.co/mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers)
-- Gemma 4 text encoder: [Gemma Terms of Use](https://ai.google.dev/gemma/terms)
+**Model weights** — research and personal use only. Commercial use requires explicit permission.
+
+**Source code in this repository** — [MIT License](LICENSE).
+
+**Third-party components** (also see [Acknowledgements](#acknowledgements)):
+
+| Component | License / terms |
+|---|---|
+| STORK scheduler (`STORKScheduler.py`) | Apache 2.0 — [ZT220501/STORK](https://github.com/ZT220501/STORK) |
+| Sana-derived helpers (`boomer/sana_flow.py`, `boomer/sana_latent_cache.py`) | Apache 2.0 — [NVlabs/Sana](https://github.com/NVlabs/Sana) |
+| Flash Linear Attention (runtime dependency) | MIT — [fla-org/flash-linear-attention](https://github.com/fla-org/flash-linear-attention) |
+| DC-AE VAE (`mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers`) | See [model card](https://huggingface.co/mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers) |
+| Gemma 4 text encoder (`google/gemma-4-E2B-it`) | [Gemma Terms of Use](https://ai.google.dev/gemma/terms) |
+
+Using the full inference pipeline requires complying with all upstream terms above.
