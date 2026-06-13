@@ -677,6 +677,18 @@ class FLASelfMixer(nn.Module):
                     conv_size=config.conv_size,
                     layer_idx=layer_idx,
                 )
+            if config.mixer_type == "fla_gdn2":
+                # GatedDeltaNet-2: channel-wise erase/write gates + log-decay. Causal-only;
+                # bidirectionality handled by FLASelfMixer's fwd/flip-bwd wrapper.
+                return fla_layers.GatedDeltaNet2(
+                    hidden_size=hidden_dim,
+                    num_heads=config.num_heads,
+                    head_dim=hidden_dim // config.num_heads,
+                    expand_v=1.0,
+                    use_short_conv=config.use_short_conv,
+                    conv_size=config.conv_size,
+                    layer_idx=layer_idx,
+                )
             if config.mixer_type == "fla_gla":
                 return fla_layers.GatedLinearAttention(
                     hidden_size=hidden_dim,

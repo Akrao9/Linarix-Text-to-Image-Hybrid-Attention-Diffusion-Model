@@ -749,6 +749,7 @@ def main() -> None:
         choices=[
             "mamba3",
             "fla_gated_deltanet",
+            "fla_gdn2",
             "fla_linear",
             "fla_gla",
             "fla_delta_net",
@@ -1276,6 +1277,14 @@ def main() -> None:
     if args.compile and not compile_active:
         print("warning: --compile is ignored when not training on CUDA")
     if compile_active:
+        # GDN-2 reads self.layer_idx (an int) every forward; dynamo treats nn.Module int
+        # attributes as static, so it specializes a separate graph per layer and the 24
+        # layers blow past recompile_limit (8) and silently fall back to eager. Make the int
+        # dynamic and raise the limit so all layers share one compiled graph and compile
+        # actually engages.
+        import torch._dynamo
+        torch._dynamo.config.allow_unspec_int_on_nn_module = True
+        torch._dynamo.config.recompile_limit = 64
         model = torch.compile(
             model,
             mode=args.compile_mode,

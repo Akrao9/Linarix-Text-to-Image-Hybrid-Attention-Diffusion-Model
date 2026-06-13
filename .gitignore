@@ -11,8 +11,17 @@ wandb/
 outputs/
 previews/
 checkpoints/
+stats/
 *.pt
 *.pth
 *.ckpt
 *.safetensors
 *.log
+
+# Decks, docs, and scratch (not source)
+*.pptx
+*.pdf
+*.docx
+~$*
+Untitledrclone*.ipynb
+make_windowed_doc.py

@@ -1,5 +1,5 @@
 ---
-title: Boomer FLA T2I
+title: BoomerV2 T2I
 emoji: 🎨
 colorFrom: indigo
 colorTo: purple
@@ -9,20 +9,20 @@ app_file: app.py
 python_version: 3.11
 pinned: false
 license: other
-short_description: 1024px text-to-image with Boomer FLA on ZeroGPU
+short_description: 1024px text-to-image with BoomerV2 (GDN-2) on ZeroGPU
 models:
-  - akrao9/Boomer-T2I
+  - akrao9/BoomerV2-Text-to-Image
   - google/gemma-4-E2B-it
   - mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers
 preload_from_hub:
-  - akrao9/Boomer-T2I
+  - akrao9/BoomerV2-Text-to-Image
 ---
 
-# Boomer FLA — Text to Image Demo
+# BoomerV2 — Text to Image Demo
 
-Interactive demo for [akrao9/Boomer-T2I](https://huggingface.co/akrao9/Boomer-T2I): a 1024×1024 text-to-image flow-matching model with Flash Linear Attention.
+Interactive demo for [akrao9/BoomerV2-Text-to-Image](https://huggingface.co/akrao9/BoomerV2-Text-to-Image): a 701M-param 1024×1024 text-to-image flow-matching model with GatedDeltaNet-2 (Flash Linear Attention).
 
-**Capabilities:** best for landscapes and scenic/architectural scenes; many objects in context may work. **Not reliable for humans or portraits.** Less reliable for animals, text in images, and very fine detail. Trained on JourneyDB + FineT2I.
+**Capabilities:** strong on landscapes, scenic/architectural scenes, **people/portraits** (use composed prompts; ¾/profile poses; CFG 4.0–4.5), and dense multi-attribute prompts. Less reliable for domestic animals, hands, and legible text. Trained on JourneyDB (512px) + FineT2I (1024px).
 
 ## Space setup
 
@@ -62,4 +62,4 @@ Set **`python_version: 3.11`** in this README (Spaces default is 3.10). After ch
 
 - Uses `@spaces.GPU(size="large", duration=150)` — RTX Pro 6000 Blackwell 48 GB tier — for 32-step STORK-2 at 1024px ([Tan et al., 2025](https://arxiv.org/abs/2505.24210)).
 - Example prompts run generation on click (`run_on_click=True`).
-- VAE and Gemma 4 2B are fetched from their upstream repos on first startup.
+- VAE and Gemma 4 E2B are fetched from their upstream repos on first startup.

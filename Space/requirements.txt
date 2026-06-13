@@ -9,4 +9,4 @@ safetensors==0.8.0rc0
 pillow>=11.3.0
 huggingface-hub==1.16.1
 einops>=0.8.2
-flash-linear-attention==0.5.0
+flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@7378dfed2ac08242b3770be43fd4539df636afc3

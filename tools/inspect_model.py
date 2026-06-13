@@ -95,6 +95,7 @@ def main() -> None:
         choices=[
             "mamba3",
             "fla_gated_deltanet",
+            "fla_gdn2",
             "fla_linear",
             "fla_gla",
             "fla_delta_net",

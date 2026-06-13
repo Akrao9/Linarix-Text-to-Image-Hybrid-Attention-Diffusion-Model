@@ -32,6 +32,12 @@ _NUMPY_DTYPES: dict[str, np.dtype] = {
     "uint16": np.dtype("uint16"),
 }
 
+# Max seconds to wait on a single shard download before abandoning it and moving on.
+# A stuck/slow HF link must not deadlock training: after this budget the rolling cache
+# gives up on that shard, clears the wedged in-flight reference, and continues with the
+# shards already in the local window (then tries a different remote shard).
+ROLLING_WDS_DOWNLOAD_TIMEOUT_S = 300.0
+
 
 def split_csv(value: str) -> list[str]:
     return [part.strip() for part in value.split(",") if part.strip()]
@@ -241,6 +247,7 @@ class RollingLocalWdsCache:
         self._prefetch_thread: threading.Thread | None = None
         self._prefetch_target: Path | None = None
         self._prefetch_remote_index: int | None = None
+        self._inflight_download_thread: threading.Thread | None = None
         self.local_dir.mkdir(parents=True, exist_ok=True)
         self._sync_manifest()
         self.fill_initial()
@@ -275,6 +282,92 @@ class RollingLocalWdsCache:
     @staticmethod
     def _is_valid_shard(path: Path) -> bool:
         return path.is_file() and path.stat().st_size > 0 and tarfile.is_tarfile(path)
+
+    def _wait_for_download_thread(
+        self,
+        thread: threading.Thread,
+        *,
+        label: str,
+        timeout: float | None = None,
+    ) -> None:
+        """Block until ``thread`` finishes, or raise ``TimeoutError`` after ``timeout`` seconds.
+
+        ``timeout=None`` waits indefinitely (legacy behaviour). A finite ``timeout`` lets a
+        stuck or pathologically slow HF download be abandoned so that one bad shard cannot
+        deadlock the (single-process) training loop. The abandoned download is a daemon
+        thread and is simply left to die on its own.
+        """
+        poll = 60
+        waited = 0
+        while thread.is_alive():
+            thread.join(timeout=poll)
+            if thread.is_alive():
+                waited += poll
+                print(
+                    f"[rolling-wds] {label} still downloading ({waited}s, one download at a time) ...",
+                    flush=True,
+                )
+                if timeout is not None and waited >= timeout:
+                    print(
+                        f"[rolling-wds] {label} exceeded {int(timeout)}s — abandoning this shard "
+                        "and continuing with the rest of the local window.",
+                        flush=True,
+                    )
+                    raise TimeoutError(f"{label} exceeded {int(timeout)}s download budget")
+
+    def _download_remote_index_sync(self, remote_index: int, *, label: str | None = None) -> Path:
+        """Download one shard, waiting for any prior in-flight download to finish first."""
+        with self._lock:
+            prior = self._inflight_download_thread
+        if prior is not None and prior.is_alive():
+            try:
+                self._wait_for_download_thread(
+                    prior,
+                    label=label or "prior shard",
+                    timeout=ROLLING_WDS_DOWNLOAD_TIMEOUT_S,
+                )
+            except TimeoutError:
+                # Prior download is wedged; stop waiting on it (it stays a daemon thread)
+                # and drop the reference so it no longer blocks this or future downloads.
+                with self._lock:
+                    if self._inflight_download_thread is prior:
+                        self._inflight_download_thread = None
+
+        result: list[Path | None] = [None]
+        exc: list[Exception | None] = [None]
+        tag = label or f"shard {remote_index}"
+
+        def _run() -> None:
+            try:
+                result[0] = self._download_remote_index(remote_index)
+            except Exception as error:
+                exc[0] = error
+
+        thread = threading.Thread(
+            target=_run,
+            name=f"wds-dl-{remote_index}",
+            daemon=True,
+        )
+        with self._lock:
+            self._inflight_download_thread = thread
+        thread.start()
+        try:
+            self._wait_for_download_thread(thread, label=tag, timeout=ROLLING_WDS_DOWNLOAD_TIMEOUT_S)
+        except TimeoutError:
+            # This shard's download is wedged. Clear the in-flight reference and re-raise so
+            # the caller counts it as a failed shard and tries a different one.
+            with self._lock:
+                if self._inflight_download_thread is thread:
+                    self._inflight_download_thread = None
+            raise
+        with self._lock:
+            if self._inflight_download_thread is thread:
+                self._inflight_download_thread = None
+        if exc[0] is not None:
+            raise exc[0]
+        if result[0] is None:
+            raise RuntimeError(f"[rolling-wds] download thread for {tag} finished without a path")
+        return result[0]
 
     def _default_download(self, shard: HfWdsShardRef, dest: Path) -> Path:
         import time
@@ -409,11 +502,17 @@ class RollingLocalWdsCache:
         with self._lock:
             if self._prefetch_thread is not None:
                 return
+            inflight = self._inflight_download_thread
+            if inflight is not None and inflight.is_alive():
+                return
             remote_index = self._next_epoch_remote_index(exclude=set(self._window_indices))
             target = self._local_path_for(self.remote_shards[remote_index])
 
         def _run() -> None:
-            self._download_remote_index(remote_index)
+            try:
+                self._download_remote_index_sync(remote_index, label=f"shard {remote_index} prefetch")
+            except Exception as exc:
+                print(f"[rolling-wds] prefetch shard {remote_index} failed: {exc}", flush=True)
 
         thread = threading.Thread(target=_run, name=f"wds-prefetch-{target.name}", daemon=True)
         with self._lock:
@@ -443,17 +542,31 @@ class RollingLocalWdsCache:
 
         remote_index: int | None = None
         next_path: Path | None = None
-        _PREFETCH_TIMEOUT = 300  # 5 min; HF download should never take longer
         if prefetch_thread is not None and prefetch_remote_index is not None:
             remote_index = prefetch_remote_index
             prefetch_dest = self._local_path_for(self.remote_shards[remote_index])
-            prefetch_thread.join(timeout=_PREFETCH_TIMEOUT)
-            if prefetch_thread.is_alive():
+            try:
+                self._wait_for_download_thread(
+                    prefetch_thread,
+                    label=f"shard {remote_index} prefetch",
+                    timeout=ROLLING_WDS_DOWNLOAD_TIMEOUT_S,
+                )
+            except TimeoutError:
+                # Prefetch is wedged on a slow/stuck HF link. Abandon it (the daemon thread is
+                # left to die on its own) and clear the in-flight reference so the fallback
+                # download below is not blocked by it. Training keeps going on the other shards
+                # already in the local window.
+                with self._lock:
+                    self._inflight_download_thread = None
                 remote_index = None
-            elif self._is_valid_shard(prefetch_dest):
-                next_path = prefetch_dest
-            elif prefetch_dest.exists():
-                prefetch_dest.unlink()
+                next_path = None
+            else:
+                if self._is_valid_shard(prefetch_dest):
+                    next_path = prefetch_dest
+                elif prefetch_dest.exists():
+                    prefetch_dest.unlink()
+                else:
+                    remote_index = None
 
         if remote_index is None:
             with self._lock:
@@ -461,23 +574,12 @@ class RollingLocalWdsCache:
             next_path = None
 
         if next_path is None or not self._is_valid_shard(next_path):
-            # Download ONE shard at a time, patiently. A previous version abandoned a
-            # slow-but-live download every _PREFETCH_TIMEOUT and immediately started a
-            # DIFFERENT shard; the abandoned daemon threads kept running, so consecutive
-            # timeouts stacked into many concurrent 4.3 GB downloads that split the
-            # bandwidth and cascaded into guaranteed failures (the 1/8 -> 8/8 spiral).
-            #
-            # Fix: keep at most ONE in-flight download. Wait for it to finish — a truly
-            # dead connection raises via HF_HUB_DOWNLOAD_TIMEOUT (60 s inactivity), which
-            # ends the thread with an exception. Only switch shards on a real ERROR,
-            # never while the download is still making progress. This way a transient
-            # slowdown can never snowball into concurrent downloads.
-            _MAX_SHARD_ERRORS = 8         # distinct shards allowed to hard-fail before giving up
-            _POLL = 60                    # heartbeat interval while a download is alive
-            _MAX_WAIT_PER_SHARD = 1800    # backstop: abandon a wedged-but-silent download (30 min)
+            # One download at a time, but each wait is capped at ROLLING_WDS_DOWNLOAD_TIMEOUT_S
+            # so a stuck shard is abandoned rather than deadlocking training. Abandoned daemon
+            # downloads are left to die; _MAX_SHARD_ERRORS bounds how many we try before bailing
+            # out with a clear "resume once connectivity is restored" error.
+            _MAX_SHARD_ERRORS = 8
             _excluded: set[int] = set(self._window_indices)
-            if remote_index is not None:
-                _excluded.add(remote_index)
 
             _errors = 0
             while True:
@@ -485,59 +587,28 @@ class RollingLocalWdsCache:
                     with self._lock:
                         remote_index = self._next_epoch_remote_index(exclude=_excluded)
 
-                _result: list[Path | None] = [None]
-                _exc: list[Exception | None] = [None]
                 _target_index = remote_index
-
-                def _fallback_dl(_idx: int = _target_index) -> None:
-                    try:
-                        _result[0] = self._download_remote_index(_idx)
-                    except Exception as _e:
-                        _exc[0] = _e
-
-                _dl_thread = threading.Thread(
-                    target=_fallback_dl,
-                    name=f"wds-fallback-dl-{_target_index}",
-                    daemon=True,
-                )
-                _dl_thread.start()
-
-                # Wait on this single download; never spawn a concurrent one.
-                _waited = 0
-                while _dl_thread.is_alive() and _waited < _MAX_WAIT_PER_SHARD:
-                    _dl_thread.join(timeout=_POLL)
-                    if _dl_thread.is_alive():
-                        _waited += _POLL
-                        print(
-                            f"[rolling-wds] shard {_target_index} still downloading "
-                            f"({_waited}s, no concurrent retries) ...",
-                            flush=True,
-                        )
-
-                if not _dl_thread.is_alive() and _result[0] is not None:
-                    next_path = _result[0]
+                try:
+                    next_path = self._download_remote_index_sync(
+                        _target_index,
+                        label=f"shard {_target_index}",
+                    )
                     remote_index = _target_index
                     break
-
-                # Real failure (raised) or blew the per-shard backstop: try a different shard.
-                _errors += 1
-                _reason = (
-                    f"failed ({_exc[0]})"
-                    if not _dl_thread.is_alive()
-                    else f"stuck >{_MAX_WAIT_PER_SHARD}s (abandoned)"
-                )
-                print(
-                    f"[rolling-wds] shard {_target_index} {_reason} "
-                    f"(error {_errors}/{_MAX_SHARD_ERRORS}); trying another ...",
-                    flush=True,
-                )
-                _excluded.add(_target_index)
-                remote_index = None
-                if _errors >= _MAX_SHARD_ERRORS:
-                    raise RuntimeError(
-                        f"[rolling-wds] {_MAX_SHARD_ERRORS} shards failed to download "
-                        "— HF may be down. Resume training once connectivity is restored."
+                except Exception as exc:
+                    _errors += 1
+                    print(
+                        f"[rolling-wds] shard {_target_index} failed ({exc}) "
+                        f"(error {_errors}/{_MAX_SHARD_ERRORS}); trying another ...",
+                        flush=True,
                     )
+                    _excluded.add(_target_index)
+                    remote_index = None
+                    if _errors >= _MAX_SHARD_ERRORS:
+                        raise RuntimeError(
+                            f"[rolling-wds] {_MAX_SHARD_ERRORS} shards failed to download "
+                            "— HF may be down. Resume training once connectivity is restored."
+                        ) from exc
 
         with self._lock:
             if finished_path.exists():

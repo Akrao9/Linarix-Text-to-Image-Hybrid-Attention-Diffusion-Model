@@ -30,9 +30,9 @@ import spaces
 import torch
 from huggingface_hub import snapshot_download
 
-MODEL_ID = os.environ.get("BOOMER_MODEL_ID", "akrao9/Boomer-T2I")
+MODEL_ID = os.environ.get("BOOMER_MODEL_ID", "akrao9/BoomerV2-Text-to-Image")
 DEFAULT_STEPS = 32
-DEFAULT_CFG = 4.5
+DEFAULT_CFG = 4.0
 DEFAULT_CFG_RESCALE = 0.5
 
 DEFAULT_PROMPT = (
@@ -225,12 +225,13 @@ def reset_form() -> tuple[str, None, str, float]:
 def build_ui() -> gr.Blocks:
     example_rows = [[text, -1, DEFAULT_STEPS, DEFAULT_CFG] for _, text in EXAMPLE_PROMPTS]
 
-    with gr.Blocks(title="Boomer FLA") as demo:
+    with gr.Blocks(title="BoomerV2") as demo:
         gr.Markdown(
             """
-            # Boomer FLA — Text to Image
-            Generate **1024×1024** images from text. **Best for landscapes and scenic
-            environments** — not reliable for humans or portraits (JourneyDB + FineT2I training).
+            # BoomerV2 — Text to Image
+            Generate **1024×1024** images from text. **Strong on landscapes, scenic
+            environments, and people** (use composed prompts; CFG 4.0–4.5). Less reliable
+            for domestic animals, hands, and legible text.
             Runs on **ZeroGPU** (NVIDIA RTX Pro 6000 Blackwell, 48 GB). First run may
             take a minute while a GPU is allocated.
             """
