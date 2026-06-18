@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,8 @@ def hf_token_value(token: str | None) -> str | bool | None:
     if token is None or token == "":
         return None
     if token.lower() in {"1", "true", "yes"}:
+        if env_token := os.environ.get("HF_TOKEN"):
+            return env_token
         return True
     return token
 

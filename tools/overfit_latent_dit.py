@@ -314,6 +314,7 @@ def build_model_config(args: argparse.Namespace, sample_record: Any, resume_chec
             multimodal_coord_ids=args.multimodal_coord_ids,
             use_abs_pos_embed=args.abs_pos_embed,
             patch_size=args.patch_size,
+            extra_input_channels=getattr(args, "extra_input_channels", 0),
             gradient_checkpointing=getattr(args, "gradient_checkpointing", False),
         )
 
@@ -850,6 +851,13 @@ def main() -> None:
         type=int,
         default=1,
         help="Latent patch size for BoomerFLA ViT patchification. Use 2 for 64x64 f16 latents to reduce sequence length to 32x32.",
+    )
+    parser.add_argument(
+        "--extra-input-channels",
+        type=int,
+        default=0,
+        help="FLUX-Fill-style reserved DiT input channels (zero-init, zero-fed at Stage 0). "
+        "Set 33 (=masked latent[32] + mask[1]) to make the base inpainting-ready without a future from-scratch retrain.",
     )
     parser.add_argument(
         "--cond-dropout",

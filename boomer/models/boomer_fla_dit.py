@@ -20,6 +20,11 @@ from boomer.models.latent_dit import AttentionRMSNorm, CaptionEmbedder, Timestep
 class BoomerFLADiTConfig:
     model_type: str = "boomer_fla"
     latent_channels: int = 32
+    # FLUX-Fill-style reserved input channels (e.g. 33 = masked latent[32] + mask[1]).
+    # Zero-initialized and zero-fed when no conditioning is supplied, so the base model
+    # is behaviorally identical; lets you fine-tune into inpainting without a from-scratch
+    # retrain. The output projection still predicts only `latent_channels`.
+    extra_input_channels: int = 0
     latent_size: int = 16
     text_dim: int = 1536
     text_seq_len: int = 300
@@ -976,11 +981,12 @@ class BoomerFLADiT(nn.Module):
         self.patch_size = config.patch_size
         self.token_grid_size = config.latent_size // config.patch_size
         token_count = self.token_grid_size * self.token_grid_size
+        in_channels = config.latent_channels + config.extra_input_channels
         self.x_embedder = (
-            nn.Linear(config.latent_channels, hidden_dim)
+            nn.Linear(in_channels, hidden_dim)
             if config.patch_size == 1
             else nn.Conv2d(
-                config.latent_channels,
+                in_channels,
                 hidden_dim,
                 kernel_size=config.patch_size,
                 stride=config.patch_size,
@@ -1043,6 +1049,12 @@ class BoomerFLADiT(nn.Module):
         nn.init.zeros_(self.out_proj.weight)
         nn.init.zeros_(self.out_proj.bias)
 
+        # Zero the reserved-input-channel slice so they contribute nothing until a future
+        # inpainting fine-tune learns them (base channels keep their default init).
+        if self.config.extra_input_channels > 0:
+            with torch.no_grad():
+                self.x_embedder.weight[:, self.config.latent_channels :].zero_()
+
     def apply_y_norm(self, caption_tokens: torch.Tensor) -> torch.Tensor:
         if self.attention_y_norm is None:
             return caption_tokens
@@ -1097,6 +1109,7 @@ class BoomerFLADiT(nn.Module):
         timesteps: torch.Tensor,
         text_embedding: torch.Tensor,
         attention_mask: torch.Tensor,
+        cond_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch, channels, height, width = noisy_latent.shape
         if channels != self.config.latent_channels:
@@ -1122,11 +1135,29 @@ class BoomerFLADiT(nn.Module):
         text_tokens = self.apply_y_norm(text_tokens)
         text_key_padding_mask = attention_mask == 0
 
+        # FLUX-Fill-style reserved channels: concat conditioning (or zeros) onto the
+        # noisy latent before embedding. Zeros => behaviorally identical to no conditioning.
+        if self.config.extra_input_channels > 0:
+            if cond_input is None:
+                cond_input = noisy_latent.new_zeros(
+                    batch, self.config.extra_input_channels, height, width
+                )
+            elif cond_input.shape[1] != self.config.extra_input_channels:
+                raise ValueError(
+                    f"cond_input must have {self.config.extra_input_channels} channels, "
+                    f"got {tuple(cond_input.shape)}"
+                )
+            model_input = torch.cat([noisy_latent, cond_input], dim=1)
+        elif cond_input is not None:
+            raise ValueError("cond_input given but extra_input_channels=0")
+        else:
+            model_input = noisy_latent
+
         if self.patch_size == 1:
-            x = noisy_latent.flatten(2).transpose(1, 2)
+            x = model_input.flatten(2).transpose(1, 2)
             x = self.x_embedder(x)
         else:
-            x = self.x_embedder(noisy_latent).flatten(2).transpose(1, 2)
+            x = self.x_embedder(model_input).flatten(2).transpose(1, 2)
         if self.pos_embed is not None:
             x = x + self.pos_embed
         image_coord_ids = None

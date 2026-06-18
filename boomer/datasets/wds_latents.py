@@ -669,7 +669,10 @@ def _array_to_logical_tensor(array: np.ndarray, *, dtype_name: str) -> torch.Ten
             raise ValueError(
                 f"float8_e4m3fn cache payload must be stored as uint8 bit patterns, got {array.dtype}."
             )
-        return torch.from_numpy(array).view(torch.float8_e4m3fn).to(torch.float16)
+        # Upcast to bf16 (not fp16): the DiT trains in bf16, so this keeps one dtype
+        # end-to-end and avoids a needless fp16->bf16 recast. fp16's extra mantissa is
+        # wasted here — the source is fp8 and the consumer is bf16.
+        return torch.from_numpy(array).view(torch.float8_e4m3fn).to(torch.bfloat16)
     return torch.from_numpy(array)
 
 
