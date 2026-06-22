@@ -130,12 +130,160 @@ def flat_to_latent(vec: list[float]) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------- #
+# Multi-subset mixing (build ONE proportionally-interleaved cache in one run)
+# --------------------------------------------------------------------------- #
+def parse_mix(spec: str) -> list[tuple[str, float]]:
+    """'commoncatalog-cc-by=0.3,coyo=0.2,...' -> normalized [(subset, weight), ...].
+
+    Weights are relative; they are normalized to sum to 1 so the caller can pass
+    raw proportions, percentages, or sample-count-ish numbers interchangeably."""
+    pairs: list[tuple[str, float]] = []
+    for tok in spec.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if "=" in tok:
+            name, w = tok.split("=", 1)
+        elif ":" in tok:
+            name, w = tok.split(":", 1)
+        else:
+            raise ValueError(f"bad --mix entry {tok!r}; expected subset=weight")
+        pairs.append((name.strip(), float(w)))
+    if not pairs:
+        raise ValueError("--mix is empty")
+    total = sum(w for _, w in pairs)
+    if total <= 0:
+        raise ValueError("--mix weights sum to <= 0")
+    return [(n, w / total) for n, w in pairs]
+
+
+def resolve_columns(available: set[str], args: argparse.Namespace, caption_keys: list[str],
+                    extra_cols: list[str]) -> tuple[str, list[str], str | None, list[str]]:
+    """Pick latent/caption/dino columns against THIS shard's schema (subsets differ)."""
+    latent_col = args.latent_key if args.latent_key in available else next(
+        (c for c in sorted(available) if "vae" in c.lower()), None
+    )
+    if latent_col is None:
+        raise RuntimeError(f"No VAE-latent column found; have {sorted(available)}")
+    present_caption_keys = [c for c in caption_keys if c in available]
+    dino_col = args.dino_key if (not args.no_dino and args.dino_key in available) else None
+    want = [latent_col, *present_caption_keys, *[c for c in extra_cols if c in available]]
+    if dino_col:
+        want.append(dino_col)
+    return latent_col, present_caption_keys, dino_col, list(dict.fromkeys(want))
+
+
+def build_item(
+    row: dict[str, Any], *, latent_col: str, present_caption_keys: list[str],
+    dino_col: str | None, args: argparse.Namespace, rank: int, shard_tag: str,
+    seen_clusters: set[str], counters: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Filter + resolve caption for one parquet row -> a ready cache item, or None if
+    it should be dropped. Updates ``counters`` (seen/filtered/no_latent/no_caption/
+    caption_src) in place so callers can report identically to the single-subset path."""
+    counters["seen"] += 1
+    if not passes_filters(row, args, seen_clusters):
+        counters["filtered"] += 1
+        return None
+    latent = row.get(latent_col)
+    if latent is None:
+        counters["no_latent"] += 1
+        return None
+    caption, caption_src = "", None
+    for ck in present_caption_keys:
+        v = row.get(ck)
+        if v:
+            caption, caption_src = v, ck
+            break
+    if not caption:
+        counters["no_caption"] += 1
+        return None
+    counters["caption_src"][caption_src] += 1
+    key = row.get("__key__") or row.get("id") or f"r{rank}{shard_tag}n{counters['seen']}"
+    item = {
+        "key": str(key), "latent": latent, "caption": caption, "caption_src": caption_src,
+        "source": row.get("source"), "aesthetic": row.get("aesthetic_laion-improved"),
+        "nsfw": row.get("nsfw_jasperai"), "cluster": row.get("sscd_cluster_id"),
+    }
+    if dino_col:
+        item["dino"] = row.get(dino_col)
+    return item
+
+
+def iter_subset_items(
+    subset: str, parquets: list[str], *, args: argparse.Namespace, token_str: str | None,
+    staging_dir: Path, dl_executor: Any, caption_keys: list[str], extra_cols: list[str],
+    rank: int, seen_clusters: set[str], counters: dict[str, Any],
+):
+    """Lazily yield ready cache items for ONE subset: download its parquets (small
+    per-subset look-ahead window on the shared executor), stream rows in bounded
+    pyarrow batches (so memory stays flat with many subsets open at once), and
+    delete each parquet after read."""
+    import pyarrow.parquet as pq
+    from huggingface_hub import hf_hub_download
+
+    futures: dict[int, Any] = {}
+
+    def submit(i: int) -> None:
+        if 0 <= i < len(parquets) and i not in futures:
+            futures[i] = dl_executor.submit(
+                hf_hub_download, repo_id=args.repo_id, filename=parquets[i],
+                repo_type="dataset", token=token_str, local_dir=str(staging_dir),
+            )
+
+    ahead = max(1, args.mix_prefetch_per_subset)
+    for i in range(min(ahead, len(parquets))):
+        submit(i)
+    for idx in range(len(parquets)):
+        local = futures.pop(idx).result()
+        submit(idx + ahead)
+        available = set(pq.read_schema(local).names)
+        latent_col, present_caption_keys, dino_col, want = resolve_columns(
+            available, args, caption_keys, extra_cols
+        )
+        pf = pq.ParquetFile(local)
+        for batch in pf.iter_batches(columns=want, batch_size=args.read_batch):
+            cols = {c: batch.column(c).to_pylist() for c in batch.schema.names}
+            for i in range(batch.num_rows):
+                row = {c: cols[c][i] for c in cols}
+                item = build_item(
+                    row, latent_col=latent_col, present_caption_keys=present_caption_keys,
+                    dino_col=dino_col, args=args, rank=rank, shard_tag=f"{subset[:6]}{idx}",
+                    seen_clusters=seen_clusters, counters=counters,
+                )
+                if item is not None:
+                    yield item
+        try:
+            os.remove(local)
+        except FileNotFoundError:
+            pass
+
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--repo-id", default="jasperai/monet")
     p.add_argument("--subset", default="cc12m", help="subset dir under v1.1.0/ (empty = all subsets)")
+    # Multi-subset mixing: build one proportionally-interleaved cache in a single run.
+    p.add_argument("--mix", default=None,
+                   help="weighted subset mix, e.g. "
+                        "'commoncatalog-cc-by=0.30,laion-cc-by=0.15,coyo=0.15,"
+                        "synthetic-flux1-schnell=0.20,...'. Weights are normalized. "
+                        "Overrides --subset and round-robins rows across subsets so every "
+                        "OUTPUT shard is proportionally mixed (good per-batch diversity).")
+    p.add_argument("--mix-target", type=int, default=5_000_000,
+                   help="total samples to write across ALL ranks in --mix mode "
+                        "(per-rank target = mix-target / world-size).")
+    p.add_argument("--mix-prefetch-per-subset", type=int, default=1,
+                   help="parquets to download ahead PER active subset in --mix mode.")
+    p.add_argument("--mix-allow-repeat", action="store_true",
+                   help="in --mix mode, re-iterate a subset that runs out of data before "
+                        "hitting its target (upsampling, e.g. tiny diffusion-aesthetic).")
+    p.add_argument("--read-batch", type=int, default=8192,
+                   help="rows per pyarrow batch when streaming parquets in --mix mode "
+                        "(bounds memory with many subsets open).")
     p.add_argument("--latent-key", default=DEFAULT_LATENT_KEY)
     p.add_argument("--caption-key", default=DEFAULT_CAPTION_KEY,
                    help="preferred caption column")
@@ -300,14 +448,16 @@ def main() -> int:
     staging_dir = Path(args.source_staging_dir) if args.source_staging_dir else (out_dir / "_src")
     staging_dir.mkdir(parents=True, exist_ok=True)
 
-    all_parquets = list_source_parquets(args.repo_id, args.subset or None, token_str)
-    my_parquets = all_parquets[rank::world]
-    if args.max_source_shards is not None:
-        my_parquets = my_parquets[: args.max_source_shards]
-    if args.start_source_shard:
-        my_parquets = my_parquets[args.start_source_shard:]  # resume: skip already-done shards
-    print(f"[monet-cache rank {rank}/{world}] {len(my_parquets)} source parquet shards "
-          f"(start_source_shard={args.start_source_shard}, start_output_shard={args.start_output_shard})")
+    my_parquets: list[str] = []
+    if not args.mix:  # single-subset path lists one prefix; --mix lists per-subset later
+        all_parquets = list_source_parquets(args.repo_id, args.subset or None, token_str)
+        my_parquets = all_parquets[rank::world]
+        if args.max_source_shards is not None:
+            my_parquets = my_parquets[: args.max_source_shards]
+        if args.start_source_shard:
+            my_parquets = my_parquets[args.start_source_shard:]  # resume: skip already-done shards
+        print(f"[monet-cache rank {rank}/{world}] {len(my_parquets)} source parquet shards "
+              f"(start_source_shard={args.start_source_shard}, start_output_shard={args.start_output_shard})")
 
     encoder = build_qwen_encoder(args, token)
 
@@ -327,7 +477,8 @@ def main() -> int:
     extra_cols = ["__key__", "id", "aesthetic_laion-improved", "nsfw_jasperai",
                   "wk_jasperai", "sscd_cluster_id", "source"]
 
-    pattern = str(out_dir / f"monet-{args.subset or 'all'}-r{rank:02d}-%06d.tar")
+    run_label = "mix" if args.mix else (args.subset or "all")
+    pattern = str(out_dir / f"monet-{run_label}-r{rank:02d}-%06d.tar")
     sink = wds.ShardWriter(
         pattern,
         maxcount=args.shard_size,
@@ -399,10 +550,103 @@ def main() -> int:
             sink.write(sample)
             n_written += 1
 
-    # Prefetch source parquets ahead of the GPU so it never blocks on the ~600 MB
-    # download at each shard boundary. Window = args.prefetch_shards (bounded disk).
     import concurrent.futures
 
+    # ----------------------------------------------------------------------- #
+    # --mix mode: round-robin rows across subsets so each OUTPUT shard is a
+    # proportional blend (good per-batch diversity at train time).
+    # ----------------------------------------------------------------------- #
+    if args.mix:
+        specs = parse_mix(args.mix)
+        per_rank_total = -(-args.mix_target // world)  # ceil division
+        targets = {s: max(1, int(round(w * per_rank_total))) for s, w in specs}
+        counters: dict[str, Any] = {
+            "seen": 0, "filtered": 0, "no_latent": 0, "no_caption": 0,
+            "caption_src": caption_src_counts,
+        }
+        dl_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(4, min(16, len(specs) * (args.mix_prefetch_per_subset + 1)))
+        )
+
+        def make_gen(subset: str):
+            plist = list_source_parquets(args.repo_id, subset, token_str)[rank::world]
+            if args.max_source_shards is not None:
+                plist = plist[: args.max_source_shards]
+            if not plist:
+                raise FileNotFoundError(f"no parquets for subset {subset!r} at rank {rank}")
+            return iter_subset_items(
+                subset, plist, args=args, token_str=token_str, staging_dir=staging_dir,
+                dl_executor=dl_executor, caption_keys=caption_keys, extra_cols=extra_cols,
+                rank=rank, seen_clusters=seen_clusters, counters=counters,
+            )
+
+        gens = {s: make_gen(s) for s, _ in specs}
+        written_per = {s: 0 for s, _ in specs}
+        active = {s for s, _ in specs}
+        buffer: list[dict[str, Any]] = []
+        print(f"[monet-cache rank {rank}/{world}] MIX targets (per rank): "
+              + ", ".join(f"{s}={targets[s]}" for s, _ in specs), flush=True)
+
+        def flush() -> None:
+            nonlocal buffer
+            if buffer:
+                encode_and_write(buffer)
+                buffer = []
+            uploader.poll()
+            while len(list(out_dir.glob("*.tar"))) > args.max_pending_uploads:
+                uploader.poll(wait=True)
+
+        next_log = 50000
+        while active:
+            # Pull from whichever active subset is furthest BELOW its target ratio,
+            # which keeps the running mix proportional even as subsets exhaust.
+            s = min(active, key=lambda x: written_per[x] / targets[x])
+            try:
+                item = next(gens[s])
+            except StopIteration:
+                if args.mix_allow_repeat and written_per[s] < targets[s]:
+                    gens[s] = make_gen(s)  # upsample: re-iterate this subset
+                    try:
+                        item = next(gens[s])
+                    except StopIteration:
+                        active.discard(s)
+                        continue
+                else:
+                    if written_per[s] < targets[s]:
+                        print(f"[monet-cache rank {rank}] subset {s} exhausted at "
+                              f"{written_per[s]}/{targets[s]} (no --mix-allow-repeat)", flush=True)
+                    active.discard(s)
+                    continue
+            buffer.append(item)
+            written_per[s] += 1
+            if written_per[s] >= targets[s]:
+                active.discard(s)
+            if len(buffer) >= args.encode_batch:
+                flush()
+            total_w = sum(written_per.values())
+            if total_w >= next_log:
+                next_log += 50000
+                mix_now = ", ".join(f"{s}={written_per[s]}" for s, _ in specs)
+                print(f"[monet-cache rank {rank}] mix progress: written={total_w} "
+                      f"[{mix_now}] seen={counters['seen']} filtered={counters['filtered']}",
+                      flush=True)
+        flush()
+        sink.close()
+        dl_executor.shutdown(wait=True)
+        uploader.finish()
+        src_summary = ", ".join(f"{k}={v}" for k, v in caption_src_counts.most_common()) or "none"
+        print(
+            f"[monet-cache rank {rank}] MIX DONE: {n_written} written "
+            + ", ".join(f"{s}={written_per[s]}" for s, _ in specs)
+            + f" | caption_src=[{src_summary}] seen={counters['seen']} "
+            f"filtered={counters['filtered']} no_latent={counters['no_latent']} "
+            f"no_caption={counters['no_caption']}",
+            flush=True,
+        )
+        return 0
+
+    # Prefetch source parquets ahead of the GPU so it never blocks on the ~600 MB
+    # download at each shard boundary. Window = args.prefetch_shards (bounded disk).
     dl_executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=max(1, min(4, args.prefetch_shards))
     )
