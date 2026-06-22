@@ -748,8 +748,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Wrap the training model in torch.compile. EMA is left uncompiled.")
     p.add_argument("--compile-mode",
                    choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
-                   default="max-autotune-no-cudagraphs",
-                   help="torch.compile mode. max-autotune-no-cudagraphs is the safe Blackwell default.")
+                   default="default",
+                   help="torch.compile mode. 'default' avoids aggressive Triton autotune candidates "
+                        "that can exceed Blackwell's per-SM resource limits.")
     return p
 
 

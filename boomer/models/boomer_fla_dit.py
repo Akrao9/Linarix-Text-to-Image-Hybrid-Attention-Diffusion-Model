@@ -667,6 +667,9 @@ class FLASelfMixer(nn.Module):
                 # handled by FLASelfMixer's fwd/flip-bwd wrapper, same as GatedDeltaNet. Heavier
                 # than GDN (extra b/w/decay projections); chunk kernel needs fp32 initial_state,
                 # so smoke-test under torch.compile + --fla-bidirectional before a long run.
+                # Boomer never supplies an autoregressive state cache. Leaving layer_idx unset
+                # avoids Dynamo specializing this shared forward on every block's integer index
+                # (24 redundant graphs followed by recompile-limit eager fallback).
                 return fla_layers.GatedDeltaNet2(
                     hidden_size=hidden_dim,
                     num_heads=config.num_heads,
@@ -674,7 +677,7 @@ class FLASelfMixer(nn.Module):
                     expand_v=1.0,
                     use_short_conv=config.use_short_conv,
                     conv_size=config.conv_size,
-                    layer_idx=layer_idx,
+                    layer_idx=None,
                 )
             if config.mixer_type == "fla_gla":
                 return fla_layers.GatedLinearAttention(
