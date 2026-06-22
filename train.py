@@ -529,11 +529,23 @@ def peek_record(args: argparse.Namespace, hf_token: str | bool | None) -> Any:
 
 
 def build_config(args: argparse.Namespace, record: Any) -> BoomerFLADiTConfig:
+    # With --skip-peek, record is None and dims come from the explicit flags (no shard
+    # download at startup). Otherwise dims are read from one peeked cache record.
+    if record is not None:
+        latent_channels = int(record.image_latent.shape[0])
+        latent_size = int(record.image_latent.shape[-1])
+        text_dim = int(record.text_embedding.shape[-1])
+        text_seq_len = int(record.text_embedding.shape[-2])
+    else:
+        latent_channels = args.latent_channels
+        latent_size = args.latent_size
+        text_dim = args.text_dim
+        text_seq_len = args.text_seq_len
     return BoomerFLADiTConfig(
-        latent_channels=int(record.image_latent.shape[0]),
-        latent_size=int(record.image_latent.shape[-1]),
-        text_dim=int(record.text_embedding.shape[-1]),
-        text_seq_len=int(record.text_embedding.shape[-2]),
+        latent_channels=latent_channels,
+        latent_size=latent_size,
+        text_dim=text_dim,
+        text_seq_len=text_seq_len,
         hidden_dim=args.hidden_dim,
         depth=args.depth,
         num_heads=args.num_heads,
@@ -599,6 +611,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--hf-token", default=None, help="HF token, or 'true' for the logged-in token.")
     p.add_argument("--latent-mean", type=float, default=0.0)
     p.add_argument("--latent-std", type=float, default=1.0)
+    # Skip the startup dim-peek (which downloads one full shard) and use explicit dims.
+    # Defaults match the monet DC-AE/Qwen cache: latent (32,16,16), text (224,2048).
+    p.add_argument("--skip-peek", action="store_true",
+                   help="Skip the dim-peek shard download; use --latent-*/--text-* dims directly.")
+    p.add_argument("--latent-channels", type=int, default=32)
+    p.add_argument("--latent-size", type=int, default=16)
+    p.add_argument("--text-dim", type=int, default=2048)
+    p.add_argument("--text-seq-len", type=int, default=224)
 
     # model
     p.add_argument("--hidden-dim", type=int, default=896)
@@ -735,8 +755,14 @@ def main() -> None:
 
     hf_token = hf_token_value(args.hf_token)
 
-    print("Peeking one cached record for dims...", flush=True)
-    record = peek_record(args, hf_token)
+    if args.skip_peek:
+        print(f"Skipping dim peek; using explicit dims "
+              f"(latent {args.latent_channels}x{args.latent_size}, "
+              f"text {args.text_seq_len}x{args.text_dim}).", flush=True)
+        record = None
+    else:
+        print("Peeking one cached record for dims (downloads one shard)...", flush=True)
+        record = peek_record(args, hf_token)
     config = build_config(args, record)
     print(
         f"config: latent={config.latent_channels}x{config.latent_size} "
