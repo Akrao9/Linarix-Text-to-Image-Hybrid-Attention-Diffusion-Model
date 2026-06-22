@@ -27,6 +27,7 @@ Example (from scratch, 701M GDN-2 on the PD12M Qwen cache):
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -40,9 +41,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 try:  # Lightning >= 2.0 namespace, with legacy fallback.
     import lightning.pytorch as pl
     from lightning.pytorch.callbacks import Callback, LearningRateMonitor, ModelCheckpoint
+    from lightning.pytorch.loggers import WandbLogger
 except ImportError:  # pragma: no cover
     import pytorch_lightning as pl
     from pytorch_lightning.callbacks import Callback, LearningRateMonitor, ModelCheckpoint
+    from pytorch_lightning.loggers import WandbLogger
 
 from boomer.datasets.latent_shards import collate_latent_records  # noqa: E402
 from boomer.datasets.wds_latents import (  # noqa: E402
@@ -147,10 +150,23 @@ class BoomerLit(pl.LightningModule):
             fused=hp.fused_adamw,
         )
         warmup = max(0, int(hp.warmup_steps))
+        sched_name = getattr(hp, "lr_scheduler", "linear-warmup-constant")
+        min_lr_ratio = float(getattr(hp, "min_lr_ratio", 0.1))
+        total_steps = max(int(getattr(hp, "max_steps", 0)), 1)
 
         def lr_lambda(step: int) -> float:
+            # "constant": flat (no warmup), matching overfit_latent_dit.
+            if sched_name == "constant":
+                return 1.0
+            # warmup ramp (shared by the warmup-bearing schedules)
             if warmup > 0 and step < warmup:
                 return (step + 1) / warmup
+            if sched_name == "linear-warmup-cosine":
+                decay_steps = max(total_steps - warmup, 1)
+                progress = min(max((step - warmup) / decay_steps, 0.0), 1.0)
+                cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+                return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+            # default "linear-warmup-constant": warmup then hold (legacy train.py behavior)
             return 1.0
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda)
@@ -458,7 +474,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--beta1", type=float, default=0.9)
     p.add_argument("--beta2", type=float, default=0.95)
     p.add_argument("--fused-adamw", action=bo, default=True)
-    p.add_argument("--warmup-steps", type=int, default=1000)
+    p.add_argument("--warmup-steps", type=int, default=1000,
+                   help="Linear warmup steps for the warmup-bearing schedulers.")
+    p.add_argument("--lr-scheduler", default="linear-warmup-constant",
+                   choices=["constant", "linear-warmup-constant", "linear-warmup-cosine"],
+                   help="constant=flat (no warmup); linear-warmup-constant=warmup then hold "
+                        "(legacy default); linear-warmup-cosine=warmup then cosine decay to "
+                        "--min-lr-ratio. Computed from global step, so resume is deterministic.")
+    p.add_argument("--min-lr-ratio", type=float, default=0.1,
+                   help="Final LR as a fraction of --lr for linear-warmup-cosine decay.")
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--accumulate", type=int, default=1)
     p.add_argument("--cond-dropout", type=float, default=0.1)
@@ -487,6 +511,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--log-every-steps", "--log-every", dest="log_every_steps", type=int, default=50)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--resume", default=None, help="Path to a .ckpt to resume from.")
+
+    # W&B logging (off unless --wandb). train/loss, train/repa_loss, lr, etc. log automatically.
+    p.add_argument("--wandb", action="store_true", help="Log training metrics to Weights & Biases.")
+    p.add_argument("--wandb-project", default="boomer", help="W&B project name.")
+    p.add_argument("--wandb-run-name", default=None, help="Optional W&B run name.")
+    p.add_argument("--wandb-entity", default=None, help="Optional W&B entity/team.")
+    p.add_argument("--wandb-mode", choices=["online", "offline", "disabled"], default="online",
+                   help="W&B mode. Use offline on air-gapped machines and sync later.")
     p.add_argument("--resume-weights-only", action="store_true",
                    help="With --resume, load model weights only; reset optimizer/scheduler/step.")
     p.add_argument("--compile", action="store_true",
@@ -523,6 +555,9 @@ def main() -> None:
         beta2=args.beta2,
         fused_adamw=args.fused_adamw,
         warmup_steps=args.warmup_steps,
+        lr_scheduler=args.lr_scheduler,
+        min_lr_ratio=args.min_lr_ratio,
+        max_steps=args.max_steps,
         cond_dropout=args.cond_dropout,
         t_sampler=args.t_sampler,
         t_bias=args.t_bias,
@@ -584,6 +619,18 @@ def main() -> None:
     if args.dtype is not None:
         precision = {"bf16": "bf16-mixed", "fp16": "16-mixed", "fp32": "32-true"}[args.dtype]
 
+    logger: Any = True
+    if args.wandb:
+        logger = WandbLogger(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            entity=args.wandb_entity,
+            mode=args.wandb_mode,
+            save_dir=args.checkpoint_dir,
+        )
+        # Record the full run config (model + hparams) in the W&B run.
+        logger.log_hyperparams({**vars(args), **{f"model/{k}": v for k, v in vars(config).items()}})
+
     trainer = pl.Trainer(
         accelerator="cpu" if args.device == "cpu" else "gpu",
         devices=1,
@@ -592,6 +639,7 @@ def main() -> None:
         gradient_clip_val=args.grad_clip,
         accumulate_grad_batches=args.accumulate,
         callbacks=callbacks,
+        logger=logger,
         log_every_n_steps=args.log_every_steps,
         enable_checkpointing=True,
         default_root_dir=args.checkpoint_dir,
