@@ -132,11 +132,15 @@ class BoomerLit(pl.LightningModule):
             per_sample = per_sample * flow_training_loss_weight(t, target).mean(dim=(1, 2, 3))
         if hp.min_snr_gamma > 0.0:
             per_sample = per_sample * flow_min_snr_loss_weight(t, target, hp.min_snr_gamma).mean(dim=(1, 2, 3))
-        loss = per_sample.mean()
+        flow_loss = per_sample.mean()
 
-        self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=False, batch_size=x0.shape[0])
+        # Log the components separately. train/total_loss is what the optimizer actually
+        # receives (flow + repa_w * repa); train/flow_loss is the pure denoising MSE.
+        bs = x0.shape[0]
+        loss = flow_loss
+        self.log("train/flow_loss", flow_loss, prog_bar=True, on_step=True, on_epoch=False, batch_size=bs)
         if hp.t_sampler_final:
-            self.log("train/t_polish", float(polish), on_step=True, on_epoch=False, batch_size=x0.shape[0])
+            self.log("train/t_polish", float(polish), on_step=True, on_epoch=False, batch_size=bs)
 
         if repa_feat is not None:
             cos = F.cosine_similarity(
@@ -148,10 +152,11 @@ class BoomerLit(pl.LightningModule):
             repa_w = hp.repa_weight
             if hp.repa_anneal_steps > 0:
                 repa_w *= max(0.0, 1.0 - self.global_step / hp.repa_anneal_steps)
-            loss = loss + repa_w * repa_loss
-            self.log("train/repa_loss", repa_loss, prog_bar=True, on_step=True, on_epoch=False, batch_size=x0.shape[0])
-            self.log("train/repa_w", repa_w, on_step=True, on_epoch=False, batch_size=x0.shape[0])
+            loss = flow_loss + repa_w * repa_loss
+            self.log("train/repa_loss", repa_loss, prog_bar=True, on_step=True, on_epoch=False, batch_size=bs)
+            self.log("train/repa_w", repa_w, on_step=True, on_epoch=False, batch_size=bs)
 
+        self.log("train/total_loss", loss, prog_bar=True, on_step=True, on_epoch=False, batch_size=bs)
         return loss
 
     def configure_optimizers(self):
