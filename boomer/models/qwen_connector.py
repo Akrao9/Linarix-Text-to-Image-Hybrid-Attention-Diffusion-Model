@@ -85,6 +85,11 @@ class QwenReferenceEncoder(nn.Module):
         self._base_failed = False
         self._processor: Any | None = None
         self.hidden_size: int | None = None
+        # True unless we truncate to an intermediate layer. When reading the genuine
+        # final layer we take the post-final-norm output (last_hidden_state), which is
+        # stable across transformers versions; relying on hidden_states[-1] being normed
+        # is NOT (a version change silently shifted the readout scale ~700x).
+        self._readout_is_final = True
 
     # -- lazy load -----------------------------------------------------------
     def load(self) -> None:
@@ -162,6 +167,17 @@ class QwenReferenceEncoder(nn.Module):
         self._truncate_to_readout(model)
         # Prefer the base transformer for forward() so the lm_head is never run.
         self._base_model = self._find_base_with_layers(model)
+        # Capture the genuine final norm so a final-layer readout can be normed even on
+        # the full-model fallback path (CausalLM output has no last_hidden_state). Only
+        # meaningful when not truncated (truncation replaces the norm with Identity).
+        self._final_norm: nn.Module | None = None
+        if self._readout_is_final:
+            holder = self._find_base_with_layers(model)
+            for norm_attr in ("norm", "final_layernorm", "ln_f"):
+                norm = getattr(holder, norm_attr, None) if holder is not None else None
+                if norm is not None and not isinstance(norm, nn.Identity):
+                    self._final_norm = norm
+                    break
 
     @staticmethod
     def _find_base_with_layers(model: nn.Module) -> nn.Module | None:
@@ -192,6 +208,7 @@ class QwenReferenceEncoder(nn.Module):
         r_abs = r if r >= 0 else (n + 1 + r)
         if not (0 <= r_abs <= n) or r_abs >= n:
             return  # reading the final layer (or out of range): nothing to drop
+        self._readout_is_final = False  # intermediate readout -> raw (un-normed) output
         holder.layers = nn.ModuleList(list(layers)[:r_abs])
         self.config.readout_layer = r_abs  # now the last collected hidden state
         # HF applies the base model's final norm only to the LAST hidden_states entry.
@@ -282,7 +299,15 @@ class QwenReferenceEncoder(nn.Module):
                 out = model(**inputs, output_hidden_states=True, use_cache=False, return_dict=True)
             else:
                 raise
-        hidden_states = out.hidden_states[self.config.readout_layer]
+        if self._readout_is_final and getattr(out, "last_hidden_state", None) is not None:
+            # Post-final-norm output: matches the validated cache (abs-max ~72) regardless
+            # of whether this transformers version post-norms hidden_states[-1].
+            hidden_states = out.last_hidden_state
+        elif self._readout_is_final and self._final_norm is not None:
+            # Full-model fallback (no last_hidden_state): apply the final norm explicitly.
+            hidden_states = self._final_norm(out.hidden_states[-1])
+        else:
+            hidden_states = out.hidden_states[self.config.readout_layer]
         pad_mask = inputs.get("attention_mask")
         if pad_mask is None:
             pad_mask = torch.ones(hidden_states.shape[:2], device=device, dtype=torch.long)
