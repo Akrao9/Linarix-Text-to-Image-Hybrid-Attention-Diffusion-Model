@@ -25,3 +25,6 @@ stats/
 ~$*
 Untitledrclone*.ipynb
 make_windowed_doc.py
+
+# local-only scratch/decks/docs
+archive/
