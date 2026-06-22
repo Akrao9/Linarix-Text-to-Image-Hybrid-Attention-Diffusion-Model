@@ -978,6 +978,12 @@ class PrefetchingWdsLatentCacheDataset(IterableDataset[LatentRecord]):
     hf_token: str | bool | None = None
     shuffle_buffer: int = 2000
     seed: int | None = None
+    # A shard whose download stalls past ROLLING_WDS_DOWNLOAD_TIMEOUT_S is retried up to
+    # this many times (the stuck worker is replaced, not killed); after that it is skipped.
+    download_max_retries: int = 2
+    # Abort the stream if this many shards are skipped back-to-back — a dead network must
+    # surface as a failure, not silently train on an ever-shrinking slice of the data.
+    max_consecutive_skips: int = 8
     # Background decode: a producer thread runs download->decode->sample_to_record and
     # pushes finished LatentRecords into a bounded queue, so per-sample tensor
     # reconstruction overlaps the GPU step (the consumer's CUDA call releases the GIL
@@ -1038,29 +1044,41 @@ class PrefetchingWdsLatentCacheDataset(IterableDataset[LatentRecord]):
         """Download-ahead window -> per-sample LatentRecords, looping epochs forever.
         Honors ``stop_event`` so the consumer can shut the producer down cleanly.
 
-        Downloads run on raw DAEMON threads (not a ThreadPoolExecutor) on purpose:
-        concurrent.futures joins its worker threads at interpreter exit, which would
-        block the process on an in-flight 4GB shard download when the Trainer abandons
-        the iterator at max_steps. Daemon threads are killed immediately at exit instead,
-        so the process terminates promptly (the abandoned partial download is harmless;
-        local_dir is transient)."""
+        Design (robust against silent TCP stalls — see the long discussion in git log):
+        - Downloads run on raw DAEMON threads; results are consumed in COMPLETION order
+          (a ready-queue), so one slow shard never blocks ready shards behind it.
+        - A watchdog reclaims a worker stuck past ROLLING_WDS_DOWNLOAD_TIMEOUT_S: it marks
+          the job abandoned, RE-QUEUES the shard for retry, and SPAWNS A REPLACEMENT worker
+          so the pool never shrinks (a wedged thread can't be killed, but it's parked and
+          dies at exit; if it finishes late it deletes its own file and exits).
+        - After ``download_max_retries`` stalls a shard is skipped; ``max_consecutive_skips``
+          back-to-back skips aborts the stream so a dead network surfaces as an error.
+        Daemon threads (not concurrent.futures) so the process exits promptly at max_steps
+        instead of joining an in-flight 4GB download."""
+        import itertools
         import queue
         import threading
+        import time as _time
 
         import webdataset as wds
 
         rng = random.Random(self.seed)
         order = list(range(len(self.refs)))
+        budget = ROLLING_WDS_DOWNLOAD_TIMEOUT_S
+        max_retries = max(0, self.download_max_retries)
+        max_skips = max(1, self.max_consecutive_skips)
 
         while not stop_event.is_set():  # IterableDataset: loop epochs; Trainer stops at max_steps
             rng.shuffle(order)
-            # Daemon-thread download pool: submit(pos) enqueues a download; result(pos)
-            # blocks until that position's shard is on disk. Results/events are only
-            # mutated structurally by THIS (producer) thread; workers just fill them.
-            task_q: queue.Queue = queue.Queue()
-            results: dict[int, object] = {}
-            events: dict[int, threading.Event] = {}
+            task_q: queue.Queue = queue.Queue()       # logical positions / retries to download
+            ready_q: queue.Queue = queue.Queue()      # ("ok", pos, path) | ("err", pos, exc), completion order
             lock = threading.Lock()
+            active: dict[int, tuple[int, float]] = {}  # job_id -> (pos, start_monotonic)
+            abandoned: set[int] = set()                # job_ids the watchdog reclaimed
+            retries: dict[int, int] = {}               # pos -> stall retries already spent
+            job_seq = itertools.count()
+            stats = {"ready": 0, "retried": 0, "timeout": 0, "skipped": 0}
+            worker_count = 0
 
             def worker() -> None:
                 while not stop_event.is_set():
@@ -1070,69 +1088,118 @@ class PrefetchingWdsLatentCacheDataset(IterableDataset[LatentRecord]):
                         continue
                     if pos is None or stop_event.is_set():
                         return
-                    try:
-                        res: object = self._download(self.refs[order[pos]])
-                    except Exception as exc:  # deliver to result(pos) rather than die
-                        res = exc
+                    job_id = next(job_seq)
                     with lock:
-                        results[pos] = res
-                        ev = events.get(pos)  # may be gone if result() already abandoned pos
-                    if ev is not None:
-                        ev.set()
+                        active[job_id] = (pos, _time.monotonic())
+                    try:
+                        res: tuple = ("ok", pos, self._download(self.refs[order[pos]]))
+                    except Exception as exc:  # deliver downstream rather than die
+                        res = ("err", pos, exc)
+                    with lock:
+                        active.pop(job_id, None)
+                        was_abandoned = job_id in abandoned
+                        abandoned.discard(job_id)
+                    if was_abandoned:
+                        # The watchdog already replaced me and re-queued this shard. Drop my
+                        # (possibly completed) download so no orphan 4GB file is left, then
+                        # exit so the live pool stays at download_workers.
+                        if res[0] == "ok":
+                            try:
+                                os.remove(res[2])
+                            except OSError:
+                                pass
+                        return
+                    ready_q.put(res)
 
-            workers = [
-                threading.Thread(target=worker, name="wds-dl", daemon=True)
-                for _ in range(max(1, self.download_workers))
-            ]
-            for w in workers:
-                w.start()
+            def spawn_worker() -> None:
+                nonlocal worker_count
+                worker_count += 1
+                threading.Thread(target=worker, name="wds-dl", daemon=True).start()
 
-            def submit(pos: int) -> None:
-                if 0 <= pos < len(order) and pos not in events:
-                    events[pos] = threading.Event()
-                    task_q.put(pos)
-
-            def result(pos: int, budget: float | None = None):
-                ev = events[pos]
-                waited = 0.0
-                while not ev.wait(timeout=0.5):
-                    if stop_event.is_set():
-                        raise _PrefetchStopped()
-                    waited += 0.5
-                    if budget is not None and waited >= budget:
-                        # Silent TCP stall: the download is wedged with no data and won't
-                        # return on its own. Abandon this shard so one bad connection can't
-                        # freeze the in-order, single-process training loop. Drop the
-                        # bookkeeping (the daemon worker is left to die at exit); skipping a
-                        # shard out of thousands is harmless for training.
+            def watchdog() -> None:
+                while not stop_event.is_set():
+                    _time.sleep(2.0)
+                    now = _time.monotonic()
+                    overdue: list[int] = []
+                    with lock:
+                        for job_id, (pos, start) in list(active.items()):
+                            if now - start >= budget:
+                                abandoned.add(job_id)
+                                active.pop(job_id, None)
+                                overdue.append(pos)
+                                stats["timeout"] += 1
+                    for pos in overdue:
                         with lock:
-                            events.pop(pos, None)
-                            results.pop(pos, None)
-                        raise TimeoutError(
-                            f"shard pos={pos} ({self.refs[order[pos]].filename}) "
-                            f"exceeded {int(budget)}s download budget"
-                        )
-                with lock:
-                    res = results.pop(pos)
-                events.pop(pos, None)
-                if isinstance(res, BaseException):
-                    raise res
-                return res
+                            attempts = retries.get(pos, 0) + 1
+                            retries[pos] = attempts
+                            stats["retried"] += attempts <= max_retries
+                        if attempts <= max_retries:
+                            print(
+                                f"[prefetch-wds] shard pos={pos} "
+                                f"({self.refs[order[pos]].filename}) stalled >{int(budget)}s; "
+                                f"retry {attempts}/{max_retries}",
+                                flush=True,
+                            )
+                            task_q.put(pos)  # re-download the same logical shard
+                        else:
+                            print(
+                                f"[prefetch-wds] shard pos={pos} failed after "
+                                f"{max_retries} stalls; skipping",
+                                flush=True,
+                            )
+                            ready_q.put(("err", pos, TimeoutError(f"pos={pos} stalled out")))
+                        spawn_worker()  # replace the parked worker; pool stays full
+
+            for _ in range(max(1, self.download_workers)):
+                spawn_worker()
+            threading.Thread(target=watchdog, name="wds-watchdog", daemon=True).start()
+
+            next_pos = 0
+
+            def dispatch_next() -> None:
+                nonlocal next_pos
+                if next_pos < len(order):
+                    task_q.put(next_pos)
+                    next_pos += 1
 
             try:
-                for pos in range(min(self.prefetch_shards, len(order))):
-                    submit(pos)
-                for pos in range(len(order)):
+                for _ in range(min(self.prefetch_shards, len(order))):  # prime the window
+                    dispatch_next()
+
+                consumed = 0
+                consecutive_skips = 0
+                while consumed < len(order):
                     if stop_event.is_set():
                         return
-                    submit(pos + self.prefetch_shards)  # keep the window full even if this one is skipped
                     try:
-                        path = result(pos, budget=ROLLING_WDS_DOWNLOAD_TIMEOUT_S)
-                    except _PrefetchStopped:
-                        return
-                    except Exception as exc:  # download failed/abandoned -> skip, don't freeze
-                        print(f"[prefetch-wds] skipping shard pos={pos}: {exc}", flush=True)
+                        kind, pos, payload = ready_q.get(timeout=1.0)
+                    except queue.Empty:
+                        continue  # nothing ready yet; watchdog keeps the pool alive
+                    consumed += 1
+                    dispatch_next()  # one shard done -> pull the next into the window
+
+                    if kind == "err":
+                        consecutive_skips += 1
+                        with lock:
+                            stats["skipped"] += 1
+                            snapshot = dict(stats)
+                        print(
+                            f"[prefetch-wds] skip pos={pos}: {payload} "
+                            f"(consecutive={consecutive_skips}, totals={snapshot})",
+                            flush=True,
+                        )
+                        if consecutive_skips > max_skips:
+                            raise RuntimeError(
+                                f"[prefetch-wds] aborting: {consecutive_skips} consecutive "
+                                f"shard failures (> {max_skips}); downloads are not "
+                                f"progressing (totals={snapshot})."
+                            )
                         continue
+
+                    consecutive_skips = 0
+                    with lock:
+                        stats["ready"] += 1
+                    path = payload
                     dataset = wds.WebDataset([str(path)], shardshuffle=False).decode()
                     if self.shuffle_buffer > 0:
                         dataset = dataset.shuffle(self.shuffle_buffer)
@@ -1145,9 +1212,9 @@ class PrefetchingWdsLatentCacheDataset(IterableDataset[LatentRecord]):
                     except FileNotFoundError:
                         pass
             finally:
-                # Wake idle workers so they observe stop and exit; they're daemon, so even
-                # a worker mid-download never blocks interpreter shutdown.
-                for _ in workers:
+                # Wake every idle worker (originals + replacements) so they observe stop and
+                # exit; parked/wedged workers are daemon and die at interpreter exit.
+                for _ in range(worker_count + 1):
                     task_q.put(None)
 
     def __iter__(self):

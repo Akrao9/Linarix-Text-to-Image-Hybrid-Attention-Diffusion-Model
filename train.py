@@ -239,6 +239,8 @@ def make_wds_dataset(
     seed: int,
     decode_queue_size: int = 512,
     shard_shuffle: int = 0,
+    download_max_retries: int = 2,
+    max_consecutive_skips: int = 8,
 ):
     """Remote hf:// caches use the SAME parallel download-ahead streaming as the
     caching tool (a thread-pool prefetch window into local_dir, delete after use);
@@ -253,6 +255,8 @@ def make_wds_dataset(
             shuffle_buffer=shuffle_buffer,
             seed=seed,
             decode_queue_size=decode_queue_size,
+            download_max_retries=download_max_retries,
+            max_consecutive_skips=max_consecutive_skips,
         )
     return StreamingWdsLatentCacheDataset(
         paths=cache_wds,
@@ -280,6 +284,8 @@ class BoomerData(pl.LightningDataModule):
         pin_memory: bool = True,
         prefetch_factor: int = 2,
         persistent_workers: bool | None = None,
+        download_max_retries: int = 2,
+        max_consecutive_skips: int = 8,
     ) -> None:
         super().__init__()
         self.cache_wds = cache_wds
@@ -296,6 +302,8 @@ class BoomerData(pl.LightningDataModule):
         self.pin_memory = pin_memory
         self.prefetch_factor = prefetch_factor
         self.persistent_workers = persistent_workers
+        self.download_max_retries = download_max_retries
+        self.max_consecutive_skips = max_consecutive_skips
 
     def _dataset(self):
         return make_wds_dataset(
@@ -308,6 +316,8 @@ class BoomerData(pl.LightningDataModule):
             seed=self.seed,
             decode_queue_size=self.decode_queue_size,
             shard_shuffle=self.shard_shuffle,
+            download_max_retries=self.download_max_retries,
+            max_consecutive_skips=self.max_consecutive_skips,
         )
 
     def train_dataloader(self) -> DataLoader:
@@ -610,6 +620,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="hf:// caches: bounded record queue for the background decode "
                         "thread (overlaps sample reconstruction with the GPU step at "
                         "num_workers=0). Set 0 to decode inline on the consumer thread.")
+    p.add_argument("--wds-download-max-retries", type=int, default=2,
+                   help="hf:// caches: re-download a stalled shard up to N times (the stuck "
+                        "worker is replaced, not killed) before skipping it.")
+    p.add_argument("--wds-max-consecutive-skips", type=int, default=8,
+                   help="hf:// caches: abort the run after this many back-to-back shard "
+                        "skips, so a dead network fails loudly instead of silently training "
+                        "on a shrinking data slice.")
     p.add_argument("--wds-rolling-shards", type=int, default=2,
                    help="(deprecated alias for --wds-prefetch-shards; ignored)")
     p.add_argument("--wds-shuffle-buffer", type=int, default=2000)
@@ -842,6 +859,8 @@ def main() -> None:
         pin_memory=args.pin_memory,
         prefetch_factor=args.prefetch_factor,
         persistent_workers=args.persistent_workers,
+        download_max_retries=args.wds_download_max_retries,
+        max_consecutive_skips=args.wds_max_consecutive_skips,
     )
 
     callbacks: list[Callback] = [
