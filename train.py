@@ -45,11 +45,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 try:  # Lightning >= 2.0 namespace, with legacy fallback.
     import lightning.pytorch as pl
-    from lightning.pytorch.callbacks import Callback, LearningRateMonitor, ModelCheckpoint
+    from lightning.pytorch.callbacks import (
+        Callback,
+        LearningRateMonitor,
+        ModelCheckpoint,
+        TQDMProgressBar,
+    )
     from lightning.pytorch.loggers import WandbLogger
 except ImportError:  # pragma: no cover
     import pytorch_lightning as pl
-    from pytorch_lightning.callbacks import Callback, LearningRateMonitor, ModelCheckpoint
+    from pytorch_lightning.callbacks import (
+        Callback,
+        LearningRateMonitor,
+        ModelCheckpoint,
+        TQDMProgressBar,
+    )
     from pytorch_lightning.loggers import WandbLogger
 
 from boomer.datasets.latent_shards import collate_latent_records  # noqa: E402
@@ -843,6 +853,9 @@ def main() -> None:
             filename="boomer-{step}",
         ),
         LearningRateMonitor(logging_interval="step"),
+        # In Colab/non-TTY output tqdm reprints a line every refresh, so throttle the
+        # progress bar to the same cadence as metric logging instead of every step.
+        TQDMProgressBar(refresh_rate=max(1, args.log_every_steps)),
     ]
     if args.ema_decay > 0.0:
         callbacks.append(EMACallback(decay=args.ema_decay, update_every=args.ema_update_every))
