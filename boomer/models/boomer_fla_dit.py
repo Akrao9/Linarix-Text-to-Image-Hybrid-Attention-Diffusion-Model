@@ -323,7 +323,7 @@ class FullImageSelfAttention(nn.Module):
         super().__init__()
         if hidden_dim % num_heads != 0:
             raise ValueError(f"hidden_dim={hidden_dim} must be divisible by num_heads={num_heads}")
-        if backend not in {"sdpa", "flash3", "flash4", "auto"}:
+        if backend not in {"sdpa", "flash2", "flash3", "flash4", "auto"}:
             raise ValueError(f"Unsupported image_attention_backend: {backend}")
         if rope and grid_size is None:
             raise ValueError("grid_size is required when rope=True")
@@ -340,10 +340,35 @@ class FullImageSelfAttention(nn.Module):
             if rope and grid_size is not None
             else None
         )
+        self._flash2_attn_func = None
+        self._flash2_import_attempted = False
         self._flash3_attn_func = None
         self._flash3_import_attempted = False
         self._flash4_attn_func = None
         self._flash4_import_attempted = False
+
+    def _get_flash2_attn_func(self):
+        if self._flash2_import_attempted:
+            return self._flash2_attn_func
+        self._flash2_import_attempted = True
+        try:  # FlashAttention-2 public API.
+            from flash_attn import flash_attn_func
+        except Exception:
+            flash_attn_func = None
+        self._flash2_attn_func = flash_attn_func
+        return self._flash2_attn_func
+
+    def _flash2_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        flash_attn_func = self._get_flash2_attn_func()
+        if flash_attn_func is None:
+            raise ImportError(
+                "image_attention_backend='flash2' requires FlashAttention-2 (the `flash_attn` "
+                "package). Install it or use --image-attn-backend sdpa."
+            )
+        out = flash_attn_func(q, k, v, causal=False)
+        if isinstance(out, tuple):
+            out = out[0]
+        return out
 
     def _get_flash3_attn_func(self):
         if self._flash3_import_attempted:
@@ -434,7 +459,7 @@ class FullImageSelfAttention(nn.Module):
             q, k = self.rope(q, k)
 
         flash_dtype = self._flash_compute_dtype(x)
-        use_flash = self.backend in {"flash3", "flash4", "auto"} and flash_dtype is not None
+        use_flash = self.backend in {"flash2", "flash3", "flash4", "auto"} and flash_dtype is not None
         if use_flash and (q.dtype != flash_dtype or k.dtype != flash_dtype or v.dtype != flash_dtype):
             q, k, v = q.to(flash_dtype), k.to(flash_dtype), v.to(flash_dtype)
 
@@ -442,6 +467,8 @@ class FullImageSelfAttention(nn.Module):
             out = self._flash4_attention(q, k, v)
         elif self.backend == "flash3" and use_flash:
             out = self._flash3_attention(q, k, v)
+        elif self.backend == "flash2" and use_flash:
+            out = self._flash2_attention(q, k, v)
         elif self.backend == "auto" and use_flash:
             try:
                 out = self._flash4_attention(q, k, v)
@@ -449,8 +476,11 @@ class FullImageSelfAttention(nn.Module):
                 try:
                     out = self._flash3_attention(q, k, v)
                 except Exception:
-                    use_flash = False
-        if self.backend in {"flash3", "flash4"} and not use_flash:
+                    try:
+                        out = self._flash2_attention(q, k, v)
+                    except Exception:
+                        use_flash = False
+        if self.backend in {"flash2", "flash3", "flash4"} and not use_flash:
             raise RuntimeError(
                 f"image_attention_backend='{self.backend}' requires CUDA fp16/bf16 compute; got {x.device} {x.dtype}"
             )

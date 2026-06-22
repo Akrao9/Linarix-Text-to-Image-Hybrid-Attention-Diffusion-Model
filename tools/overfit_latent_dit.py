@@ -803,7 +803,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--image-attn-backend",
-        choices=["sdpa", "flash3", "flash4", "auto"],
+        choices=["sdpa", "flash2", "flash3", "flash4", "auto"],
         default="sdpa",
         help="Backend for BoomerFLA periodic full image self-attention.",
     )

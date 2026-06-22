@@ -614,7 +614,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--use-short-conv", action="store_true")
     p.add_argument("--conv-size", type=int, default=4)
     p.add_argument("--image-attn-every", type=int, default=6)
-    p.add_argument("--image-attn-backend", default="sdpa", choices=["sdpa", "flash3", "flash4", "auto"])
+    p.add_argument("--image-attn-backend", default="sdpa",
+                   choices=["sdpa", "flash2", "flash3", "flash4", "auto"])
     p.add_argument("--image-rope", action=bo, default=False,
                    help="Apply 2D RoPE to full image self-attention anchor blocks.")
     p.add_argument("--image-rope-theta", type=float, default=10000.0,
