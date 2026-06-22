@@ -998,17 +998,41 @@ class PrefetchingWdsLatentCacheDataset(IterableDataset[LatentRecord]):
         self.manifest = load_wds_cache_manifest(self.remote_paths, hf_token=self.hf_token)
 
     def _download(self, ref: HfWdsShardRef) -> Path:
+        import time
+
         from huggingface_hub import hf_hub_download
 
         token = self.hf_token if isinstance(self.hf_token, str) else None
+        # 60s inactivity timeout per chunk. hf_xet/hf_transfer (if installed) handle
+        # connection drops far better than the pure-python backend, but can still stall,
+        # so the consumer also enforces a wall-clock budget (see result() below).
         os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")
-        # local_dir (not the blob cache) so os.remove actually frees the shard.
-        return Path(
-            hf_hub_download(
-                repo_id=ref.repo_id, filename=ref.path_in_repo, repo_type="dataset",
-                token=token, local_dir=str(self.local_dir),
-            )
-        )
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            if attempt > 0:
+                time.sleep(20 * attempt)  # 20s, 40s backoff before retrying
+                print(
+                    f"[prefetch-wds] retry {attempt}/2 for {ref.path_in_repo} ...",
+                    flush=True,
+                )
+            try:
+                # local_dir (not the blob cache) so os.remove actually frees the shard.
+                return Path(
+                    hf_hub_download(
+                        repo_id=ref.repo_id, filename=ref.path_in_repo, repo_type="dataset",
+                        token=token, local_dir=str(self.local_dir),
+                    )
+                )
+            except Exception as exc:
+                last_exc = exc
+                print(
+                    f"[prefetch-wds] download attempt {attempt + 1}/3 failed for "
+                    f"{ref.path_in_repo}: {exc}",
+                    flush=True,
+                )
+        raise OSError(
+            f"[prefetch-wds] failed to download {ref.path_in_repo} after 3 attempts"
+        ) from last_exc
 
     def _shard_stream(self, stop_event):
         """Download-ahead window -> per-sample LatentRecords, looping epochs forever.
@@ -1052,7 +1076,9 @@ class PrefetchingWdsLatentCacheDataset(IterableDataset[LatentRecord]):
                         res = exc
                     with lock:
                         results[pos] = res
-                    events[pos].set()
+                        ev = events.get(pos)  # may be gone if result() already abandoned pos
+                    if ev is not None:
+                        ev.set()
 
             workers = [
                 threading.Thread(target=worker, name="wds-dl", daemon=True)
@@ -1066,11 +1092,26 @@ class PrefetchingWdsLatentCacheDataset(IterableDataset[LatentRecord]):
                     events[pos] = threading.Event()
                     task_q.put(pos)
 
-            def result(pos: int):
+            def result(pos: int, budget: float | None = None):
                 ev = events[pos]
+                waited = 0.0
                 while not ev.wait(timeout=0.5):
                     if stop_event.is_set():
                         raise _PrefetchStopped()
+                    waited += 0.5
+                    if budget is not None and waited >= budget:
+                        # Silent TCP stall: the download is wedged with no data and won't
+                        # return on its own. Abandon this shard so one bad connection can't
+                        # freeze the in-order, single-process training loop. Drop the
+                        # bookkeeping (the daemon worker is left to die at exit); skipping a
+                        # shard out of thousands is harmless for training.
+                        with lock:
+                            events.pop(pos, None)
+                            results.pop(pos, None)
+                        raise TimeoutError(
+                            f"shard pos={pos} ({self.refs[order[pos]].filename}) "
+                            f"exceeded {int(budget)}s download budget"
+                        )
                 with lock:
                     res = results.pop(pos)
                 events.pop(pos, None)
@@ -1084,11 +1125,14 @@ class PrefetchingWdsLatentCacheDataset(IterableDataset[LatentRecord]):
                 for pos in range(len(order)):
                     if stop_event.is_set():
                         return
+                    submit(pos + self.prefetch_shards)  # keep the window full even if this one is skipped
                     try:
-                        path = result(pos)
+                        path = result(pos, budget=ROLLING_WDS_DOWNLOAD_TIMEOUT_S)
                     except _PrefetchStopped:
                         return
-                    submit(pos + self.prefetch_shards)  # keep the window full
+                    except Exception as exc:  # download failed/abandoned -> skip, don't freeze
+                        print(f"[prefetch-wds] skipping shard pos={pos}: {exc}", flush=True)
+                        continue
                     dataset = wds.WebDataset([str(path)], shardshuffle=False).decode()
                     if self.shuffle_buffer > 0:
                         dataset = dataset.shuffle(self.shuffle_buffer)
