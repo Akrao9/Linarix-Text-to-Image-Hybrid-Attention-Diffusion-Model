@@ -28,7 +28,12 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
+import queue
+import shutil
+import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -86,11 +91,18 @@ class BoomerLit(pl.LightningModule):
         text, mask = self.model.apply_condition_dropout(text, mask, hp.cond_dropout)
 
         noise = torch.randn_like(x0)
+        # "Texture polish" phase: once global_step crosses t_sampler_final_step, switch the
+        # timestep sampler (e.g. -> uniform), reallocating compute toward the low-noise
+        # t~0 regime to sharpen textures/edges instead of refining global layout.
+        sampler = hp.t_sampler
+        polish = hp.t_sampler_final and self.global_step >= hp.t_sampler_final_step
+        if polish:
+            sampler = hp.t_sampler_final
         t = sample_flow_sigmas(
             x0.shape[0],
             device=x0.device,
             dtype=x0.dtype,
-            sampler=hp.t_sampler,
+            sampler=sampler,
             bias=hp.t_bias,
             flow_shift=hp.flow_shift,
             logit_mean=hp.logit_mean,
@@ -123,6 +135,8 @@ class BoomerLit(pl.LightningModule):
         loss = per_sample.mean()
 
         self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=False, batch_size=x0.shape[0])
+        if hp.t_sampler_final:
+            self.log("train/t_polish", float(polish), on_step=True, on_epoch=False, batch_size=x0.shape[0])
 
         if repa_feat is not None:
             cos = F.cosine_similarity(
@@ -337,6 +351,166 @@ class EMACallback(Callback):
 
 
 # --------------------------------------------------------------------------- #
+# Async checkpoint upload (local -> Google Drive / rclone, in the background)
+# --------------------------------------------------------------------------- #
+class CheckpointUploadCallback(Callback):
+    """Copy finished local checkpoints to a remote in a BACKGROUND thread, then keep
+    only the newest ``local_retain`` checkpoints on local disk.
+
+    Lightning's ModelCheckpoint writes locally (fast, reliable). This callback must be
+    placed AFTER ModelCheckpoint in the callbacks list, so by the time its hook runs the
+    .ckpt file exists on disk; it then enqueues the file for an async copy. Training is
+    never blocked on the upload, and a Drive-mount stall can't corrupt the local save or
+    pause the step. Local pruning only deletes checkpoints that have already uploaded, so
+    a slow upload never loses a checkpoint.
+
+    ``remote`` may be either an rclone remote (e.g. ``gdrive:Boomer/ckpts``) or an
+    absolute directory path such as a mounted Drive folder
+    (``/content/drive/MyDrive/Boomer/ckpts``); the latter is copied via tmp-file +
+    atomic rename so a reader never sees a partial file.
+    """
+
+    def __init__(
+        self,
+        *,
+        checkpoint_dir: str,
+        remote: str,
+        local_retain: int = 2,
+        keep_uploaded: int = 0,
+        rclone_bin: str = "rclone",
+        chunk_size: str = "128M",
+    ) -> None:
+        self.checkpoint_dir = Path(checkpoint_dir)
+        self.remote = remote
+        self.local_retain = max(1, int(local_retain))
+        self.keep_uploaded = int(keep_uploaded)  # 0 = keep all uploaded
+        self.rclone_bin = rclone_bin
+        self.chunk_size = chunk_size
+        # rclone remotes look like "name:path"; an absolute/relative dir does not.
+        self.use_rclone = ":" in remote and not os.path.isabs(remote)
+        self._q: queue.Queue = queue.Queue()
+        self._uploaded: set[str] = set()       # filenames confirmed on the remote
+        self._enqueued: set[str] = set()        # filenames already handed to the worker
+        self._lock = threading.Lock()
+        self._worker: threading.Thread | None = None
+        self._stop = threading.Event()
+
+    # ---- worker plumbing -------------------------------------------------- #
+    def on_fit_start(self, trainer, pl_module) -> None:
+        if trainer.global_rank != 0 or self._worker is not None:
+            return  # rank 0 only; single worker
+        if self.use_rclone:
+            print(f"[ckpt-upload] rclone -> {self.remote}", flush=True)
+        else:
+            os.makedirs(self.remote, exist_ok=True)
+            print(f"[ckpt-upload] copy -> {self.remote}", flush=True)
+        self._worker = threading.Thread(target=self._run, name="ckpt-upload", daemon=True)
+        self._worker.start()
+
+    def _run(self) -> None:
+        while not (self._stop.is_set() and self._q.empty()):
+            try:
+                path = self._q.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            try:
+                self._upload_one(Path(path))
+                with self._lock:
+                    self._uploaded.add(Path(path).name)
+                self._prune_local()
+                if self.keep_uploaded > 0:
+                    self._prune_remote()
+            except Exception as exc:  # never let an upload error kill the worker
+                print(f"[ckpt-upload] FAILED {Path(path).name}: {exc}", flush=True)
+            finally:
+                self._q.task_done()
+
+    def _upload_one(self, local: Path) -> None:
+        if not local.exists():
+            return
+        if self.use_rclone:
+            dest = f"{self.remote.rstrip('/')}/{local.name}"
+            cmd = [self.rclone_bin, "copyto", str(local), dest,
+                   "--drive-chunk-size", self.chunk_size, "--no-traverse"]
+            subprocess.run(cmd, check=True, capture_output=True)
+        else:
+            dest = Path(self.remote) / local.name
+            tmp = Path(self.remote) / (local.name + ".uploading")
+            shutil.copy2(str(local), str(tmp))  # copy to tmp...
+            os.replace(str(tmp), str(dest))     # ...then atomic swap into place
+        print(f"[ckpt-upload] uploaded {local.name}", flush=True)
+
+    # ---- pruning ---------------------------------------------------------- #
+    def _local_step_ckpts(self) -> list[Path]:
+        # All step checkpoints except the rolling 'last.ckpt' (which is overwritten).
+        return sorted(
+            (p for p in self.checkpoint_dir.glob("*.ckpt") if p.name != "last.ckpt"),
+            key=lambda p: p.stat().st_mtime,
+        )
+
+    def _prune_local(self) -> None:
+        ckpts = self._local_step_ckpts()
+        # keep the newest local_retain; delete older ones ONLY if already uploaded.
+        for p in ckpts[: max(0, len(ckpts) - self.local_retain)]:
+            with self._lock:
+                done = p.name in self._uploaded
+            if done:
+                try:
+                    p.unlink()
+                    print(f"[ckpt-upload] pruned local {p.name}", flush=True)
+                except FileNotFoundError:
+                    pass
+
+    def _prune_remote(self) -> None:
+        if self.use_rclone:
+            out = subprocess.run([self.rclone_bin, "lsf", self.remote],
+                                 capture_output=True, text=True)
+            names = sorted(n for n in out.stdout.split() if n.endswith(".ckpt") and n != "last.ckpt")
+            for n in names[: max(0, len(names) - self.keep_uploaded)]:
+                subprocess.run([self.rclone_bin, "deletefile", f"{self.remote.rstrip('/')}/{n}"],
+                               capture_output=True)
+        else:
+            files = sorted(
+                (p for p in Path(self.remote).glob("*.ckpt") if p.name != "last.ckpt"),
+                key=lambda p: p.stat().st_mtime,
+            )
+            for p in files[: max(0, len(files) - self.keep_uploaded)]:
+                try:
+                    p.unlink()
+                except FileNotFoundError:
+                    pass
+
+    # ---- hook: enqueue new checkpoints ------------------------------------ #
+    def _scan_and_enqueue(self, trainer) -> None:
+        if trainer.global_rank != 0:
+            return
+        for p in self.checkpoint_dir.glob("*.ckpt"):
+            if p.name == "last.ckpt":
+                continue
+            with self._lock:
+                seen = p.name in self._enqueued
+            if not seen:
+                with self._lock:
+                    self._enqueued.add(p.name)
+                self._q.put(str(p))
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:
+        # Runs after ModelCheckpoint's hook (this callback is appended later), so any
+        # checkpoint written this step already exists on disk.
+        self._scan_and_enqueue(trainer)
+
+    def on_fit_end(self, trainer, pl_module) -> None:
+        # Make sure the final checkpoint(s) are enqueued, then drain before exit.
+        self._scan_and_enqueue(trainer)
+        if self._worker is None:
+            return
+        print("[ckpt-upload] draining pending uploads...", flush=True)
+        self._q.join()
+        self._stop.set()
+        self._worker.join(timeout=30.0)
+
+
+# --------------------------------------------------------------------------- #
 # dim auto-detection
 # --------------------------------------------------------------------------- #
 def peek_record(args: argparse.Namespace, hf_token: str | bool | None) -> Any:
@@ -488,6 +662,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cond-dropout", type=float, default=0.1)
     p.add_argument("--t-sampler", default="plateau-logit-normal",
                    choices=["uniform", "high", "low", "logit-normal", "bounded-logit-normal", "plateau-logit-normal"])
+    # "Texture polish" final phase: from --t-sampler-final-step onward, switch the timestep
+    # sampler (e.g. to uniform), shifting compute to the low-noise t~0 regime to sharpen
+    # textures/edges. Off unless --t-sampler-final is set.
+    p.add_argument("--t-sampler-final", default=None,
+                   choices=["uniform", "high", "low", "logit-normal", "bounded-logit-normal", "plateau-logit-normal"],
+                   help="Sampler to switch to for the final polish phase (e.g. uniform).")
+    p.add_argument("--t-sampler-final-step", type=int, default=80000,
+                   help="global_step at which to switch to --t-sampler-final.")
     p.add_argument("--t-bias", type=float, default=2.0)
     p.add_argument("--flow-shift", type=float, default=1.5)
     p.add_argument("--logit-mean", type=float, default=0.0)
@@ -506,8 +688,23 @@ def build_parser() -> argparse.ArgumentParser:
                    help="If set, overrides --precision (bf16->bf16-mixed, fp16->16-mixed, fp32->32-true).")
     p.add_argument("--device", default="cuda",
                    help="'cuda' (gpu accelerator) or 'cpu'. Lightning manages device placement.")
-    p.add_argument("--checkpoint-dir", default="/content/ckpt_stage0")
+    p.add_argument("--checkpoint-dir", default="/content/ckpt_stage0",
+                   help="Local directory for checkpoints (always written here first).")
     p.add_argument("--save-every-steps", "--save-every", dest="save_every_steps", type=int, default=2000)
+    # Async checkpoint upload: save locally, copy to Drive/rclone in the background,
+    # keep only the newest N local checkpoints (older ones deleted after they upload).
+    p.add_argument("--checkpoint-upload-remote", default=None,
+                   help="Background upload destination: an rclone remote "
+                        "(e.g. 'gdrive:Boomer/ckpts') OR an absolute dir such as a mounted "
+                        "Drive folder ('/content/drive/MyDrive/Boomer/ckpts'). Off if unset.")
+    p.add_argument("--checkpoint-local-retain", type=int, default=2,
+                   help="Keep this many newest checkpoints on local disk; older uploaded ones are deleted.")
+    p.add_argument("--checkpoint-keep-uploaded", type=int, default=0,
+                   help="Prune the remote to this many newest checkpoints. 0 = keep all uploaded.")
+    p.add_argument("--checkpoint-rclone-bin", default="rclone",
+                   help="rclone executable for --checkpoint-upload-remote rclone remotes.")
+    p.add_argument("--checkpoint-upload-chunk-size", default="128M",
+                   help="rclone --drive-chunk-size for Google Drive uploads.")
     p.add_argument("--log-every-steps", "--log-every", dest="log_every_steps", type=int, default=50)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--resume", default=None, help="Path to a .ckpt to resume from.")
@@ -560,6 +757,8 @@ def main() -> None:
         max_steps=args.max_steps,
         cond_dropout=args.cond_dropout,
         t_sampler=args.t_sampler,
+        t_sampler_final=args.t_sampler_final,
+        t_sampler_final_step=args.t_sampler_final_step,
         t_bias=args.t_bias,
         flow_shift=args.flow_shift,
         logit_mean=args.logit_mean,
@@ -614,6 +813,17 @@ def main() -> None:
     ]
     if args.ema_decay > 0.0:
         callbacks.append(EMACallback(decay=args.ema_decay, update_every=args.ema_update_every))
+    # Appended AFTER ModelCheckpoint so a checkpoint written this step already exists on
+    # disk when this callback's hook runs and enqueues it for async upload.
+    if args.checkpoint_upload_remote:
+        callbacks.append(CheckpointUploadCallback(
+            checkpoint_dir=args.checkpoint_dir,
+            remote=args.checkpoint_upload_remote,
+            local_retain=args.checkpoint_local_retain,
+            keep_uploaded=args.checkpoint_keep_uploaded,
+            rclone_bin=args.checkpoint_rclone_bin,
+            chunk_size=args.checkpoint_upload_chunk_size,
+        ))
 
     precision = args.precision
     if args.dtype is not None:
