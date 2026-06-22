@@ -1,0 +1,518 @@
+"""Cache jasperai/monet parquet shards into Boomer's WebDataset latent/text cache.
+
+monet ships precomputed DC-AE f32c32 latents (verified drop-in for Boomer's VAE;
+see tools/verify_monet_vae_compat.py) flattened to 8192 floats == 32x16x16 at
+native 512x512. So this tool SKIPS image download + VAE encoding entirely: it
+reads the latent column straight from parquet and only runs Qwen3.5-2B over the
+provided captions, then writes the same WebDataset members the existing pipeline
+emits (latents/text/text_mask + caption.txt + meta.json), consumed unchanged by
+boomer/datasets/wds_latents.py.
+
+It additionally writes a `dino.npy` member (monet's precomputed DINOv2-ViT-G/14
+embedding) so a REPA representation-alignment loss can be added to training later
+at no extra caching cost. The loader ignores unknown members, so existing
+training keeps working until REPA is wired in.
+
+Parallel fan-out matches the rest of the pipeline: launch one process per GPU
+with RANK/WORLD_SIZE set; each rank takes parquet shards `[rank::world_size]`
+and writes its own `r{rank}` tar shards + manifest.
+
+Example (single GPU, smoke test on 2 shards, no upload):
+
+    python -m tools.cache_monet_parquet_to_boomer_wds \
+        --subset cc12m --max-source-shards 2 \
+        --output-dir /content/monet_cache \
+        --hf-token "$HF_TOKEN"
+
+Example (8-GPU launcher):
+
+    for r in $(seq 0 7); do
+      RANK=$r WORLD_SIZE=8 CUDA_VISIBLE_DEVICES=$r \
+        python -m tools.cache_monet_parquet_to_boomer_wds \
+          --output-dir /data/monet_cache \
+          --upload-repo you/boomer-monet-cache --delete-uploaded \
+          --hf-token "$HF_TOKEN" &
+    done; wait
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from collections import Counter
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+
+from boomer.models.qwen_connector import (
+    QwenConnectorConfig,
+    QwenReferenceEncoder,
+    encode_qwen_text_fixed,
+)
+from boomer.sana_latent_cache import hf_token_value
+from tools.cache_hf_wds_to_boomer_wds import (
+    AsyncHubUploader,
+    normalize_storage_dtype,
+    tensor_to_storage_npy,
+    tensor_to_u8_npy,
+)
+
+DEFAULT_LATENT_KEY = "embedding_vae-dc-sana1p5-1p6b-1024px-tiling-128-resolution-512x512"
+DEFAULT_CAPTION_KEY = "caption_gemini-2.5-flash-lite"
+DEFAULT_DINO_KEY = "embedding_dinov2-vitg14"
+LATENT_CHANNELS = 32  # DC-AE f32c32
+
+
+# --------------------------------------------------------------------------- #
+# Source shard discovery
+# --------------------------------------------------------------------------- #
+def list_source_parquets(repo_id: str, subset: str | None, token: str | None) -> list[str]:
+    from huggingface_hub import HfApi
+
+    api = HfApi(token=token)
+    files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
+    prefix = f"v1.1.0/{subset}/" if subset else "v1.1.0/"
+    parquets = sorted(f for f in files if f.startswith(prefix) and f.endswith(".parquet"))
+    if not parquets:
+        raise FileNotFoundError(f"No parquet shards under {prefix} in {repo_id}")
+    return parquets
+
+
+def resolve_rank_world(args: argparse.Namespace) -> tuple[int, int]:
+    rank = args.rank if args.rank is not None else int(os.environ.get("RANK", "0"))
+    world = args.world_size if args.world_size is not None else int(os.environ.get("WORLD_SIZE", "1"))
+    if rank < 0 or world < 1 or rank >= world:
+        raise ValueError(f"Invalid rank/world: rank={rank} world={world}")
+    return rank, world
+
+
+# --------------------------------------------------------------------------- #
+# Quality filtering (monet ships per-image quality signals)
+# --------------------------------------------------------------------------- #
+def passes_filters(row: dict[str, Any], args: argparse.Namespace, seen_clusters: set[str]) -> bool:
+    if args.min_aesthetic is not None:
+        a = row.get("aesthetic_laion-improved")
+        if a is None or a < args.min_aesthetic:
+            return False
+    if args.max_nsfw is not None:
+        n = row.get("nsfw_jasperai")
+        if n is not None and n > args.max_nsfw:
+            return False
+    if args.max_watermark is not None:
+        w = row.get("wk_jasperai")
+        if w is not None and w > args.max_watermark:
+            return False
+    if args.dedup:
+        cid = row.get("sscd_cluster_id")
+        if cid:
+            if cid in seen_clusters:
+                return False
+            seen_clusters.add(cid)
+    return True
+
+
+# --------------------------------------------------------------------------- #
+# Latent reshape
+# --------------------------------------------------------------------------- #
+def flat_to_latent(vec: list[float]) -> np.ndarray:
+    arr = np.asarray(vec, dtype=np.float32)
+    n = arr.size
+    if n % LATENT_CHANNELS != 0:
+        raise ValueError(f"latent length {n} not divisible by {LATENT_CHANNELS}")
+    cells = n // LATENT_CHANNELS
+    side = int(round(cells ** 0.5))
+    if side * side != cells:
+        raise ValueError(f"latent {n} -> {cells} cells is not square")
+    return arr.reshape(LATENT_CHANNELS, side, side)
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--repo-id", default="jasperai/monet")
+    p.add_argument("--subset", default="cc12m", help="subset dir under v1.1.0/ (empty = all subsets)")
+    p.add_argument("--latent-key", default=DEFAULT_LATENT_KEY)
+    p.add_argument("--caption-key", default=DEFAULT_CAPTION_KEY,
+                   help="preferred caption column")
+    p.add_argument("--caption-fallback-keys",
+                   default="caption_internvl-3-8b,caption_sharegpt4v-7b,caption_florence-2-large,caption_original",
+                   help="comma-ordered captions to use when --caption-key is empty/absent "
+                        "(some subsets, e.g. commoncatalog, have no Gemini caption)")
+    p.add_argument("--dino-key", default=DEFAULT_DINO_KEY)
+    p.add_argument("--no-dino", action="store_true", help="skip the DINOv2 REPA member")
+    p.add_argument("--output-dir", required=True)
+    p.add_argument("--shard-size", type=int, default=100000,
+                   help="max samples per output tar (upper bound; --max-shard-gb usually triggers first)")
+    p.add_argument("--max-shard-gb", type=float, default=4.0,
+                   help="rotate the output tar at this many GB (default 4)")
+    p.add_argument("--encode-batch", type=int, default=64, help="captions per Qwen forward")
+    p.add_argument("--max-length", type=int, default=340, help="must match existing Qwen cache shape")
+    p.add_argument("--latent-dtype", default="bfloat16")
+    p.add_argument("--text-dtype", default="bfloat16")
+    p.add_argument("--dino-dtype", default="float16")
+    # Qwen text encoder
+    p.add_argument("--qwen-id", default=QwenConnectorConfig.qwen_model_id)
+    p.add_argument("--qwen-readout-layer", type=int, default=-1)
+    p.add_argument("--qwen-instruction", default=None)
+    p.add_argument("--no-qwen-instruction", action="store_true")
+    p.add_argument("--dtype", default="bf16")
+    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--compile", action="store_true",
+                   help="torch.compile(mode=default, dynamic=True) the Qwen forward for speed")
+    # filtering
+    p.add_argument("--min-aesthetic", type=float, default=None)
+    p.add_argument("--max-nsfw", type=float, default=None)
+    p.add_argument("--max-watermark", type=float, default=None)
+    p.add_argument("--dedup", action="store_true", help="keep one image per sscd_cluster_id (per rank)")
+    # parallel + limits
+    p.add_argument("--rank", type=int, default=None)
+    p.add_argument("--world-size", type=int, default=None)
+    p.add_argument("--max-source-shards", type=int, default=None, help="cap source shards (testing)")
+    p.add_argument("--prefetch-shards", type=int, default=10,
+                   help="source parquets to download ahead of the GPU (bounded disk window)")
+    p.add_argument("--source-staging-dir", default=None,
+                   help="where to download source parquets (default <output-dir>/_src). Files are "
+                        "deleted after read; using a real dir (not the HF cache) lets that free disk.")
+    p.add_argument("--max-pending-uploads", type=int, default=6,
+                   help="block when more than this many output shards await upload (bounds disk)")
+    # Resume: skip source shards already done and continue output shard numbering.
+    p.add_argument("--start-source-shard", type=int, default=0,
+                   help="skip the first N of THIS rank's source shards (resume)")
+    p.add_argument("--start-output-shard", type=int, default=0,
+                   help="first output shard index (set to last written + 1 to resume)")
+    # upload
+    p.add_argument("--upload-repo", default=None)
+    p.add_argument("--repo-path-prefix", default="")
+    p.add_argument("--upload-workers", type=int, default=4)
+    p.add_argument("--delete-uploaded", action="store_true")
+    p.add_argument("--no-create-repo", action="store_true")
+    p.add_argument("--hf-token", default=None)
+    return p.parse_args()
+
+
+def build_qwen_encoder(args: argparse.Namespace, token) -> QwenReferenceEncoder:
+    instruction = None if args.no_qwen_instruction else (args.qwen_instruction or QwenConnectorConfig.instruction)
+    cfg = QwenConnectorConfig(
+        qwen_model_id=args.qwen_id,
+        readout_layer=args.qwen_readout_layer,
+        instruction=instruction,
+        dtype=args.dtype,
+        # Cap the forward at the cache length (don't process tokens we'll discard).
+        # When compiling, also pad to that exact length so shapes are static.
+        max_text_tokens=args.max_length,
+        pad_to_max_length=args.compile,
+    )
+    encoder = QwenReferenceEncoder(cfg, hf_token=token)
+    encoder.load()
+    encoder.to(args.device)
+    if args.compile:
+        # Static seq length (pad_to_max_length) -> only the batch dim varies (full vs
+        # the last partial batch), so dynamic=True settles in ~2 compiles instead of
+        # thrashing on every distinct caption length.
+        if getattr(encoder, "_base_model", None) is not None:
+            encoder._base_model = torch.compile(encoder._base_model, mode="default", dynamic=True)
+        if getattr(encoder, "_model", None) is not None:
+            encoder._model = torch.compile(encoder._model, mode="default", dynamic=True)
+        print("[monet-cache] torch.compile(mode=default, dynamic=True) applied to Qwen "
+              f"(static seq={args.max_length})")
+    print(f"[monet-cache] Qwen ready (hidden_size={encoder.hidden_size}, layer={args.qwen_readout_layer})")
+    return encoder
+
+
+def write_manifest(
+    output_dir: Path,
+    rank: int,
+    *,
+    latent_dtype: str,
+    text_dtype: str,
+    text_shape: tuple[int, int],
+    dino_dtype: str | None,
+    dino_dim: int | None,
+    args: argparse.Namespace,
+    uploader: AsyncHubUploader,
+) -> None:
+    schema = ["latents.npy", "text.npy", "text_mask.npy", "caption.txt", "meta.json"]
+    if dino_dim is not None:
+        schema.append("dino.npy")
+    manifest = {
+        "format_version": 2,
+        "format": "boomer_wds_latent_text_cache",
+        "latents_dtype": latent_dtype,
+        # monet's 512px f32c32 latents are always 32x16x16
+        "latents_shape": [LATENT_CHANNELS, 16, 16],
+        "text_dtype": text_dtype,
+        "text_shape": list(text_shape),
+        "text_mask_dtype": "uint8",
+        "raw_tensors": False,
+        "schema": schema,
+        "source": args.repo_id,
+        "caption_key": args.caption_key,
+        "qwen_model_id": args.qwen_id,
+        "qwen_readout_layer": args.qwen_readout_layer,
+        "max_length": args.max_length,
+    }
+    if dino_dim is not None:
+        manifest["dino_dtype"] = dino_dtype
+        manifest["dino_shape"] = [dino_dim]
+    name = "manifest.json" if rank == 0 else f"manifest-r{rank:02d}.json"
+    path = output_dir / name
+    path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    uploader.upload_path(path)
+    print(f"[monet-cache] wrote {name}")
+
+
+def write_null_embeddings(
+    output_dir: Path,
+    encoder: QwenReferenceEncoder,
+    args: argparse.Namespace,
+    uploader: AsyncHubUploader,
+) -> None:
+    # CFG null embedding: encode the empty string, same shape as cached text.
+    hidden, mask = encode_qwen_text_fixed(encoder, [""], args.max_length)
+    null_text = output_dir / "null_text.npy"
+    null_mask = output_dir / "null_mask.npy"
+    null_text.write_bytes(tensor_to_storage_npy(hidden[0], args.text_dtype))
+    null_mask.write_bytes(tensor_to_u8_npy(mask[0]))
+    uploader.upload_path(null_text)
+    uploader.upload_path(null_mask)
+    print("[monet-cache] wrote null_text.npy / null_mask.npy")
+
+
+def main() -> int:
+    import pyarrow.parquet as pq
+    import webdataset as wds
+    from huggingface_hub import hf_hub_download
+
+    args = parse_args()
+    token = hf_token_value(args.hf_token)
+    token_str = token if isinstance(token, str) else None
+    normalize_storage_dtype(args.latent_dtype)  # validate early
+    normalize_storage_dtype(args.text_dtype)
+    rank, world = resolve_rank_world(args)
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    staging_dir = Path(args.source_staging_dir) if args.source_staging_dir else (out_dir / "_src")
+    staging_dir.mkdir(parents=True, exist_ok=True)
+
+    all_parquets = list_source_parquets(args.repo_id, args.subset or None, token_str)
+    my_parquets = all_parquets[rank::world]
+    if args.max_source_shards is not None:
+        my_parquets = my_parquets[: args.max_source_shards]
+    if args.start_source_shard:
+        my_parquets = my_parquets[args.start_source_shard:]  # resume: skip already-done shards
+    print(f"[monet-cache rank {rank}/{world}] {len(my_parquets)} source parquet shards "
+          f"(start_source_shard={args.start_source_shard}, start_output_shard={args.start_output_shard})")
+
+    encoder = build_qwen_encoder(args, token)
+
+    uploader = AsyncHubUploader(
+        repo_id=args.upload_repo,
+        repo_path_prefix=args.repo_path_prefix,
+        workers=args.upload_workers,
+        delete_uploaded=args.delete_uploaded,
+        create_repo=not args.no_create_repo,
+    )
+
+    # Caption priority: preferred key first, then fallbacks (subsets vary in which
+    # captioners ran). The first non-empty value per row is used.
+    caption_keys = [args.caption_key] + [
+        c.strip() for c in args.caption_fallback_keys.split(",") if c.strip()
+    ]
+    extra_cols = ["__key__", "id", "aesthetic_laion-improved", "nsfw_jasperai",
+                  "wk_jasperai", "sscd_cluster_id", "source"]
+
+    pattern = str(out_dir / f"monet-{args.subset or 'all'}-r{rank:02d}-%06d.tar")
+    sink = wds.ShardWriter(
+        pattern,
+        maxcount=args.shard_size,
+        maxsize=int(args.max_shard_gb * 1e9),
+        start_shard=args.start_output_shard,
+        post=uploader.upload_path,
+    )
+
+    seen_clusters: set[str] = set()
+    manifest_written = False
+    n_written = 0
+    n_seen = 0
+    n_filtered = 0
+    n_no_latent = 0
+    n_no_caption = 0
+    caption_src_counts: Counter[str] = Counter()
+
+    def encode_and_write(buffer: list[dict[str, Any]]) -> None:
+        nonlocal n_written, manifest_written
+        if not buffer:
+            return
+        latents = torch.from_numpy(
+            np.stack([flat_to_latent(item["latent"]) for item in buffer])
+        )  # (B,32,16,16) fp32
+        captions = [item["caption"] for item in buffer]
+        with torch.inference_mode():
+            hidden, mask = encode_qwen_text_fixed(encoder, captions, args.max_length)
+        hidden = hidden.detach().cpu()
+        mask = mask.detach().cpu()
+        has_dino = (not args.no_dino) and all(item.get("dino") is not None for item in buffer)
+        dinos = None
+        if has_dino:
+            dinos = torch.from_numpy(
+                np.stack([np.asarray(item["dino"], dtype=np.float32) for item in buffer])
+            )
+
+        if not manifest_written:
+            text_shape = (int(hidden.shape[1]), int(hidden.shape[2]))
+            write_manifest(
+                out_dir, rank,
+                latent_dtype=args.latent_dtype, text_dtype=args.text_dtype,
+                text_shape=text_shape,
+                dino_dtype=args.dino_dtype if not args.no_dino else None,
+                dino_dim=int(dinos.shape[1]) if dinos is not None else None,
+                args=args, uploader=uploader,
+            )
+            if rank == 0:
+                write_null_embeddings(out_dir, encoder, args, uploader)
+            manifest_written = True
+
+        for i, item in enumerate(buffer):
+            sample = {
+                "__key__": item["key"],
+                "latents.npy": tensor_to_storage_npy(latents[i], args.latent_dtype),
+                "text.npy": tensor_to_storage_npy(hidden[i], args.text_dtype),
+                "text_mask.npy": tensor_to_u8_npy(mask[i]),
+                "caption.txt": item["caption"],
+                "meta.json": {
+                    "source": item.get("source") or args.repo_id,
+                    "key": item["key"],
+                    "caption_key": item.get("caption_src") or args.caption_key,
+                    "aesthetic": item.get("aesthetic"),
+                    "nsfw": item.get("nsfw"),
+                    "sscd_cluster_id": item.get("cluster"),
+                },
+            }
+            if dinos is not None:
+                sample["dino.npy"] = tensor_to_storage_npy(dinos[i], args.dino_dtype)
+            sink.write(sample)
+            n_written += 1
+
+    # Prefetch source parquets ahead of the GPU so it never blocks on the ~600 MB
+    # download at each shard boundary. Window = args.prefetch_shards (bounded disk).
+    import concurrent.futures
+
+    dl_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=max(1, min(4, args.prefetch_shards))
+    )
+    dl_futures: dict[int, concurrent.futures.Future] = {}
+
+    def submit_download(idx: int) -> None:
+        if 0 <= idx < len(my_parquets) and idx not in dl_futures:
+            dl_futures[idx] = dl_executor.submit(
+                hf_hub_download,
+                repo_id=args.repo_id, filename=my_parquets[idx],
+                repo_type="dataset", token=token_str,
+                # Download to a real staging dir (NOT the HF blob cache); os.remove on the
+                # returned file then actually frees disk. With the default cache, removing the
+                # snapshot symlink leaves the blob behind and disk grows unbounded.
+                local_dir=str(staging_dir),
+            )
+
+    for idx in range(min(args.prefetch_shards, len(my_parquets))):
+        submit_download(idx)
+
+    for shard_idx, parquet_path in enumerate(my_parquets):
+        local = dl_futures.pop(shard_idx).result()   # wait only if not prefetched yet
+        submit_download(shard_idx + args.prefetch_shards)  # keep the window full
+        available = set(pq.read_schema(local).names)
+        # Resolve columns against THIS shard's schema (subsets differ); request only
+        # what exists so a missing fallback caption / dino column can't crash read_table.
+        latent_col = args.latent_key if args.latent_key in available else next(
+            (c for c in sorted(available) if "vae" in c.lower()), None
+        )
+        if latent_col is None:
+            raise RuntimeError(f"No VAE-latent column found in {parquet_path}; have {sorted(available)}")
+        present_caption_keys = [c for c in caption_keys if c in available]
+        dino_col = args.dino_key if (not args.no_dino and args.dino_key in available) else None
+        want = [latent_col, *present_caption_keys, *[c for c in extra_cols if c in available]]
+        if dino_col:
+            want.append(dino_col)
+        want = list(dict.fromkeys(want))  # dedupe, preserve order
+
+        table = pq.read_table(local, columns=want)
+        cols = {c: table.column(c).to_pylist() for c in table.column_names}
+        n_rows = table.num_rows
+        buffer: list[dict[str, Any]] = []
+        for i in range(n_rows):
+            n_seen += 1
+            row = {c: cols[c][i] for c in cols}
+            if not passes_filters(row, args, seen_clusters):
+                n_filtered += 1
+                continue
+            latent = row.get(latent_col)
+            if latent is None:
+                n_no_latent += 1
+                continue
+            caption = ""
+            caption_src = None
+            for ck in present_caption_keys:
+                v = row.get(ck)
+                if v:
+                    caption, caption_src = v, ck
+                    break
+            if not caption:
+                n_no_caption += 1
+                continue
+            caption_src_counts[caption_src] += 1
+            key = row.get("__key__") or row.get("id") or f"r{rank}s{shard_idx}n{i}"
+            item = {
+                "key": str(key),
+                "latent": latent,
+                "caption": caption,
+                "caption_src": caption_src,
+                "source": row.get("source"),
+                "aesthetic": row.get("aesthetic_laion-improved"),
+                "nsfw": row.get("nsfw_jasperai"),
+                "cluster": row.get("sscd_cluster_id"),
+            }
+            if dino_col:
+                item["dino"] = row.get(dino_col)
+            buffer.append(item)
+            if len(buffer) >= args.encode_batch:
+                encode_and_write(buffer)
+                buffer = []
+        encode_and_write(buffer)
+
+        try:
+            os.remove(local)  # staging cleanup: drop the source parquet after read
+        except FileNotFoundError:
+            pass
+        uploader.poll()
+        # Backpressure: if uploads lag, don't let finished output shards pile up on disk.
+        # Count closed-but-present tars (the open one stays); wait for uploads to drain.
+        while len(list(out_dir.glob("*.tar"))) > args.max_pending_uploads:
+            uploader.poll(wait=True)
+        # Report the captioners ACTUALLY used (not just the preferred key), so a
+        # present-but-null column like Gemini on commoncatalog-cc-by is visible here.
+        src_summary = ", ".join(f"{k}={v}" for k, v in caption_src_counts.most_common()) or "none"
+        print(
+            f"[monet-cache rank {rank}] shard {shard_idx + 1}/{len(my_parquets)} "
+            f"({parquet_path}): caption_src=[{src_summary}] seen={n_seen} "
+            f"written={n_written} filtered={n_filtered} no_latent={n_no_latent} no_caption={n_no_caption}",
+            flush=True,
+        )
+
+    sink.close()
+    dl_executor.shutdown(wait=True)
+    uploader.finish()
+    print(
+        f"[monet-cache rank {rank}] DONE: {n_written} samples written "
+        f"(filtered={n_filtered} no_latent={n_no_latent} no_caption={n_no_caption} of {n_seen} seen)"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

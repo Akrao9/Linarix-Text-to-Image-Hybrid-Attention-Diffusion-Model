@@ -316,6 +316,8 @@ def build_model_config(args: argparse.Namespace, sample_record: Any, resume_chec
             patch_size=args.patch_size,
             extra_input_channels=getattr(args, "extra_input_channels", 0),
             gradient_checkpointing=getattr(args, "gradient_checkpointing", False),
+            repa_dim=getattr(args, "repa_dim", 0),
+            repa_layer=getattr(args, "repa_layer", -1),
         )
 
     return LatentDiTConfig(
@@ -739,6 +741,13 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--hidden-dim", type=int, default=384)
     parser.add_argument("--depth", type=int, default=6)
+    # REPA representation alignment. --repa-dim 1536 enables it (matches monet's DINOv2 CLS);
+    # --repa-weight scales the cosine-alignment loss; --repa-anneal-steps decays it to 0 by
+    # that step (0 = constant). Requires the cache to carry a dino.npy member.
+    parser.add_argument("--repa-dim", type=int, default=0, help="SSL target dim; 1536 for DINOv2-ViT-G. 0=off")
+    parser.add_argument("--repa-layer", type=int, default=-1, help="DiT block to align; -1 => depth//2")
+    parser.add_argument("--repa-weight", type=float, default=0.0, help="REPA loss weight (e.g. 0.5)")
+    parser.add_argument("--repa-anneal-steps", type=int, default=0, help="decay REPA weight to 0 by this step")
     parser.add_argument("--num-heads", type=int, default=6)
     parser.add_argument("--mlp-ratio", type=float, default=4.0)
     parser.add_argument("--cross-attn", action="store_true", help="Use cross-attention over full Gemma token states.")
@@ -1387,6 +1396,7 @@ def main() -> None:
     pending_sigma_high_losses: list[torch.Tensor] = []
     pending_grad_norms: list[torch.Tensor] = []
     pending_lrs: list[float] = []
+    pending_repa_losses: list[torch.Tensor] = []
     last_step = start_step
     train_started = time.perf_counter()
 
@@ -1450,8 +1460,21 @@ def main() -> None:
                 plateau_high=args.plateau_high,
             )
 
+            repa_target = None
+            if args.repa_weight > 0.0 and getattr(raw_model.config, "repa_dim", 0) > 0:
+                dino_batch = batch.get("dino_embedding")
+                if dino_batch is not None:
+                    repa_target = move_batch_tensor(
+                        dino_batch, device=device, dtype=dtype, non_blocking=non_blocking
+                    )
             with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=autocast_enabled):
-                pred_velocity = model(x_t, t, text_embedding, attention_mask)
+                if repa_target is not None:
+                    pred_velocity, repa_feat = model(
+                        x_t, t, text_embedding, attention_mask, return_repa=True
+                    )
+                else:
+                    pred_velocity = model(x_t, t, text_embedding, attention_mask)
+                    repa_feat = None
             # Loss math stays in fp32 outside autocast for numerical stability.
             raw_per_sample_loss = (pred_velocity.float() - target_velocity.float()).pow(2).mean(dim=(1, 2, 3))
             bin_losses = sigma_bin_means(raw_per_sample_loss, t)
@@ -1465,6 +1488,20 @@ def main() -> None:
                     args.min_snr_gamma,
                 ).mean(dim=(1, 2, 3))
             loss = per_sample_loss.mean()
+            repa_loss_value = None
+            if repa_feat is not None and repa_target is not None:
+                # Cosine alignment of the pooled mid-depth feature to the DINOv2 target.
+                repa_cos = F.cosine_similarity(
+                    F.normalize(repa_feat.float(), dim=-1),
+                    F.normalize(repa_target.float(), dim=-1),
+                    dim=-1,
+                )
+                repa_loss = (1.0 - repa_cos).mean()
+                repa_w = args.repa_weight
+                if args.repa_anneal_steps > 0:
+                    repa_w *= max(0.0, 1.0 - step / args.repa_anneal_steps)
+                loss = loss + repa_w * repa_loss
+                repa_loss_value = repa_loss.detach()
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             # Keep grad_norm as a tensor; only sync at log boundaries below.
@@ -1483,6 +1520,8 @@ def main() -> None:
             pending_sigma_high_losses.append(bin_losses["high"].detach())
             pending_grad_norms.append(grad_norm_tensor.detach())
             pending_lrs.append(optimizer.param_groups[0]["lr"])
+            if repa_loss_value is not None:
+                pending_repa_losses.append(repa_loss_value)
 
             should_log = step == 1 or (args.log_every and step % args.log_every == 0)
             log_snapshot: dict[str, Any] | None = None
@@ -1515,6 +1554,11 @@ def main() -> None:
                     "sigma_high_loss": sigma_high_vals[-1],
                     "sigma_mean": sigma_mean_vals[-1],
                 }
+                if pending_repa_losses:
+                    log_snapshot["repa_loss"] = (
+                        torch.stack(pending_repa_losses).float().mean().item()
+                    )
+                pending_repa_losses.clear()
                 pending_steps.clear()
                 pending_losses.clear()
                 pending_raw_losses.clear()

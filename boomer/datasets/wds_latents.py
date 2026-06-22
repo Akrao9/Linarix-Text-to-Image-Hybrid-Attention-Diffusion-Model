@@ -71,6 +71,7 @@ class WdsCacheManifest:
     text_shape: tuple[int, ...] | None = None
     text_mask_dtype: str = "uint8"
     raw_tensors: bool = False
+    dino_dtype: str = "float16"
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> WdsCacheManifest:
@@ -87,6 +88,7 @@ class WdsCacheManifest:
             text_shape=tuple(text_shape) if text_shape else None,
             text_mask_dtype=str(payload.get("text_mask_dtype", "uint8")),
             raw_tensors=raw_tensors,
+            dino_dtype=str(payload.get("dino_dtype", "float16")),
         )
 
 
@@ -750,6 +752,21 @@ def sample_to_record(
     text_embedding = _text_to_tensor(text_value, text_fmt, manifest=manifest)
     attention_mask = _mask_to_tensor(mask_value, mask_fmt, manifest=manifest).to(torch.int16)
 
+    dino_embedding = None
+    if "dino.npy" in sample or "dino.bin" in sample:
+        dino_fmt, dino_value = _pick_sample_field(sample, "dino")
+        dino_dtype = manifest.dino_dtype if manifest is not None else "float16"
+        if dino_fmt == "npy":
+            dino_embedding = _array_to_logical_tensor(
+                _load_npy_array(dino_value), dtype_name=dino_dtype
+            ).contiguous()
+        else:
+            shape = _require_shape(manifest, "dino_shape", "dino")
+            payload = dino_value if isinstance(dino_value, (bytes, bytearray)) else bytes(dino_value)
+            dino_embedding = _array_to_logical_tensor(
+                _bin_to_numpy(payload, dtype_name=dino_dtype, shape=shape), dtype_name=dino_dtype
+            ).contiguous()
+
     caption = decode_text(sample["caption.txt"])
     metadata = decode_json(sample["meta.json"])
     return LatentRecord(
@@ -759,6 +776,7 @@ def sample_to_record(
         caption=caption,
         metadata=metadata,
         path=str(sample.get("__url__", "")),
+        dino_embedding=dino_embedding,
     )
 
 
@@ -937,8 +955,169 @@ class RollingStreamingWdsLatentCacheDataset(IterableDataset[LatentRecord]):
             self.cache.advance_after(shard_name)
 
 
+@dataclass
+class PrefetchingWdsLatentCacheDataset(IterableDataset[LatentRecord]):
+    """Stream remote WDS shards with a PARALLEL download-ahead window — the same
+    prefetch pattern the caching tool uses.
+
+    A thread pool keeps ``prefetch_shards`` tars downloading at once into
+    ``local_dir``; the main thread yields samples from each shard in order and
+    deletes it after use. This keeps the GPU fed even when one shard download is
+    slower than consuming a shard (the failure mode of the serial rolling cache on
+    large 4 GB shards). Run with ``num_workers=0`` — prefetch is on internal threads.
+    """
+
+    paths: str | Iterable[str]
+    local_dir: str | Path
+    prefetch_shards: int = 8
+    download_workers: int = 4
+    hf_token: str | bool | None = None
+    shuffle_buffer: int = 2000
+    seed: int | None = None
+    # Background decode: a producer thread runs download->decode->sample_to_record and
+    # pushes finished LatentRecords into a bounded queue, so per-sample tensor
+    # reconstruction overlaps the GPU step (the consumer's CUDA call releases the GIL
+    # while the GPU is busy). Set <= 0 to decode inline on the consumer thread.
+    decode_queue_size: int = 512
+
+    def __post_init__(self) -> None:
+        if isinstance(self.paths, str):
+            raw_paths = split_csv(self.paths)
+        else:
+            raw_paths = [str(p) for p in self.paths]
+        if len(raw_paths) != 1 or not raw_paths[0].startswith("hf://"):
+            raise ValueError(
+                "PrefetchingWdsLatentCacheDataset requires exactly one hf://datasets/... glob."
+            )
+        self.remote_paths = raw_paths[0]
+        self.refs = list_hf_wds_shard_refs(self.remote_paths, hf_token=self.hf_token)
+        self.manifest = load_wds_cache_manifest(self.remote_paths, hf_token=self.hf_token)
+
+    def _download(self, ref: HfWdsShardRef) -> Path:
+        from huggingface_hub import hf_hub_download
+
+        token = self.hf_token if isinstance(self.hf_token, str) else None
+        os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")
+        # local_dir (not the blob cache) so os.remove actually frees the shard.
+        return Path(
+            hf_hub_download(
+                repo_id=ref.repo_id, filename=ref.path_in_repo, repo_type="dataset",
+                token=token, local_dir=str(self.local_dir),
+            )
+        )
+
+    def _shard_stream(self, stop_event):
+        """Download-ahead window -> per-sample LatentRecords, looping epochs forever.
+        Honors ``stop_event`` so the consumer can shut the producer down cleanly."""
+        import concurrent.futures
+
+        import webdataset as wds
+
+        rng = random.Random(self.seed)
+        order = list(range(len(self.refs)))
+
+        while not stop_event.is_set():  # IterableDataset: loop epochs; Trainer stops at max_steps
+            rng.shuffle(order)
+            executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=max(1, self.download_workers)
+            )
+            futures: dict[int, concurrent.futures.Future] = {}
+
+            def submit(pos: int) -> None:
+                if 0 <= pos < len(order) and pos not in futures:
+                    futures[pos] = executor.submit(self._download, self.refs[order[pos]])
+
+            try:
+                for pos in range(min(self.prefetch_shards, len(order))):
+                    submit(pos)
+                for pos in range(len(order)):
+                    if stop_event.is_set():
+                        return
+                    path = futures.pop(pos).result()
+                    submit(pos + self.prefetch_shards)  # keep the window full
+                    dataset = wds.WebDataset([str(path)], shardshuffle=False).decode()
+                    if self.shuffle_buffer > 0:
+                        dataset = dataset.shuffle(self.shuffle_buffer)
+                    for sample in dataset:
+                        if stop_event.is_set():
+                            return
+                        yield sample_to_record(sample, manifest=self.manifest)
+                    try:
+                        os.remove(path)
+                    except FileNotFoundError:
+                        pass
+            finally:
+                executor.shutdown(wait=True)
+
+    def __iter__(self):
+        import queue
+        import threading
+
+        worker_info = get_worker_info()
+        if worker_info is not None and worker_info.num_workers > 1:
+            raise RuntimeError(
+                "PrefetchingWdsLatentCacheDataset requires num_workers=0 "
+                "(it prefetches shards on internal threads)."
+            )
+        Path(self.local_dir).mkdir(parents=True, exist_ok=True)
+
+        stop_event = threading.Event()
+
+        # Inline path: decode on the consumer thread (decode_queue_size <= 0).
+        if self.decode_queue_size <= 0:
+            try:
+                yield from self._shard_stream(stop_event)
+            finally:
+                stop_event.set()
+            return
+
+        # Background-decode path: a producer thread runs download+decode and fills a
+        # bounded queue, so sample reconstruction overlaps the GPU step.
+        record_queue: queue.Queue = queue.Queue(maxsize=self.decode_queue_size)
+        sentinel = object()
+
+        def producer() -> None:
+            try:
+                for record in self._shard_stream(stop_event):
+                    while not stop_event.is_set():
+                        try:
+                            record_queue.put(record, timeout=1.0)
+                            break
+                        except queue.Full:
+                            continue
+                    if stop_event.is_set():
+                        return
+            except Exception as exc:  # propagate to the consumer rather than hang
+                record_queue.put(exc)
+            finally:
+                record_queue.put(sentinel)
+
+        thread = threading.Thread(
+            target=producer, name="wds-prefetch-decode", daemon=True
+        )
+        thread.start()
+        try:
+            while True:
+                item = record_queue.get()
+                if item is sentinel:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                yield item
+        finally:
+            stop_event.set()
+            # Drain so a blocked producer.put() can return and the thread can exit.
+            try:
+                while True:
+                    record_queue.get_nowait()
+            except queue.Empty:
+                pass
+            thread.join(timeout=5.0)
+
+
 __all__ = [
     "HfWdsShardRef",
+    "PrefetchingWdsLatentCacheDataset",
     "RollingLocalWdsCache",
     "RollingStreamingWdsLatentCacheDataset",
     "StreamingWdsLatentCacheDataset",

@@ -27,6 +27,7 @@ DEFAULT_SCALING_FACTOR = 0.41407
 class CacheConfig:
     resolution: int = 512
     vae_id: str = DEFAULT_VAE_ID
+    vae_subfolder: str | None = None
     text_encoder_id: str = DEFAULT_TEXT_ENCODER_ID
     text_attn_implementation: str | None = None
     max_length: int = 340
@@ -99,7 +100,10 @@ def load_vae(config: CacheConfig, hf_token: str | bool | None = None):
     from diffusers import AutoencoderDC
 
     dtype = resolve_dtype(config.dtype, config.device)
-    vae = AutoencoderDC.from_pretrained(config.vae_id, torch_dtype=dtype, token=hf_token)
+    from_pretrained_kwargs: dict[str, Any] = {"torch_dtype": dtype, "token": hf_token}
+    if config.vae_subfolder:
+        from_pretrained_kwargs["subfolder"] = config.vae_subfolder
+    vae = AutoencoderDC.from_pretrained(config.vae_id, **from_pretrained_kwargs)
     vae = vae.to(config.device).eval()
     vae.requires_grad_(False)
     return vae

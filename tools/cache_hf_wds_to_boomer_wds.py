@@ -456,6 +456,26 @@ def is_local_source_path(url: str) -> bool:
     )
 
 
+def purge_source_download_cache(source_path: Path) -> None:
+    """Drop HF download-staging residue for a consumed shard so it cannot accumulate.
+
+    hf_hub_download(local_dir=...) leaves small lock/incomplete/metadata stubs under
+    ``<local_dir>/.cache/huggingface/download``. We delete the shard after reading it,
+    but those stubs are otherwise never cleaned -- one per shard over a long run. The
+    shard's local_dir is its parent directory (flat rolling-localize layout).
+    """
+    cache = source_path.parent / ".cache" / "huggingface" / "download"
+    if not cache.exists():
+        return
+    stem = source_path.name
+    for pattern in (f"{stem}*.lock", f"{stem}*.incomplete", f"{stem}*.metadata"):
+        for leftover in cache.rglob(pattern):
+            try:
+                leftover.unlink()
+            except OSError:
+                pass
+
+
 def cleanup_empty_parents(path: Path, root: Path) -> None:
     root = root.resolve()
     current = path.resolve()
@@ -471,15 +491,26 @@ def wait_for_local_source_path(
     path: Path,
     *,
     ready_suffix: str,
+    skip_suffix: str | None,
     timeout: float,
     poll_interval: float,
-) -> None:
+) -> bool:
+    """Block until the shard is ready (return True) or marked skipped (return False).
+
+    The rolling-localize sidecar writes a ``<path><skip_suffix>`` marker for a shard
+    it gave up downloading; treating that as "move on" lets the cacher tolerate a dead
+    shard instead of waiting out the full timeout and crashing the long-lived run.
+    """
     ready = Path(f"{path}{ready_suffix}")
+    skip = Path(f"{path}{skip_suffix}") if skip_suffix else None
     deadline = None if timeout <= 0 else time.monotonic() + timeout
     while not (path.exists() and ready.exists()):
+        if skip is not None and skip.exists():
+            return False
         if deadline is not None and time.monotonic() > deadline:
             raise TimeoutError(f"Timed out waiting for local source shard: {path}")
         time.sleep(poll_interval)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -516,20 +547,24 @@ def gpu_decode_and_resize(
         mode=_TV_IMAGE_READ_MODE.RGB,
         device=device,
     )
-    # decode_jpeg with a list returns a list of CHW uint8 tensors of varying H/W.
-    # Resize each to (resolution, resolution), then stack.
-    resized = []
-    for img in decoded:
-        # Match the Sana CPU path geometry: resize-to-fill, then center crop.
-        # The interpolation kernel differs from PIL bicubic, but aspect ratio
-        # and crop placement now match resize_crop_to_fill_image().
-        _, height, width = img.shape
+    # decode_jpeg with a list returns CHW uint8 tensors of varying H/W. Bucket images
+    # by identical (C, H, W) so each distinct size is resized+cropped as ONE batched
+    # call instead of one F.interpolate launch per image. The per-image geometry
+    # (resize-to-fill min side, then center crop) is unchanged, so outputs are bit-for-bit
+    # identical to the old loop; only kernel-launch overhead is removed.
+    buckets: dict[tuple[int, ...], list[int]] = {}
+    for i, img in enumerate(decoded):
+        buckets.setdefault(tuple(img.shape), []).append(i)
+
+    out: list[torch.Tensor | None] = [None] * len(decoded)
+    for shape, idxs in buckets.items():
+        group = torch.stack([decoded[i] for i in idxs], dim=0).to(torch.float32)
+        _, _, height, width = group.shape
         scale = resolution / min(height, width)
         new_h = round(height * scale)
         new_w = round(width * scale)
-        x = img.unsqueeze(0).to(torch.float32)
-        x = F.interpolate(
-            x,
+        group = F.interpolate(
+            group,
             size=(new_h, new_w),
             mode="bilinear",
             align_corners=False,
@@ -537,9 +572,10 @@ def gpu_decode_and_resize(
         )
         top = max((new_h - resolution) // 2, 0)
         left = max((new_w - resolution) // 2, 0)
-        x = x[:, :, top : top + resolution, left : left + resolution]
-        resized.append(x)
-    batch = torch.cat(resized, dim=0)
+        group = group[:, :, top : top + resolution, left : left + resolution]
+        for j, i in enumerate(idxs):
+            out[i] = group[j : j + 1]
+    batch = torch.cat(out, dim=0)  # type: ignore[arg-type]
     # uint8 [0,255] -> [-1, 1]
     batch = batch.mul_(2.0 / 255.0).sub_(1.0)
     return batch
@@ -754,6 +790,9 @@ def encode_text_microbatched(
     config: CacheConfig,
     microbatch_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # NOTE: captions are encoded in input order (no length sorting). Regrouping captions
+    # changes the bf16 GEMM batch dimension, which perturbs cached values at the
+    # numerical-noise level; keeping input order makes the cache reproducible.
     # Qwen path: text_processor is None and text_encoder is a QwenReferenceEncoder.
     # Cache the same instruction-prefixed hidden states the connector reads at inference,
     # padded/truncated to config.max_length for fixed-shape storage.
@@ -946,6 +985,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Delete each local source-list tar after it has been fully read.",
     )
     parser.add_argument("--local-source-ready-suffix", default=".ready")
+    parser.add_argument(
+        "--local-source-skip-suffix",
+        default=".skip",
+        help="Marker the rolling localizer writes for a shard it gave up on; the cacher skips it.",
+    )
     parser.add_argument("--local-source-wait-timeout", type=float, default=3600.0)
     parser.add_argument("--local-source-poll-interval", type=float, default=0.25)
     parser.add_argument("--split", default="train")
@@ -971,8 +1015,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--async-flush-depth", type=int, default=2)
     parser.add_argument(
         "--async-cpu-transfer",
-        action="store_true",
-        help="Copy encoded latents/text/masks to pinned CPU memory on a separate CUDA stream before tar writing.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Copy encoded latents/text/masks to pinned CPU memory on a separate CUDA stream "
+        "before tar writing (overlaps the GPU->CPU sync with the next encode). On by default; "
+        "pass --no-async-cpu-transfer to disable (e.g. on CPU-only runs).",
     )
     parser.add_argument("--shard-size-gb", type=float, default=2.0)
     parser.add_argument("--shard-start-index", type=int, default=0)
@@ -1217,7 +1264,8 @@ def main() -> None:  # noqa: C901 — single-file script, complexity is fine.
     if args.dali_decode and not str(device).startswith("cuda"):
         raise ValueError("--dali-decode requires a CUDA device.")
     if args.async_cpu_transfer and not str(device).startswith("cuda"):
-        raise ValueError("--async-cpu-transfer requires a CUDA device.")
+        # On by default; silently disable on non-CUDA rather than failing the run.
+        args.async_cpu_transfer = False
     if args.async_cpu_transfer and not args.async_flush:
         print("warning: --async-cpu-transfer has little benefit without --async-flush")
 
@@ -1326,14 +1374,19 @@ def main() -> None:  # noqa: C901 — single-file script, complexity is fine.
     if args.compile:
         # Best-effort compile. encode_image_latent / encode_captions wrap the
         # module-level forwards, so we compile the submodule, not the wrappers.
+        # The VAE compiles with the requested --compile-mode. "default" is a fast (~1 min)
+        # Inductor compile; the DC-AE VAE has many conv layers so "max-autotune-no-cudagraphs"
+        # adds a long per-conv kernel search (minutes, can look like a hang) for a modest
+        # steady-state gain — opt into it explicitly when you want it.
+        vae_mode = args.compile_mode
         try:
             vae_compile_target = getattr(vae, "encoder", vae)
-            compiled = torch.compile(vae_compile_target, mode=args.compile_mode, fullgraph=False)
+            compiled = torch.compile(vae_compile_target, mode=vae_mode, fullgraph=False)
             if hasattr(vae, "encoder"):
                 vae.encoder = compiled
             else:
                 vae = compiled
-            print(f"[rank {rank}] torch.compile(vae, mode={args.compile_mode}) applied.")
+            print(f"[rank {rank}] torch.compile(vae, mode={vae_mode}) applied.")
         except Exception as exc:
             print(f"[rank {rank}] torch.compile on VAE failed, continuing: {exc}")
         if args.text_encoder_kind == "qwen":
@@ -1352,11 +1405,18 @@ def main() -> None:  # noqa: C901 — single-file script, complexity is fine.
                         setattr(_dynamo.config, _flag, True)
                     except Exception:
                         pass
-                inner = text_encoder.model  # property -> the loaded HF module
-                text_encoder._model = torch.compile(
-                    inner, mode="default", fullgraph=False, dynamic=True
-                )
-                print(f"[rank {rank}] torch.compile(qwen inner model, mode=default, dynamic=True) applied.")
+                # forward() runs the base transformer (lm_head skipped), so compile that
+                # exact module; fall back to the full model if the base wasn't located.
+                if getattr(text_encoder, "_base_model", None) is not None:
+                    text_encoder._base_model = torch.compile(
+                        text_encoder._base_model, mode="default", fullgraph=False, dynamic=True
+                    )
+                    print(f"[rank {rank}] torch.compile(qwen base model, mode=default, dynamic=True) applied.")
+                else:
+                    text_encoder._model = torch.compile(
+                        text_encoder.model, mode="default", fullgraph=False, dynamic=True
+                    )
+                    print(f"[rank {rank}] torch.compile(qwen full model, mode=default, dynamic=True) applied.")
             except Exception as exc:
                 print(f"[rank {rank}] torch.compile on Qwen encoder failed, continuing: {exc}")
         else:
@@ -1451,17 +1511,26 @@ def main() -> None:  # noqa: C901 — single-file script, complexity is fine.
             return
 
         delete_root = Path(args.source_list_file).parent if args.source_list_file else Path.cwd()
+        skip_suffix = args.local_source_skip_suffix or None
         for shard_url in urls:
             local = is_local_source_path(shard_url)
             if local and args.wait_local_source_shards:
                 wait_started = time.time()
-                wait_for_local_source_path(
+                ready = wait_for_local_source_path(
                     Path(shard_url),
                     ready_suffix=args.local_source_ready_suffix,
+                    skip_suffix=skip_suffix,
                     timeout=args.local_source_wait_timeout,
                     poll_interval=args.local_source_poll_interval,
                 )
                 record_stage("source_shard_wait", time.time() - wait_started)
+                if not ready:
+                    # Sidecar gave up on this shard; clear its marker and move on.
+                    print(f"[rank {rank}] skipping unavailable source shard: {shard_url}")
+                    if skip_suffix:
+                        Path(f"{shard_url}{skip_suffix}").unlink(missing_ok=True)
+                    cleanup_empty_parents(Path(shard_url).parent, delete_root)
+                    continue
 
             completed = False
             try:
@@ -1472,6 +1541,7 @@ def main() -> None:  # noqa: C901 — single-file script, complexity is fine.
                     source_path = Path(shard_url)
                     source_path.unlink(missing_ok=True)
                     Path(f"{source_path}{args.local_source_ready_suffix}").unlink(missing_ok=True)
+                    purge_source_download_cache(source_path)
                     cleanup_empty_parents(source_path.parent, delete_root)
 
     # Source dataset — keep raw bytes through to GPU when --gpu-decode.
@@ -1545,44 +1615,44 @@ def main() -> None:  # noqa: C901 — single-file script, complexity is fine.
         if args.gpu_decode:
             jpegs = [item["jpeg_bytes"] for item in current if item.get("jpeg_bytes") is not None]
             cpu_fallbacks = [item for item in current if item.get("jpeg_bytes") is None]
-            tensors: list[torch.Tensor] = []
-            if jpegs:
-                jpeg_chunks = [
-                    jpegs[start : start + args.dali_decode_batch]
-                    for start in range(0, len(jpegs), args.dali_decode_batch)
-                ]
-                tensors.append(torch.cat([decode_jpeg_batch(chunk) for chunk in jpeg_chunks], dim=0))
-            if cpu_fallbacks:
+
+            def decode_jpegs(byte_list: list[bytes]) -> torch.Tensor:
+                # Chunk only for DALI (its pipeline is built per batch_size); torchvision
+                # nvJPEG already batches a whole list internally, so chunking it just adds
+                # Python overhead + extra cats.
+                if dali_decoder is not None and not dali_failed:
+                    chunks = [
+                        byte_list[start : start + args.dali_decode_batch]
+                        for start in range(0, len(byte_list), args.dali_decode_batch)
+                    ]
+                    return torch.cat([decode_jpeg_batch(chunk) for chunk in chunks], dim=0)
+                return decode_jpeg_batch(byte_list)
+
+            def cpu_batch() -> torch.Tensor:
                 cpu = torch.cat([item["image_tensor"] for item in cpu_fallbacks], dim=0)
                 if pin_memory:
                     cpu = cpu.pin_memory()
-                tensors.append(cpu.to(device, non_blocking=True))
-            # Reorder back to input order so captions line up.
-            # Easiest: rebuild in original order by indexing.
-            order = []
+                return cpu.to(device, non_blocking=True)
+
+            # Fast paths: when only one source is present, no interleave is needed.
+            if not cpu_fallbacks:
+                return decode_jpegs(jpegs)
+            if not jpegs:
+                return cpu_batch()
+
+            # Mixed batch: decode both, then stitch back into input order.
+            jpeg_t = decode_jpegs(jpegs)
+            cpu_t = cpu_batch()
+            slices = []
             j_idx = 0
             c_idx = 0
-            jpeg_count = len(jpegs)
-            cpu_count = len(cpu_fallbacks)
             for item in current:
                 if item.get("jpeg_bytes") is not None:
-                    order.append(("j", j_idx))
+                    slices.append(jpeg_t[j_idx : j_idx + 1])
                     j_idx += 1
                 else:
-                    order.append(("c", c_idx))
+                    slices.append(cpu_t[c_idx : c_idx + 1])
                     c_idx += 1
-            jpeg_t = tensors[0] if jpeg_count > 0 else None
-            cpu_t = tensors[-1] if cpu_count > 0 and len(tensors) > (1 if jpeg_count > 0 else 0) else (
-                tensors[0] if cpu_count > 0 and jpeg_count == 0 else None
-            )
-            slices = []
-            for kind, idx in order:
-                if kind == "j":
-                    assert jpeg_t is not None
-                    slices.append(jpeg_t[idx : idx + 1])
-                else:
-                    assert cpu_t is not None
-                    slices.append(cpu_t[idx : idx + 1])
             return torch.cat(slices, dim=0)
         # CPU path
         images = torch.cat([item["image_tensor"] for item in current], dim=0)

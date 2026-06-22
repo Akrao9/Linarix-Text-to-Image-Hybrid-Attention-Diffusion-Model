@@ -53,6 +53,10 @@ class QwenConnectorConfig:
     freeze_encoder: bool = True
     instruction: str | None = DEFAULT_INSTRUCTION
     max_text_tokens: int = 512
+    # Pad every batch to exactly max_text_tokens (static shape) instead of to the
+    # batch's longest caption. Wastes a little compute on pad tokens but gives
+    # torch.compile a single shape to specialize, avoiding recompile thrash.
+    pad_to_max_length: bool = False
     dtype: str = "bf16"
     attn_implementation: str | None = None
 
@@ -74,6 +78,11 @@ class QwenReferenceEncoder(nn.Module):
         self.config = config
         self._hf_token = hf_token
         self._model: nn.Module | None = None
+        # Base transformer (the submodule that owns the decoder layers). Calling it
+        # directly for hidden-state readout skips the lm_head matmul (B*L*vocab FLOPs)
+        # that the full causal-LM forward would otherwise compute and discard.
+        self._base_model: nn.Module | None = None
+        self._base_failed = False
         self._processor: Any | None = None
         self.hidden_size: int | None = None
 
@@ -148,6 +157,58 @@ class QwenReferenceEncoder(nn.Module):
             getattr(getattr(model, "config", None), "hidden_size", 0)
             or getattr(getattr(model, "config", None), "text_config", object()).hidden_size
         )
+        # Drop every transformer layer above the readout layer: hidden_states[readout]
+        # is unchanged by layers that run after it, so computing them is pure waste.
+        self._truncate_to_readout(model)
+        # Prefer the base transformer for forward() so the lm_head is never run.
+        self._base_model = self._find_base_with_layers(model)
+
+    @staticmethod
+    def _find_base_with_layers(model: nn.Module) -> nn.Module | None:
+        """Return the submodule that owns the decoder ``layers`` ModuleList (the base
+        transformer), or ``None`` if it can't be located."""
+        candidates = [
+            getattr(model, "model", None),
+            getattr(getattr(model, "model", None), "model", None),
+            getattr(model, "language_model", None),
+            getattr(getattr(model, "model", None), "language_model", None),
+        ]
+        for holder in candidates:
+            if holder is None or holder is model:
+                continue
+            layers = getattr(holder, "layers", None)
+            if isinstance(layers, nn.ModuleList) and len(layers) > 0:
+                return holder
+        return None
+
+    def _truncate_to_readout(self, model: nn.Module) -> None:
+        holder = self._find_base_with_layers(model)
+        if holder is None:
+            return
+        layers = holder.layers
+        n = len(layers)
+        # output_hidden_states yields n+1 tensors (embeddings + each layer output).
+        r = self.config.readout_layer
+        r_abs = r if r >= 0 else (n + 1 + r)
+        if not (0 <= r_abs <= n) or r_abs >= n:
+            return  # reading the final layer (or out of range): nothing to drop
+        holder.layers = nn.ModuleList(list(layers)[:r_abs])
+        self.config.readout_layer = r_abs  # now the last collected hidden state
+        # HF applies the base model's final norm only to the LAST hidden_states entry.
+        # At an intermediate readout the full model returns the RAW (un-normed) layer
+        # output, so neutralize the final norm to keep the truncated readout identical.
+        for norm_attr in ("norm", "final_layernorm", "ln_f"):
+            if hasattr(holder, norm_attr) and getattr(holder, norm_attr) is not None:
+                setattr(holder, norm_attr, nn.Identity())
+                break
+        cfg = getattr(model, "config", None)
+        for cfg_obj in (cfg, getattr(cfg, "text_config", None)):
+            if cfg_obj is not None and hasattr(cfg_obj, "num_hidden_layers"):
+                try:
+                    cfg_obj.num_hidden_layers = r_abs
+                except Exception:
+                    pass
+        print(f"[qwen] truncated encoder to {r_abs}/{n} layers (readout={r_abs}); upper layers + lm_head skipped.")
 
     @property
     def model(self) -> nn.Module:
@@ -183,7 +244,7 @@ class QwenReferenceEncoder(nn.Module):
             image_arg = [im for im in images if im is not None]
         input_kwargs: dict[str, Any] = {
             "text": texts,
-            "padding": True,
+            "padding": "max_length" if self.config.pad_to_max_length else True,
             "truncation": True,
             "max_length": self.config.max_text_tokens,
             "return_tensors": "pt",
@@ -205,7 +266,22 @@ class QwenReferenceEncoder(nn.Module):
         device = next(model.parameters()).device
         inputs = self._build_inputs(prompts, images)
         inputs = {k: v.to(device) for k, v in inputs.items() if torch.is_tensor(v)}
-        out = model(**inputs, output_hidden_states=True, use_cache=False, return_dict=True)
+        # Text-only readout: run the base transformer directly to skip the lm_head.
+        # hidden_states[readout] is identical either way (lm_head doesn't feed back).
+        text_only = images is None or not any(im is not None for im in images)
+        runner = (
+            self._base_model
+            if (text_only and self._base_model is not None and not self._base_failed)
+            else model
+        )
+        try:
+            out = runner(**inputs, output_hidden_states=True, use_cache=False, return_dict=True)
+        except Exception:
+            if runner is not model:
+                self._base_failed = True  # fall back to the full model for the rest of the run
+                out = model(**inputs, output_hidden_states=True, use_cache=False, return_dict=True)
+            else:
+                raise
         hidden_states = out.hidden_states[self.config.readout_layer]
         pad_mask = inputs.get("attention_mask")
         if pad_mask is None:

@@ -52,6 +52,11 @@ class BoomerFLADiTConfig:
     use_abs_pos_embed: bool = True
     patch_size: int = 1
     gradient_checkpointing: bool = False
+    # REPA representation alignment (https://arxiv.org/abs/2410.06940). When repa_dim > 0
+    # the DiT exposes a pooled projection of a mid-depth block's hidden state so training
+    # can align it to an external SSL target (monet's DINOv2 ViT-G/14 CLS = 1536). 0 = off.
+    repa_dim: int = 0
+    repa_layer: int = -1  # block whose output to align; -1 => depth // 2
 
 
 def maybe_add_sibling_fla_repo() -> None:
@@ -1021,6 +1026,19 @@ class BoomerFLADiT(nn.Module):
         self.final_norm = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
         self.final_t_block = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 2))
         self.out_proj = nn.Linear(hidden_dim, config.latent_channels * config.patch_size * config.patch_size)
+        # REPA: pooled mid-depth feature -> SSL embedding space. 3-layer MLP head per the
+        # REPA paper; only built (and only run) when repa_dim > 0 and return_repa is set.
+        self.repa_layer = config.repa_layer if config.repa_layer >= 0 else config.depth // 2
+        self.repa_proj = (
+            nn.Sequential(
+                nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, config.repa_dim),
+            )
+            if config.repa_dim > 0
+            else None
+        )
         self.initialize_weights()
 
     def initialize_weights(self) -> None:
@@ -1110,7 +1128,8 @@ class BoomerFLADiT(nn.Module):
         text_embedding: torch.Tensor,
         attention_mask: torch.Tensor,
         cond_input: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        return_repa: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
         batch, channels, height, width = noisy_latent.shape
         if channels != self.config.latent_channels:
             raise ValueError(
@@ -1174,7 +1193,9 @@ class BoomerFLADiT(nn.Module):
         text_attn_bias = text_attn_bias.masked_fill(text_attn_bias > 0, -10000.0)
         t_emb = self.t_embedder(timesteps)
         use_ckpt = self.config.gradient_checkpointing and self.training
-        for block in self.blocks:
+        want_repa = return_repa and self.repa_proj is not None
+        repa_feat: torch.Tensor | None = None
+        for layer_idx, block in enumerate(self.blocks):
             if getattr(block, "updates_text", False):
                 # Dual-stream block: returns (x, text_tokens).
                 # Non-tensor args (height, width, coord_rope, coord IDs) captured via closure.
@@ -1213,13 +1234,20 @@ class BoomerFLADiT(nn.Module):
                         x, text_tokens, t_emb, text_key_padding_mask, text_attn_bias,
                         height=token_height, width=token_width,
                     )
+            if want_repa and layer_idx == self.repa_layer:
+                # Pool image tokens -> project to the SSL space for alignment.
+                repa_feat = self.repa_proj(x.mean(dim=1))
         final_mod = self.final_t_block(t_emb)
         shift, scale = final_mod.reshape(batch, 2, -1).chunk(2, dim=1)
         x = modulate(self.final_norm(x), shift, scale)
         x = self.out_proj(x)
         if self.patch_size == 1:
-            return x.transpose(1, 2).reshape(batch, channels, height, width)
-        patch = self.patch_size
-        x = x.reshape(batch, token_height, token_width, channels, patch, patch)
-        x = x.permute(0, 3, 1, 4, 2, 5).contiguous()
-        return x.reshape(batch, channels, height, width)
+            out = x.transpose(1, 2).reshape(batch, channels, height, width)
+        else:
+            patch = self.patch_size
+            x = x.reshape(batch, token_height, token_width, channels, patch, patch)
+            x = x.permute(0, 3, 1, 4, 2, 5).contiguous()
+            out = x.reshape(batch, channels, height, width)
+        if return_repa:
+            return out, repa_feat
+        return out

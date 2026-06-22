@@ -23,6 +23,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -80,7 +81,26 @@ def ensure_root_manifest(repo_id: str, token: str | bool | None, prefix: str) ->
     print(f"wrote root manifest.json (from {prefix}) -> rolling loader can now resolve dtypes/shapes")
 
 
-def run_cacher(args: argparse.Namespace, list_file: Path, cache_dir: Path, prefix: str, create_repo: bool) -> None:
+def _stop_process(proc: subprocess.Popen, *, timeout: float = 10) -> None:
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=timeout)
+
+
+def run_cacher(
+    args: argparse.Namespace,
+    list_file: Path,
+    cache_dir: Path,
+    prefix: str,
+    create_repo: bool,
+    prefetch_proc: subprocess.Popen | None = None,
+    prefetch_error_file: Path | None = None,
+) -> None:
     cacher = Path(__file__).resolve().parent / "cache_hf_wds_to_boomer_wds.py"
     cmd = [
         sys.executable, str(cacher),
@@ -136,6 +156,9 @@ def run_cacher(args: argparse.Namespace, list_file: Path, cache_dir: Path, prefi
         cmd.append("--async-cpu-transfer")
     if args.rolling_localize_source_shards:
         cmd.append("--wait-local-source-shards")
+        # Keep the cacher's skip marker in sync with the sidecar's (empty disables it).
+        skip_suffix = args.rolling_localize_skip_suffix if args.rolling_localize_skip_on_failure else ""
+        cmd.extend(["--local-source-skip-suffix", skip_suffix])
         if not args.keep_localized_source_shards:
             cmd.append("--delete-local-source-shards-after-read")
     if not args.select_source_files:
@@ -145,7 +168,29 @@ def run_cacher(args: argparse.Namespace, list_file: Path, cache_dir: Path, prefi
     if create_repo:
         cmd.append("--create-repo")
     print(f"[{prefix}] caching {args.shards_per_group} shard(s) -> hf://datasets/{args.hf_repo_id}/{prefix}")
-    subprocess.run(cmd, check=True)
+    cacher_proc = subprocess.Popen(cmd)
+    try:
+        while True:
+            prefetch_returncode = prefetch_proc.poll() if prefetch_proc is not None else None
+            cacher_returncode = cacher_proc.poll()
+            if prefetch_error_file is not None and prefetch_error_file.exists():
+                error = prefetch_error_file.read_text(encoding="utf-8", errors="replace").strip()
+                _stop_process(cacher_proc)
+                raise RuntimeError(error or "rolling localizer reported an unknown download failure")
+            if prefetch_returncode not in (None, 0):
+                _stop_process(cacher_proc)
+                raise RuntimeError(
+                    f"rolling localizer exited with code {prefetch_returncode}; "
+                    "see the preceding [rolling-localize] error"
+                )
+            if cacher_returncode is not None:
+                if cacher_returncode != 0:
+                    raise subprocess.CalledProcessError(cacher_returncode, cmd)
+                return
+            time.sleep(0.5)
+    except BaseException:
+        _stop_process(cacher_proc)
+        raise
 
 
 def localize_source_shards(
@@ -189,6 +234,8 @@ def start_rolling_localizer(
 ) -> subprocess.Popen:
     """Start a sidecar that keeps a small rolling window of HF shards localized."""
     helper = Path(__file__).resolve().parent / "hf_rolling_localize.py"
+    error_file = rolling_localizer_error_path(shard_list_file)
+    error_file.unlink(missing_ok=True)
     shard_list_file.write_text("\n".join(shards) + "\n", encoding="utf-8")
     source_dir.mkdir(parents=True, exist_ok=True)
 
@@ -206,9 +253,29 @@ def start_rolling_localizer(
         str(args.rolling_localize_window),
         "--download-workers",
         str(args.rolling_localize_download_workers),
+        "--max-download-attempts",
+        str(args.rolling_localize_download_attempts),
+        "--retry-delay",
+        str(args.rolling_localize_retry_delay),
+        "--download-timeout",
+        str(args.rolling_localize_download_timeout),
+        "--error-file",
+        str(error_file),
         "--token-env",
         "HF_TOKEN",
     ]
+    if args.rolling_localize_skip_on_failure:
+        cmd.extend(
+            [
+                "--skip-on-failure",
+                "--skip-suffix",
+                args.rolling_localize_skip_suffix,
+                "--max-consecutive-skips",
+                str(args.rolling_localize_max_consecutive_skips),
+                "--skipped-log",
+                str(rolling_localizer_skipped_path(shard_list_file)),
+            ]
+        )
     env = os.environ.copy()
     if isinstance(token, str):
         env["HF_TOKEN"] = token
@@ -219,15 +286,18 @@ def start_rolling_localizer(
     return subprocess.Popen(cmd, env=env)
 
 
+def rolling_localizer_error_path(shard_list_file: Path) -> Path:
+    return Path(f"{shard_list_file}.error")
+
+
+def rolling_localizer_skipped_path(shard_list_file: Path) -> Path:
+    return Path(f"{shard_list_file}.skipped")
+
+
 def stop_rolling_localizer(proc: subprocess.Popen | None) -> None:
-    if proc is None or proc.poll() is not None:
+    if proc is None:
         return
-    proc.terminate()
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=10)
+    _stop_process(proc)
 
 
 def main() -> None:
@@ -262,6 +332,41 @@ def main() -> None:
         type=int,
         default=3,
         help="Concurrent hf_hub_download calls in rolling-localize prefetch sidecar.",
+    )
+    p.add_argument(
+        "--rolling-localize-download-attempts",
+        type=int,
+        default=5,
+        help="Maximum attempts per source shard before the rolling sidecar fails.",
+    )
+    p.add_argument(
+        "--rolling-localize-retry-delay",
+        type=float,
+        default=5.0,
+        help="Base delay between rolling download attempts (linear backoff).",
+    )
+    p.add_argument(
+        "--rolling-localize-download-timeout",
+        type=float,
+        default=600.0,
+        help="Per-attempt seconds before a stalled source download is abandoned and retried.",
+    )
+    p.add_argument(
+        "--rolling-localize-skip-on-failure",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip a shard that fails all download attempts and keep going, instead of aborting.",
+    )
+    p.add_argument(
+        "--rolling-localize-max-consecutive-skips",
+        type=int,
+        default=5,
+        help="Abort once this many shards fail back-to-back (a real outage, not one bad shard).",
+    )
+    p.add_argument(
+        "--rolling-localize-skip-suffix",
+        default=".skip",
+        help="Marker suffix shared by the localizer and cacher for skipped shards.",
     )
     p.add_argument(
         "--rolling-localize-dir",
@@ -336,6 +441,10 @@ def main() -> None:
         sys.exit("--rolling-localize-window must be positive.")
     if args.rolling_localize_download_workers <= 0:
         sys.exit("--rolling-localize-download-workers must be positive.")
+    if args.rolling_localize_download_attempts <= 0:
+        sys.exit("--rolling-localize-download-attempts must be positive.")
+    if args.rolling_localize_retry_delay < 0:
+        sys.exit("--rolling-localize-retry-delay must be non-negative.")
 
     if args.write_root_manifest:
         files = _repo_files(args.hf_repo_id, token)
@@ -390,6 +499,7 @@ def main() -> None:
         cache_dir = scratch / prefix
         source_dir = Path(args.rolling_localize_dir) if args.rolling_localize_dir else scratch / f"{prefix}_source"
         source_index_file = scratch / f"{prefix}_source_shards.txt"
+        source_error_file = rolling_localizer_error_path(source_index_file)
         prefetch_proc: subprocess.Popen | None = None
         scratch.mkdir(parents=True, exist_ok=True)
         print(f"\n=== group {gi + 1}/{len(groups)}: {prefix} ({len(group)} shards) ===")
@@ -408,18 +518,38 @@ def main() -> None:
             "\n".join(source_paths) + "\n", encoding="utf-8"
         )
         try:
-            run_cacher(args, list_file, cache_dir, prefix, create_repo=not repo_seeded)
+            run_cacher(
+                args,
+                list_file,
+                cache_dir,
+                prefix,
+                create_repo=not repo_seeded,
+                prefetch_proc=prefetch_proc,
+                prefetch_error_file=source_error_file if prefetch_proc is not None else None,
+            )
             if prefetch_proc is not None and prefetch_proc.poll() not in (None, 0):
                 raise RuntimeError(f"rolling localizer exited with code {prefetch_proc.returncode}")
             repo_seeded = True
             processed += 1
         finally:
             stop_rolling_localizer(prefetch_proc)
+            # Archive any skipped shards to a durable log before clearing scratch, so the
+            # handful of shards the localizer gave up on can be re-fetched in a later pass.
+            skipped_file = rolling_localizer_skipped_path(source_index_file)
+            if skipped_file.exists():
+                skipped = [s for s in skipped_file.read_text(encoding="utf-8").splitlines() if s.strip()]
+                if skipped:
+                    durable = scratch / "rolling_skipped_shards.txt"
+                    with durable.open("a", encoding="utf-8") as handle:
+                        handle.write("\n".join(skipped) + "\n")
+                    print(f"[{prefix}] skipped {len(skipped)} unreachable shard(s); logged -> {durable}")
+                skipped_file.unlink(missing_ok=True)
             shutil.rmtree(cache_dir, ignore_errors=True)
             if not args.keep_localized_source_shards:
                 shutil.rmtree(source_dir, ignore_errors=True)
             list_file.unlink(missing_ok=True)
             source_index_file.unlink(missing_ok=True)
+            source_error_file.unlink(missing_ok=True)
         if not root_present:
             ensure_root_manifest(args.hf_repo_id, token, prefix)
             root_present = True

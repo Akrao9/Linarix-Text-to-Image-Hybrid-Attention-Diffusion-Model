@@ -26,6 +26,8 @@ class LatentRecord:
     caption: str
     metadata: dict[str, Any]
     path: str
+    # Optional SSL target for REPA (monet's DINOv2 ViT-G/14 CLS). None when absent.
+    dino_embedding: torch.Tensor | None = None
 
 
 def looks_like_cache_record_name(name: str) -> bool:
@@ -142,6 +144,10 @@ class LatentCacheDataset(Dataset[LatentRecord]):
 
 
 def collate_latent_records(records: list[LatentRecord]) -> dict[str, Any]:
+    dinos = [record.dino_embedding for record in records]
+    dino_batch = (
+        torch.stack(dinos, dim=0) if dinos and all(d is not None for d in dinos) else None
+    )
     return {
         "image_latent": torch.stack([record.image_latent for record in records], dim=0),
         "text_embedding": torch.stack([record.text_embedding for record in records], dim=0),
@@ -149,4 +155,5 @@ def collate_latent_records(records: list[LatentRecord]) -> dict[str, Any]:
         "caption": [record.caption for record in records],
         "metadata": [record.metadata for record in records],
         "path": [record.path for record in records],
+        "dino_embedding": dino_batch,
     }
