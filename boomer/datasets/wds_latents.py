@@ -955,6 +955,10 @@ class RollingStreamingWdsLatentCacheDataset(IterableDataset[LatentRecord]):
             self.cache.advance_after(shard_name)
 
 
+class _PrefetchStopped(Exception):
+    """Internal: raised inside the prefetch pool when stop_event fires mid-wait."""
+
+
 @dataclass
 class PrefetchingWdsLatentCacheDataset(IterableDataset[LatentRecord]):
     """Stream remote WDS shards with a PARALLEL download-ahead window — the same
@@ -1008,8 +1012,16 @@ class PrefetchingWdsLatentCacheDataset(IterableDataset[LatentRecord]):
 
     def _shard_stream(self, stop_event):
         """Download-ahead window -> per-sample LatentRecords, looping epochs forever.
-        Honors ``stop_event`` so the consumer can shut the producer down cleanly."""
-        import concurrent.futures
+        Honors ``stop_event`` so the consumer can shut the producer down cleanly.
+
+        Downloads run on raw DAEMON threads (not a ThreadPoolExecutor) on purpose:
+        concurrent.futures joins its worker threads at interpreter exit, which would
+        block the process on an in-flight 4GB shard download when the Trainer abandons
+        the iterator at max_steps. Daemon threads are killed immediately at exit instead,
+        so the process terminates promptly (the abandoned partial download is harmless;
+        local_dir is transient)."""
+        import queue
+        import threading
 
         import webdataset as wds
 
@@ -1018,14 +1030,53 @@ class PrefetchingWdsLatentCacheDataset(IterableDataset[LatentRecord]):
 
         while not stop_event.is_set():  # IterableDataset: loop epochs; Trainer stops at max_steps
             rng.shuffle(order)
-            executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=max(1, self.download_workers)
-            )
-            futures: dict[int, concurrent.futures.Future] = {}
+            # Daemon-thread download pool: submit(pos) enqueues a download; result(pos)
+            # blocks until that position's shard is on disk. Results/events are only
+            # mutated structurally by THIS (producer) thread; workers just fill them.
+            task_q: queue.Queue = queue.Queue()
+            results: dict[int, object] = {}
+            events: dict[int, threading.Event] = {}
+            lock = threading.Lock()
+
+            def worker() -> None:
+                while not stop_event.is_set():
+                    try:
+                        pos = task_q.get(timeout=0.5)
+                    except queue.Empty:
+                        continue
+                    if pos is None or stop_event.is_set():
+                        return
+                    try:
+                        res: object = self._download(self.refs[order[pos]])
+                    except Exception as exc:  # deliver to result(pos) rather than die
+                        res = exc
+                    with lock:
+                        results[pos] = res
+                    events[pos].set()
+
+            workers = [
+                threading.Thread(target=worker, name="wds-dl", daemon=True)
+                for _ in range(max(1, self.download_workers))
+            ]
+            for w in workers:
+                w.start()
 
             def submit(pos: int) -> None:
-                if 0 <= pos < len(order) and pos not in futures:
-                    futures[pos] = executor.submit(self._download, self.refs[order[pos]])
+                if 0 <= pos < len(order) and pos not in events:
+                    events[pos] = threading.Event()
+                    task_q.put(pos)
+
+            def result(pos: int):
+                ev = events[pos]
+                while not ev.wait(timeout=0.5):
+                    if stop_event.is_set():
+                        raise _PrefetchStopped()
+                with lock:
+                    res = results.pop(pos)
+                events.pop(pos, None)
+                if isinstance(res, BaseException):
+                    raise res
+                return res
 
             try:
                 for pos in range(min(self.prefetch_shards, len(order))):
@@ -1033,7 +1084,10 @@ class PrefetchingWdsLatentCacheDataset(IterableDataset[LatentRecord]):
                 for pos in range(len(order)):
                     if stop_event.is_set():
                         return
-                    path = futures.pop(pos).result()
+                    try:
+                        path = result(pos)
+                    except _PrefetchStopped:
+                        return
                     submit(pos + self.prefetch_shards)  # keep the window full
                     dataset = wds.WebDataset([str(path)], shardshuffle=False).decode()
                     if self.shuffle_buffer > 0:
@@ -1047,7 +1101,10 @@ class PrefetchingWdsLatentCacheDataset(IterableDataset[LatentRecord]):
                     except FileNotFoundError:
                         pass
             finally:
-                executor.shutdown(wait=True)
+                # Wake idle workers so they observe stop and exit; they're daemon, so even
+                # a worker mid-download never blocks interpreter shutdown.
+                for _ in workers:
+                    task_q.put(None)
 
     def __iter__(self):
         import queue
