@@ -260,6 +260,87 @@ def iter_subset_items(
 
 
 # --------------------------------------------------------------------------- #
+# Text-storage fidelity gate (E4M3 round-trip) + cache fingerprint
+# --------------------------------------------------------------------------- #
+_STORAGE_TORCH_DTYPE = {
+    "bfloat16": "bfloat16", "bf16": "bfloat16",
+    "float16": "float16", "fp16": "float16",
+    "float8_e4m3fn": "float8_e4m3fn", "fp8": "float8_e4m3fn", "float8": "float8_e4m3fn",
+    "float32": "float32", "fp32": "float32",
+}
+
+_FIDELITY_REFS = [
+    "a photograph of a golden retriever running through a park",
+    "an oil painting of a stormy sea at sunset",
+    "a labeled diagram of the water cycle with arrows",
+    "macro close-up of a dewdrop on a green leaf",
+]
+
+
+def _transformers_version() -> str:
+    try:
+        import transformers
+        return transformers.__version__
+    except Exception:
+        return "unknown"
+
+
+def _storage_roundtrip(t: "torch.Tensor", dtype_name: str) -> "torch.Tensor":
+    """Cast to the cache storage dtype and back to fp32 — exactly the precision the
+    loader sees (storage is a bit-preserving view, so value == .to(dtype).to(fp32))."""
+    name = _STORAGE_TORCH_DTYPE.get(dtype_name, "bfloat16")
+    return t.to(getattr(torch, name)).to(torch.float32)
+
+
+def text_fidelity_fingerprint(
+    encoder: QwenReferenceEncoder, args: argparse.Namespace, *, min_cosine: float,
+) -> dict[str, Any]:
+    """Encode reference captions, round-trip through the storage dtype, and verify the
+    representation survives. ALSO returns a fingerprint (transformers version + abs-max)
+    so a future env drift that silently changes the encoder is caught at cache time.
+
+    Aborts if the round-trip NaNs (out of range) or cosine drops below ``min_cosine`` —
+    turning the manual checks from this session into an automatic gate."""
+    with torch.inference_mode():
+        hidden, mask = encode_qwen_text_fixed(encoder, _FIDELITY_REFS, args.max_length)
+    h = hidden.float()
+    rt = _storage_roundtrip(hidden, args.text_dtype).float()
+    valid = mask.bool().reshape(-1)
+    a = h.reshape(-1, h.shape[-1])[valid]
+    b = rt.reshape(-1, rt.shape[-1])[valid]
+    cos = torch.nn.functional.cosine_similarity(a, b, dim=-1)
+    fp = {
+        "transformers_version": _transformers_version(),
+        "ref_abs_max": round(float(h.abs().max()), 2),
+        "fidelity_dtype": args.text_dtype,
+        "fidelity_cosine_mean": round(float(cos.mean()), 5),
+        "fidelity_cosine_min": round(float(cos.min()), 5),
+    }
+    print(
+        f"[monet-cache] text fidelity: dtype={args.text_dtype} abs-max={fp['ref_abs_max']} "
+        f"cosine mean={fp['fidelity_cosine_mean']} min={fp['fidelity_cosine_min']} "
+        f"(transformers {fp['transformers_version']})",
+        flush=True,
+    )
+    nan = int(torch.isnan(rt).sum())
+    if nan:
+        raise RuntimeError(
+            f"[monet-cache] text round-trip produced {nan} NaNs at dtype {args.text_dtype}: "
+            f"abs-max {fp['ref_abs_max']} exceeds its range (e4m3fn max 448). Use bf16, or fix "
+            f"the encoder readout so embeddings are post-norm (~72). Aborting before caching."
+        )
+    # Gate on the MEAN (aggregate fidelity); per-token min naturally dips with E4M3 even
+    # on healthy data, so it's reported but not the gate.
+    if float(cos.mean()) < min_cosine:
+        raise RuntimeError(
+            f"[monet-cache] text fidelity cosine mean {float(cos.mean()):.5f} < {min_cosine} at "
+            f"dtype {args.text_dtype}; refusing to cache a degraded representation (encoder/"
+            f"transformers drift, or this dtype needs block-wise scaling). Aborting."
+        )
+    return fp
+
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def parse_args() -> argparse.Namespace:
@@ -284,6 +365,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--read-batch", type=int, default=8192,
                    help="rows per pyarrow batch when streaming parquets in --mix mode "
                         "(bounds memory with many subsets open).")
+    p.add_argument("--fidelity-min-cosine", type=float, default=0.999,
+                   help="abort if the text storage-dtype round-trip drops MEAN cosine below this "
+                        "on reference captions (catches fp8 range/precision loss & encoder drift).")
+    p.add_argument("--no-fidelity-check", action="store_true",
+                   help="skip the startup text-fidelity gate (not recommended for fp8).")
     p.add_argument("--latent-key", default=DEFAULT_LATENT_KEY)
     p.add_argument("--caption-key", default=DEFAULT_CAPTION_KEY,
                    help="preferred caption column")
@@ -383,6 +469,7 @@ def write_manifest(
     dino_dim: int | None,
     args: argparse.Namespace,
     uploader: AsyncHubUploader,
+    fingerprint: dict[str, Any] | None = None,
 ) -> None:
     schema = ["latents.npy", "text.npy", "text_mask.npy", "caption.txt", "meta.json"]
     if dino_dim is not None:
@@ -407,6 +494,8 @@ def write_manifest(
     if dino_dim is not None:
         manifest["dino_dtype"] = dino_dtype
         manifest["dino_shape"] = [dino_dim]
+    if fingerprint:
+        manifest.update(fingerprint)  # transformers version, ref abs-max, fidelity cosine
     name = "manifest.json" if rank == 0 else f"manifest-r{rank:02d}.json"
     path = output_dir / name
     path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
@@ -460,6 +549,13 @@ def main() -> int:
               f"(start_source_shard={args.start_source_shard}, start_output_shard={args.start_output_shard})")
 
     encoder = build_qwen_encoder(args, token)
+
+    # Gate + fingerprint: verify the text storage dtype round-trips faithfully on this
+    # exact encoder/env BEFORE caching, and stamp the fingerprint into the manifest so a
+    # future drift fails loudly instead of silently poisoning a run.
+    fingerprint: dict[str, Any] = {}
+    if not args.no_fidelity_check:
+        fingerprint = text_fidelity_fingerprint(encoder, args, min_cosine=args.fidelity_min_cosine)
 
     uploader = AsyncHubUploader(
         repo_id=args.upload_repo,
@@ -523,7 +619,7 @@ def main() -> int:
                 text_shape=text_shape,
                 dino_dtype=args.dino_dtype if not args.no_dino else None,
                 dino_dim=int(dinos.shape[1]) if dinos is not None else None,
-                args=args, uploader=uploader,
+                args=args, uploader=uploader, fingerprint=fingerprint,
             )
             if rank == 0:
                 write_null_embeddings(out_dir, encoder, args, uploader)
