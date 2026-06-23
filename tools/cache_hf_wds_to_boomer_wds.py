@@ -837,12 +837,20 @@ class AsyncHubUploader:
         workers: int,
         delete_uploaded: bool,
         create_repo: bool,
+        commit_batch_size: int = 8,
     ) -> None:
         self.repo_id = repo_id
         self.repo_path_prefix = repo_path_prefix.strip("/")
         self.delete_uploaded = delete_uploaded
+        # HF caps repo commits at 256/hour. One commit per shard trips that with
+        # small (1 GB) shards, but small shards are required so training streaming
+        # doesn't stall. So commit MANY shards per commit instead of shrinking the
+        # batch granularity that training needs.
+        self.commit_batch_size = max(1, commit_batch_size)
         self._uploaded: set[str] = set()
-        self._futures: dict[str, concurrent.futures.Future] = {}
+        self._buffer: list[str] = []          # queued, not yet committed
+        self._futures: dict[int, tuple[concurrent.futures.Future, list[str]]] = {}
+        self._batch_id = 0
         self._lock = threading.Lock()
         self._executor = None
         self._api = None
@@ -863,53 +871,108 @@ class AsyncHubUploader:
             return
         path = str(local_path)
         with self._lock:
-            if path in self._uploaded or path in self._futures:
+            if path in self._uploaded or path in self._buffer:
                 return
-            assert self._executor is not None
-            self._futures[path] = self._executor.submit(self._upload_path_sync, path)
+            if any(path in paths for _, paths in self._futures.values()):
+                return
+            self._buffer.append(path)
+            if len(self._buffer) >= self.commit_batch_size:
+                self._kick_batch_locked()
         print(f"[upload] queued {Path(path).name}")
 
-    def _upload_path_sync(self, local_path: str) -> None:
+    def _kick_batch_locked(self) -> None:
+        """Submit up to commit_batch_size buffered files as ONE commit. Caller holds lock."""
+        if not self._buffer:
+            return
+        assert self._executor is not None
+        paths = self._buffer[: self.commit_batch_size]
+        del self._buffer[: len(paths)]
+        bid = self._batch_id
+        self._batch_id += 1
+        self._futures[bid] = (self._executor.submit(self._commit_batch_sync, paths), paths)
+        print(f"[upload] commit batch {bid}: {len(paths)} shard(s)")
+
+    def _commit_batch_sync(self, paths: list[str]) -> None:
         assert self._api is not None and self.repo_id is not None
-        repo_path = (
-            f"{self.repo_path_prefix}/{Path(local_path).name}"
-            if self.repo_path_prefix
-            else Path(local_path).name
-        )
-        self._api.upload_file(
-            path_or_fileobj=local_path,
-            path_in_repo=repo_path,
-            repo_id=self.repo_id,
-            repo_type="dataset",
-        )
-        if self.delete_uploaded:
+        import re as _re
+
+        from huggingface_hub import CommitOperationAdd
+        from huggingface_hub.errors import HfHubHTTPError
+
+        ops = [
+            CommitOperationAdd(
+                path_in_repo=(
+                    f"{self.repo_path_prefix}/{Path(p).name}"
+                    if self.repo_path_prefix
+                    else Path(p).name
+                ),
+                path_or_fileobj=p,
+            )
+            for p in paths
+        ]
+        attempt = 0
+        while True:
             try:
-                os.remove(local_path)
-            except FileNotFoundError:
-                pass
+                self._api.create_commit(
+                    repo_id=self.repo_id,
+                    repo_type="dataset",
+                    operations=ops,
+                    commit_message=f"Add {len(paths)} shard(s)",
+                )
+                break
+            except HfHubHTTPError as e:
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                # 429 = commit rate limit (256/hr), 5xx = transient server error.
+                # Both are recoverable: back off and retry forever rather than
+                # letting one bad commit kill a multi-hour cache run. Honour the
+                # server's "Retry after N seconds" hint when present.
+                if status != 429 and not (status and 500 <= status < 600):
+                    raise
+                attempt += 1
+                m = _re.search(r"[Rr]etry after (\d+)", str(e))
+                wait_s = int(m.group(1)) + 5 if m else min(90 * attempt, 600)
+                print(
+                    f"[upload] {status} on batch of {len(paths)}; backing off {wait_s}s "
+                    f"(attempt {attempt}) -- rate limit / transient, will retry"
+                )
+                time.sleep(wait_s)
+        if self.delete_uploaded:
+            for p in paths:
+                try:
+                    os.remove(p)
+                except FileNotFoundError:
+                    pass
 
     def poll(self, *, wait: bool = False) -> None:
         if not self.enabled:
             return
-        if wait and self._futures:
-            concurrent.futures.wait(
-                list(self._futures.values()),
-                return_when=concurrent.futures.FIRST_COMPLETED,
-            )
-        done_paths = []
         with self._lock:
-            for path, future in list(self._futures.items()):
+            # If progress is needed but nothing is in flight, commit a PARTIAL batch
+            # so disk-backpressure (max_pending_uploads) can never deadlock waiting
+            # for a full batch that won't fill.
+            if wait and not self._futures and self._buffer:
+                self._kick_batch_locked()
+            in_flight = [fut for fut, _ in self._futures.values()]
+        if wait and in_flight:
+            concurrent.futures.wait(in_flight, return_when=concurrent.futures.FIRST_COMPLETED)
+        done = []
+        with self._lock:
+            for bid, (future, paths) in list(self._futures.items()):
                 if future.done():
-                    done_paths.append(path)
-        for path in done_paths:
-            future = self._futures.pop(path)
+                    done.append((bid, paths))
+        for bid, paths in done:
+            future, _ = self._futures.pop(bid)
             future.result()
-            self._uploaded.add(path)
-            print(f"[upload] done   {Path(path).name}")
+            for p in paths:
+                self._uploaded.add(p)
+            print(f"[upload] done   batch {bid} ({len(paths)} shard(s))")
 
     def finish(self) -> None:
         if not self.enabled:
             return
+        with self._lock:
+            while self._buffer:
+                self._kick_batch_locked()
         while self._futures:
             self.poll(wait=True)
         assert self._executor is not None

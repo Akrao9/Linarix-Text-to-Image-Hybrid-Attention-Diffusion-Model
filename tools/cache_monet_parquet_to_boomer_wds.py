@@ -423,6 +423,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--upload-repo", default=None)
     p.add_argument("--repo-path-prefix", default="")
     p.add_argument("--upload-workers", type=int, default=4)
+    p.add_argument("--upload-batch", type=int, default=8,
+                   help="shards committed per HF commit (HF caps commits at 256/hr; "
+                        "batching lets you keep small training-friendly shards). Set "
+                        "--max-pending-uploads >= this so full batches form before backpressure.")
     p.add_argument("--delete-uploaded", action="store_true")
     p.add_argument("--no-create-repo", action="store_true")
     p.add_argument("--hf-token", default=None)
@@ -563,6 +567,7 @@ def main() -> int:
         workers=args.upload_workers,
         delete_uploaded=args.delete_uploaded,
         create_repo=not args.no_create_repo,
+        commit_batch_size=args.upload_batch,
     )
 
     # Caption priority: preferred key first, then fallbacks (subsets vary in which
