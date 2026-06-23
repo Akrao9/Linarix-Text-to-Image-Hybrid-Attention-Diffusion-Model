@@ -64,6 +64,7 @@ except ImportError:  # pragma: no cover
 
 from boomer.datasets.latent_shards import collate_latent_records  # noqa: E402
 from boomer.datasets.wds_latents import (  # noqa: E402
+    ParquetStreamingLatentCacheDataset,
     PrefetchingWdsLatentCacheDataset,
     StreamingWdsLatentCacheDataset,
 )
@@ -228,6 +229,12 @@ def is_remote_cache(cache_wds: str) -> bool:
     return "hf://" in cache_wds
 
 
+def is_parquet_cache(cache_wds: str) -> bool:
+    """Parquet cache (range-streamed via `datasets`), local or hf://. Takes precedence
+    over the tar-shard paths in make_wds_dataset / the worker-count logic."""
+    return ".parquet" in cache_wds
+
+
 def make_wds_dataset(
     *,
     cache_wds: str,
@@ -242,9 +249,17 @@ def make_wds_dataset(
     download_max_retries: int = 2,
     max_consecutive_skips: int = 8,
 ):
-    """Remote hf:// caches use the SAME parallel download-ahead streaming as the
-    caching tool (a thread-pool prefetch window into local_dir, delete after use);
-    local shard globs read directly with plain streaming."""
+    """Parquet caches range-stream via `datasets` (faster + stall-resilient); remote
+    hf:// tar caches use the parallel download-ahead prefetch window (thread-pool into
+    local_dir, delete after use); local tar globs read directly with plain streaming."""
+    if is_parquet_cache(cache_wds):
+        return ParquetStreamingLatentCacheDataset(
+            paths=cache_wds,
+            hf_token=hf_token,
+            shuffle_buffer=shuffle_buffer,
+            seed=seed,
+            download_max_retries=download_max_retries,
+        )
     if is_remote_cache(cache_wds):
         return PrefetchingWdsLatentCacheDataset(
             paths=cache_wds,
@@ -321,9 +336,15 @@ class BoomerData(pl.LightningDataModule):
         )
 
     def train_dataloader(self) -> DataLoader:
-        # The rolling remote cache REQUIRES num_workers=0 (single-process shard
-        # download); local streaming can use multiple workers.
-        workers = 0 if is_remote_cache(self.cache_wds) else self.num_workers
+        # The rolling remote TAR cache REQUIRES num_workers=0 (single-process shard
+        # download). Parquet range-streaming and local globs use multiple workers
+        # (datasets shards parquet files across workers automatically).
+        if is_parquet_cache(self.cache_wds):
+            workers = self.num_workers
+        elif is_remote_cache(self.cache_wds):
+            workers = 0
+        else:
+            workers = self.num_workers
         persistent = self.persistent_workers if self.persistent_workers is not None else workers > 0
         kwargs = {}
         if workers > 0:

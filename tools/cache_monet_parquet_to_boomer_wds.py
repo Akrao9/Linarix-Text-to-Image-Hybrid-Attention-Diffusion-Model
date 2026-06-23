@@ -341,6 +341,104 @@ def text_fidelity_fingerprint(
 
 
 # --------------------------------------------------------------------------- #
+# Parquet shard sink (alternative to WebDataset tar). Parquet streams far better
+# from HF — `datasets streaming=True` + large range reads gives the "2x sample/s,
+# 100x fewer requests" wins from the HF streaming-datasets blog, and sidesteps the
+# silent tar-shard socket stalls the rolling WDS loader has to watchdog around.
+# --------------------------------------------------------------------------- #
+class ParquetShardWriter:
+    """Drop-in stand-in for ``wds.ShardWriter`` that writes one Parquet shard per
+    ``maxcount``/``maxsize`` window, one row per sample.
+
+    It accepts the SAME sample dict the tar path builds (``encode_and_write`` is
+    unchanged). Array members (``latents.npy``/``text.npy``/``text_mask.npy``/
+    ``dino.npy``) are stored as their ``.npy`` bytes in binary columns —
+    byte-identical to the tar members, self-describing dtype/shape, decoded with
+    ``np.load(BytesIO(col))``. ``caption.txt`` becomes a utf-8 string column and
+    ``meta.json`` a JSON-string column. ``post(path)`` fires on each finished shard
+    so the existing AsyncHubUploader handles batched upload/delete exactly as for tar.
+
+    ``maxsize`` is the UNCOMPRESSED payload budget (sum of binary member bytes); the
+    on-disk Parquet file is usually a touch smaller after compression.
+    """
+
+    _MEMBER_TO_COLUMN = {
+        "latents.npy": "latents",
+        "text.npy": "text",
+        "text_mask.npy": "text_mask",
+        "dino.npy": "dino",
+    }
+
+    def __init__(
+        self, pattern: str, *, maxcount: int, maxsize: int, start_shard: int = 0,
+        post: Any = None, row_group_size: int = 512, compression: str = "zstd",
+    ) -> None:
+        self.pattern = pattern
+        self.maxcount = max(1, maxcount)
+        self.maxsize = max(1, maxsize)
+        self.shard = start_shard
+        self.post = post
+        self.row_group_size = max(1, row_group_size)
+        self.compression = compression
+        self._reset()
+
+    def _reset(self) -> None:
+        self._cols: dict[str, list] = {}
+        self._schema_cols: list[str] | None = None
+        self._count = 0
+        self._bytes = 0
+
+    def write(self, sample: dict[str, Any]) -> None:
+        rec: dict[str, Any] = {
+            "__key__": str(sample["__key__"]),
+            "latents": sample["latents.npy"],
+            "text": sample["text.npy"],
+            "text_mask": sample["text_mask.npy"],
+            "caption": sample.get("caption.txt", ""),
+            "meta": json.dumps(sample.get("meta.json", {}), separators=(",", ":")),
+        }
+        if "dino.npy" in sample:
+            rec["dino"] = sample["dino.npy"]
+        # Fix the column set from the first row; keep every shard rectangular even if a
+        # later/earlier row is missing an optional member (e.g. dino) by padding nulls.
+        if self._schema_cols is None:
+            self._schema_cols = list(rec.keys())
+            self._cols = {c: [] for c in self._schema_cols}
+        for c in self._schema_cols:
+            self._cols[c].append(rec.get(c))
+        for c in rec:
+            if c not in self._cols:  # a new optional column appeared mid-shard: backfill
+                self._cols[c] = [None] * self._count + [rec[c]]
+                self._schema_cols.append(c)
+        self._count += 1
+        self._bytes += sum(len(sample[m]) for m in self._MEMBER_TO_COLUMN if m in sample)
+        if self._count >= self.maxcount or self._bytes >= self.maxsize:
+            self.flush()
+
+    def flush(self) -> None:
+        if self._count == 0:
+            return
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        path = self.pattern % self.shard
+        table = pa.table(self._cols)
+        pq.write_table(
+            table, path,
+            row_group_size=min(self.row_group_size, self._count),
+            compression=self.compression,
+            use_dictionary=False,  # unique binary blobs: dictionary encoding only bloats
+        )
+        if self.post is not None:
+            self.post(path)
+        self.shard += 1
+        self._reset()
+
+    def close(self) -> None:
+        self.flush()
+
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def parse_args() -> argparse.Namespace:
@@ -380,10 +478,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dino-key", default=DEFAULT_DINO_KEY)
     p.add_argument("--no-dino", action="store_true", help="skip the DINOv2 REPA member")
     p.add_argument("--output-dir", required=True)
+    p.add_argument("--output-format", choices=["wds", "parquet"], default="wds",
+                   help="wds = WebDataset .tar shards (default); parquet = one row per sample "
+                        "in .parquet shards (streams far better from HF via `datasets "
+                        "streaming=True` + range reads; recommended for new caches).")
+    p.add_argument("--parquet-row-group-size", type=int, default=512,
+                   help="rows per Parquet row group (parquet format only). ~512 rows of "
+                        "~0.65 MB/sample => ~330 MB groups, a good range-read granularity.")
+    p.add_argument("--parquet-compression", default="zstd",
+                   help="Parquet column compression (parquet format only): zstd|snappy|none. "
+                        "fp8 text is near-incompressible, so gains are modest; zstd is cheap.")
     p.add_argument("--shard-size", type=int, default=100000,
-                   help="max samples per output tar (upper bound; --max-shard-gb usually triggers first)")
+                   help="max samples per output shard (upper bound; --max-shard-gb usually triggers first)")
     p.add_argument("--max-shard-gb", type=float, default=4.0,
-                   help="rotate the output tar at this many GB (default 4)")
+                   help="rotate the output shard at this many GB (default 4)")
     p.add_argument("--encode-batch", type=int, default=64, help="captions per Qwen forward")
     p.add_argument("--max-length", type=int, default=340, help="must match existing Qwen cache shape")
     p.add_argument("--latent-dtype", default="bfloat16")
@@ -474,13 +582,24 @@ def write_manifest(
     args: argparse.Namespace,
     uploader: AsyncHubUploader,
     fingerprint: dict[str, Any] | None = None,
+    output_format: str = "wds",
 ) -> None:
-    schema = ["latents.npy", "text.npy", "text_mask.npy", "caption.txt", "meta.json"]
-    if dino_dim is not None:
-        schema.append("dino.npy")
+    if output_format == "parquet":
+        # Arrays are stored as their .npy bytes in binary columns (np.load(BytesIO));
+        # caption is a utf-8 string column, meta a JSON-string column.
+        schema = ["latents", "text", "text_mask", "caption", "meta"]
+        if dino_dim is not None:
+            schema.append("dino")
+        fmt = "boomer_parquet_latent_text_cache"
+    else:
+        schema = ["latents.npy", "text.npy", "text_mask.npy", "caption.txt", "meta.json"]
+        if dino_dim is not None:
+            schema.append("dino.npy")
+        fmt = "boomer_wds_latent_text_cache"
     manifest = {
         "format_version": 2,
-        "format": "boomer_wds_latent_text_cache",
+        "format": fmt,
+        "output_format": output_format,
         "latents_dtype": latent_dtype,
         # monet's 512px f32c32 latents are always 32x16x16
         "latents_shape": [LATENT_CHANNELS, 16, 16],
@@ -495,6 +614,9 @@ def write_manifest(
         "qwen_readout_layer": args.qwen_readout_layer,
         "max_length": args.max_length,
     }
+    if output_format == "parquet":
+        # arrays = np.load(BytesIO(col)); caption = str; meta = JSON string.
+        manifest["column_encoding"] = "npy_bytes"
     if dino_dim is not None:
         manifest["dino_dtype"] = dino_dtype
         manifest["dino_shape"] = [dino_dim]
@@ -526,7 +648,6 @@ def write_null_embeddings(
 
 def main() -> int:
     import pyarrow.parquet as pq
-    import webdataset as wds
     from huggingface_hub import hf_hub_download
 
     args = parse_args()
@@ -579,14 +700,30 @@ def main() -> int:
                   "wk_jasperai", "sscd_cluster_id", "source"]
 
     run_label = "mix" if args.mix else (args.subset or "all")
-    pattern = str(out_dir / f"monet-{run_label}-r{rank:02d}-%06d.tar")
-    sink = wds.ShardWriter(
-        pattern,
-        maxcount=args.shard_size,
-        maxsize=int(args.max_shard_gb * 1e9),
-        start_shard=args.start_output_shard,
-        post=uploader.upload_path,
-    )
+    is_parquet = args.output_format == "parquet"
+    ext = "parquet" if is_parquet else "tar"
+    shard_glob = f"*.{ext}"  # backpressure counts only output shards, not manifest/null npy
+    pattern = str(out_dir / f"monet-{run_label}-r{rank:02d}-%06d.{ext}")
+    if is_parquet:
+        sink = ParquetShardWriter(
+            pattern,
+            maxcount=args.shard_size,
+            maxsize=int(args.max_shard_gb * 1e9),
+            start_shard=args.start_output_shard,
+            post=uploader.upload_path,
+            row_group_size=args.parquet_row_group_size,
+            compression=args.parquet_compression,
+        )
+    else:
+        import webdataset as wds
+
+        sink = wds.ShardWriter(
+            pattern,
+            maxcount=args.shard_size,
+            maxsize=int(args.max_shard_gb * 1e9),
+            start_shard=args.start_output_shard,
+            post=uploader.upload_path,
+        )
 
     seen_clusters: set[str] = set()
     manifest_written = False
@@ -625,6 +762,7 @@ def main() -> int:
                 dino_dtype=args.dino_dtype if not args.no_dino else None,
                 dino_dim=int(dinos.shape[1]) if dinos is not None else None,
                 args=args, uploader=uploader, fingerprint=fingerprint,
+                output_format=args.output_format,
             )
             if rank == 0:
                 write_null_embeddings(out_dir, encoder, args, uploader)
@@ -694,7 +832,7 @@ def main() -> int:
                 encode_and_write(buffer)
                 buffer = []
             uploader.poll()
-            while len(list(out_dir.glob("*.tar"))) > args.max_pending_uploads:
+            while len(list(out_dir.glob(shard_glob))) > args.max_pending_uploads:
                 uploader.poll(wait=True)
 
         next_log = 50000
@@ -837,7 +975,7 @@ def main() -> int:
         uploader.poll()
         # Backpressure: if uploads lag, don't let finished output shards pile up on disk.
         # Count closed-but-present tars (the open one stays); wait for uploads to drain.
-        while len(list(out_dir.glob("*.tar"))) > args.max_pending_uploads:
+        while len(list(out_dir.glob(shard_glob))) > args.max_pending_uploads:
             uploader.poll(wait=True)
         # Report the captioners ACTUALLY used (not just the preferred key), so a
         # present-but-null column like Gemini on commoncatalog-cc-by is visible here.

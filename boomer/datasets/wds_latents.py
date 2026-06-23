@@ -36,7 +36,11 @@ _NUMPY_DTYPES: dict[str, np.dtype] = {
 # A stuck/slow HF link must not deadlock training: after this budget the rolling cache
 # gives up on that shard, clears the wedged in-flight reference, and continues with the
 # shards already in the local window (then tries a different remote shard).
-ROLLING_WDS_DOWNLOAD_TIMEOUT_S = 300.0
+# 120s: a 1 GB shard downloads in ~10-60s even on a slow-but-alive link, so this gives a
+# healthy shard ample headroom while abandoning a silently-stalled Xet thread 2.5x faster
+# than the old 300s. (HF_HUB_DOWNLOAD_TIMEOUT is ignored on the Xet path — its Rust thread
+# can't be cancelled — so this wall-clock budget is the only thing that catches Xet stalls.)
+ROLLING_WDS_DOWNLOAD_TIMEOUT_S = 120.0
 
 
 def split_csv(value: str) -> list[str]:
@@ -980,6 +984,9 @@ class PrefetchingWdsLatentCacheDataset(IterableDataset[LatentRecord]):
     seed: int | None = None
     # A shard whose download stalls past ROLLING_WDS_DOWNLOAD_TIMEOUT_S is retried up to
     # this many times (the stuck worker is replaced, not killed); after that it is skipped.
+    # Each retry gets a fresh socket via a replacement worker, so retries genuinely recover
+    # transient CDN-edge hiccups. With the budget now 120s, worst case per bad shard is
+    # 3x120s=360s vs the old 3x300s=900s.
     download_max_retries: int = 2
     # Abort the stream if this many shards are skipped back-to-back — a dead network must
     # surface as a failure, not silently train on an ever-shrinking slice of the data.
@@ -1283,8 +1290,135 @@ class PrefetchingWdsLatentCacheDataset(IterableDataset[LatentRecord]):
             thread.join(timeout=5.0)
 
 
+@dataclass
+class ParquetStreamingLatentCacheDataset(IterableDataset[LatentRecord]):
+    """Stream Boomer's *Parquet* latent/text cache from HF via `datasets
+    streaming=True` (HTTP range reads), looping epochs forever.
+
+    Why this over the WebDataset tar path: range reads go through fsspec/`requests`,
+    which HONOR ``HF_HUB_DOWNLOAD_TIMEOUT`` and raise a catchable ``ReadTimeout`` on a
+    stalled socket — unlike ``hf_hub_download``'s uncancellable Xet whole-file thread
+    that caused the silent shard stalls the tar loader has to watchdog around. Plus the
+    HF streaming-datasets optimizations (large range reads + background prefetch +
+    persistent cross-worker cache) give materially higher sample/s. So it is both
+    faster AND stall-resilient. See https://huggingface.co/blog/streaming-datasets.
+
+    The cache columns (manifest ``column_encoding=npy_bytes``) are: latents/text/
+    text_mask as ``.npy`` bytes, caption a utf-8 string, meta a JSON string, dino an
+    optional ``.npy`` bytes column. Each row is mapped back to the WDS member-key dict
+    and decoded by :func:`sample_to_record`, so the tensors are byte-identical to the
+    tar path and the rest of training is unchanged.
+
+    DataLoader workers: `datasets` streaming shards the parquet files across worker
+    processes automatically, so this dataset is meant to run with ``num_workers > 0``
+    (unlike the single-process rolling tar cache).
+    """
+
+    paths: str | Iterable[str]
+    hf_token: str | bool | None = None
+    shuffle_buffer: int = 2000
+    seed: int = 0
+    download_timeout: float = 30.0
+    # Streaming read retries (datasets re-opens the range on a transient drop). This is
+    # the parquet analog of the tar loader's shard retry — but per 128 MiB range, not
+    # per whole 2 GB file, so recovery is far cheaper.
+    download_max_retries: int = 5
+
+    def __post_init__(self) -> None:
+        if isinstance(self.paths, str):
+            self._globs = split_csv(self.paths)
+        else:
+            self._globs = [str(p) for p in self.paths]
+        # Range reads honor this (cancellable requests path) — the core stall fix.
+        os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", str(int(self.download_timeout)))
+        self.manifest = load_wds_cache_manifest(self.paths, hf_token=self.hf_token)
+        # Best-effort shard count for a startup log line (don't fail the run on a glob hiccup).
+        try:
+            n = len(self._list_files())
+            print(f"[parquet-wds] streaming {n} parquet shard(s) for {self.paths}", flush=True)
+        except Exception as exc:  # noqa: BLE001 - logging only
+            print(f"[parquet-wds] shard pre-count skipped ({exc})", flush=True)
+
+    def _token(self) -> str | None:
+        if self.hf_token is True:
+            from huggingface_hub import get_token
+
+            return get_token()
+        return self.hf_token if isinstance(self.hf_token, str) else None
+
+    def _list_files(self) -> list[str]:
+        files: list[str] = []
+        fs = None
+        for raw in self._globs:
+            if raw.startswith("hf://"):
+                if fs is None:
+                    from huggingface_hub import HfFileSystem
+
+                    fs = HfFileSystem(token=self.hf_token)
+                matched = sorted(fs.glob(raw))
+                # HfFileSystem.glob drops the scheme; datasets wants it back.
+                files.extend(m if m.startswith("hf://") else f"hf://{m}" for m in matched)
+            elif any(ch in raw for ch in "*?[]"):
+                files.extend(sorted(glob.glob(raw)))
+            else:
+                files.append(raw)
+        if not files:
+            raise FileNotFoundError(f"No parquet shards found for: {self.paths}")
+        return files
+
+    def _make_stream(self, epoch: int):
+        import datasets
+        from datasets import load_dataset
+
+        # datasets' streaming read-retry knobs (the actual retry path for streaming=True).
+        datasets.config.STREAMING_READ_MAX_RETRIES = self.download_max_retries
+        datasets.config.STREAMING_READ_RETRY_INTERVAL = 5
+        ds = load_dataset(
+            "parquet",
+            data_files={"train": self._list_files()},
+            split="train",
+            streaming=True,
+            token=self._token(),
+        )
+        if self.shuffle_buffer and self.shuffle_buffer > 0:
+            ds = ds.shuffle(seed=self.seed + epoch, buffer_size=self.shuffle_buffer)
+        return ds
+
+    def _row_to_record(self, row: dict[str, Any]) -> LatentRecord:
+        # Map parquet columns back to WDS member keys so sample_to_record decodes them
+        # identically (npy bytes -> tensors, json string -> dict, str -> caption).
+        sample: dict[str, Any] = {
+            "__url__": "",
+            "latents.npy": row["latents"],
+            "text.npy": row["text"],
+            "text_mask.npy": row["text_mask"],
+            "caption.txt": row.get("caption", ""),
+            "meta.json": row.get("meta", "{}"),
+        }
+        dino = row.get("dino")
+        if dino is not None:
+            sample["dino.npy"] = dino
+        return sample_to_record(sample, manifest=self.manifest)
+
+    def __iter__(self):
+        epoch = 0
+        while True:  # IterableDataset: loop epochs forever; Trainer stops at max_steps
+            stream = self._make_stream(epoch)
+            n = 0
+            for row in stream:
+                yield self._row_to_record(row)
+                n += 1
+            if n == 0:
+                raise RuntimeError(
+                    f"[parquet-wds] stream yielded 0 rows for {self.paths} "
+                    "(empty/unreadable shards?) — refusing to spin an empty epoch loop."
+                )
+            epoch += 1
+
+
 __all__ = [
     "HfWdsShardRef",
+    "ParquetStreamingLatentCacheDataset",
     "PrefetchingWdsLatentCacheDataset",
     "RollingLocalWdsCache",
     "RollingStreamingWdsLatentCacheDataset",
