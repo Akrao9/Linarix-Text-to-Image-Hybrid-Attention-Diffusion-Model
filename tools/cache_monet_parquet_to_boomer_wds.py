@@ -81,6 +81,36 @@ def list_source_parquets(repo_id: str, subset: str | None, token: str | None) ->
     return parquets
 
 
+def resolve_download_with_watchdog(future, resubmit, *, budget_s, retries, label):
+    """Wait for a source-parquet download future with a wall-clock budget. On a stall
+    (silent socket — the HF transfer thread can't be cancelled) or error, abandon the
+    wedged worker and resubmit a FRESH download, up to ``retries`` times. The leaked
+    thread dies on its own once HF_HUB_DOWNLOAD_TIMEOUT fires (xet disabled => honored).
+
+    This is the source-side analog of the training prefetcher's watchdog: the cache
+    builder must not deadlock for days on one hung CDN connection."""
+    import concurrent.futures as _cf
+
+    attempt = 0
+    while True:
+        try:
+            return future.result(timeout=budget_s)
+        except _cf.TimeoutError:
+            err = f"stalled >{int(budget_s)}s"
+        except Exception as exc:  # noqa: BLE001 - any download error is retryable
+            err = repr(exc)
+        attempt += 1
+        if attempt > retries:
+            raise OSError(
+                f"[monet-cache] source download {label} failed after {retries} retries ({err})"
+            )
+        print(
+            f"[monet-cache] source download {label} {err}; abandon + retry {attempt}/{retries}",
+            flush=True,
+        )
+        future = resubmit()
+
+
 def resolve_rank_world(args: argparse.Namespace) -> tuple[int, int]:
     rank = args.rank if args.rank is not None else int(os.environ.get("RANK", "0"))
     world = args.world_size if args.world_size is not None else int(os.environ.get("WORLD_SIZE", "1"))
@@ -235,7 +265,15 @@ def iter_subset_items(
     for i in range(min(ahead, len(parquets))):
         submit(i)
     for idx in range(len(parquets)):
-        local = futures.pop(idx).result()
+        local = resolve_download_with_watchdog(
+            futures.pop(idx),
+            resubmit=lambda i=idx: dl_executor.submit(
+                hf_hub_download, repo_id=args.repo_id, filename=parquets[i],
+                repo_type="dataset", token=token_str, local_dir=str(staging_dir),
+            ),
+            budget_s=args.download_timeout, retries=args.download_retries,
+            label=parquets[idx],
+        )
         submit(idx + ahead)
         available = set(pq.read_schema(local).names)
         latent_col, present_caption_keys, dino_col, want = resolve_columns(
@@ -538,6 +576,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--delete-uploaded", action="store_true")
     p.add_argument("--no-create-repo", action="store_true")
     p.add_argument("--hf-token", default=None)
+    # Stall watchdogs (silent HF socket hangs must not deadlock a multi-day build).
+    p.add_argument("--download-timeout", type=float, default=180.0,
+                   help="wall-clock budget (s) for ONE source-parquet download before it is "
+                        "abandoned as a stall and retried on a fresh connection.")
+    p.add_argument("--download-retries", type=int, default=3,
+                   help="source-parquet download retries after a stall/error before aborting.")
+    p.add_argument("--commit-timeout", type=float, default=900.0,
+                   help="wall-clock budget (s) for ONE HF commit (batch upload) before it is "
+                        "abandoned as a stall and retried; generous since a batch is a big upload.")
+    p.add_argument("--no-disable-xet", action="store_true",
+                   help="keep hf_xet for source download/upload (default DISABLES it so "
+                        "HF_HUB_DOWNLOAD_TIMEOUT is honored and stalls raise instead of hang).")
     return p.parse_args()
 
 
@@ -651,6 +701,13 @@ def main() -> int:
     from huggingface_hub import hf_hub_download
 
     args = parse_args()
+    # Make HF transfers stall-resistant: disabling hf_xet routes source download AND
+    # upload through the requests path that HONORS HF_HUB_DOWNLOAD_TIMEOUT, so a dropped
+    # socket raises (and our watchdog retries) instead of the uncancellable Xet thread
+    # hanging the whole run. The wall-clock watchdogs below are the backstop.
+    if not args.no_disable_xet:
+        os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
     token = hf_token_value(args.hf_token)
     token_str = token if isinstance(token, str) else None
     normalize_storage_dtype(args.latent_dtype)  # validate early
@@ -689,6 +746,7 @@ def main() -> int:
         delete_uploaded=args.delete_uploaded,
         create_repo=not args.no_create_repo,
         commit_batch_size=args.upload_batch,
+        commit_timeout=args.commit_timeout,
     )
 
     # Caption priority: preferred key first, then fallbacks (subsets vary in which
@@ -907,7 +965,15 @@ def main() -> int:
         submit_download(idx)
 
     for shard_idx, parquet_path in enumerate(my_parquets):
-        local = dl_futures.pop(shard_idx).result()   # wait only if not prefetched yet
+        local = resolve_download_with_watchdog(   # wait (with stall watchdog) if not prefetched yet
+            dl_futures.pop(shard_idx),
+            resubmit=lambda i=shard_idx: dl_executor.submit(
+                hf_hub_download, repo_id=args.repo_id, filename=my_parquets[i],
+                repo_type="dataset", token=token_str, local_dir=str(staging_dir),
+            ),
+            budget_s=args.download_timeout, retries=args.download_retries,
+            label=my_parquets[shard_idx],
+        )
         submit_download(shard_idx + args.prefetch_shards)  # keep the window full
         available = set(pq.read_schema(local).names)
         # Resolve columns against THIS shard's schema (subsets differ); request only

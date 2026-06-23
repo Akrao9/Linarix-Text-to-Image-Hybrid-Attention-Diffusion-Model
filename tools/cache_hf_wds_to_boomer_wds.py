@@ -838,10 +838,17 @@ class AsyncHubUploader:
         delete_uploaded: bool,
         create_repo: bool,
         commit_batch_size: int = 8,
+        commit_timeout: float = 900.0,
+        commit_max_retries: int = 10,
     ) -> None:
         self.repo_id = repo_id
         self.repo_path_prefix = repo_path_prefix.strip("/")
         self.delete_uploaded = delete_uploaded
+        # A create_commit that exceeds this wall-clock budget is treated as a silent
+        # socket stall (the HF transfer thread can't be cancelled), abandoned, and
+        # retried on a fresh connection. Generous because a full batch is a big upload.
+        self.commit_timeout = max(30.0, commit_timeout)
+        self.commit_max_retries = max(1, commit_max_retries)
         # HF caps repo commits at 256/hour. One commit per shard trips that with
         # small (1 GB) shards, but small shards are required so training streaming
         # doesn't stall. So commit MANY shards per commit instead of shrinking the
@@ -892,6 +899,28 @@ class AsyncHubUploader:
         self._futures[bid] = (self._executor.submit(self._commit_batch_sync, paths), paths)
         print(f"[upload] commit batch {bid}: {len(paths)} shard(s)")
 
+    @staticmethod
+    def _run_with_timeout(fn, budget_s):
+        """Run ``fn()`` in a daemon thread; raise ``TimeoutError`` if it exceeds
+        ``budget_s``. A wedged HF transfer (silent socket stall) can't be cancelled, so
+        it is abandoned to die on its own rather than hanging the uploader forever."""
+        box = {}
+
+        def runner():
+            try:
+                box["val"] = fn()
+            except BaseException as exc:  # noqa: BLE001 - propagate to caller
+                box["exc"] = exc
+
+        th = threading.Thread(target=runner, name="commit-watchdog", daemon=True)
+        th.start()
+        th.join(budget_s)
+        if th.is_alive():
+            raise TimeoutError(f"create_commit exceeded {int(budget_s)}s wall-clock budget")
+        if "exc" in box:
+            raise box["exc"]
+        return box.get("val")
+
     def _commit_batch_sync(self, paths: list[str]) -> None:
         assert self._api is not None and self.repo_id is not None
         import re as _re
@@ -910,14 +939,21 @@ class AsyncHubUploader:
             )
             for p in paths
         ]
-        attempt = 0
+        attempt = 0          # 429 / 5xx rate-limit backoff (retried forever)
+        net_attempt = 0      # silent stall / network drop (bounded retries)
         while True:
             try:
-                self._api.create_commit(
-                    repo_id=self.repo_id,
-                    repo_type="dataset",
-                    operations=ops,
-                    commit_message=f"Add {len(paths)} shard(s)",
+                # Wrap create_commit in a wall-clock watchdog: a silently-stalled upload
+                # socket (no HTTP status, uncancellable transfer thread) would otherwise
+                # hang the uploader forever and deadlock the writer on backpressure.
+                self._run_with_timeout(
+                    lambda: self._api.create_commit(
+                        repo_id=self.repo_id,
+                        repo_type="dataset",
+                        operations=ops,
+                        commit_message=f"Add {len(paths)} shard(s)",
+                    ),
+                    self.commit_timeout,
                 )
                 break
             except HfHubHTTPError as e:
@@ -934,6 +970,19 @@ class AsyncHubUploader:
                 print(
                     f"[upload] {status} on batch of {len(paths)}; backing off {wait_s}s "
                     f"(attempt {attempt}) -- rate limit / transient, will retry"
+                )
+                time.sleep(wait_s)
+            except Exception as e:  # noqa: BLE001 - TimeoutError / connection drops / etc.
+                # The watchdog abandoned a wedged upload, or a connection dropped (no HTTP
+                # status). create_commit is atomic and LFS/Xet blobs dedup by hash, so a
+                # fresh retry is safe. Bounded so a genuine bad batch can't loop forever.
+                net_attempt += 1
+                if net_attempt > self.commit_max_retries:
+                    raise
+                wait_s = min(30 * net_attempt, 300)
+                print(
+                    f"[upload] commit stalled/failed ({e!r}); abandon + retry in {wait_s}s "
+                    f"(attempt {net_attempt}/{self.commit_max_retries})"
                 )
                 time.sleep(wait_s)
         if self.delete_uploaded:
