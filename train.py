@@ -353,18 +353,18 @@ class BoomerData(pl.LightningDataModule):
             workers = self.num_workers
 
         # DataLoader spawn workers inherit the environment present when iteration
-        # begins. Disable Xet HP *before* they start: HP owns a 16 GiB reconstruction
-        # buffer (64 GiB limit) per process, so multiplying it across Parquet workers
-        # can OOM the host. Default adaptive Xet remains enabled.
-        if parquet and workers > 1:
-            xet_hp = os.environ.get("HF_XET_HIGH_PERFORMANCE", "").strip().upper()
-            if xet_hp in {"1", "ON", "YES", "TRUE"}:
+        # begins. Parquet wants cancellable HTTP Range reads. Xet's reconstruction
+        # path has an 8 GiB default buffer limit per process (64 GiB in HP mode), so
+        # six workers can consume tens of GiB and wait minutes before yielding row 1.
+        # Set both flags before spawn/import so Hugging Face actually selects HTTP.
+        if parquet:
+            if os.environ.get("HF_HUB_DISABLE_XET") != "1":
                 print(
-                    "[parquet-wds] disabling HF_XET_HIGH_PERFORMANCE for multi-worker "
-                    "streaming (default adaptive Xet remains enabled)",
+                    "[parquet-wds] disabling Xet reconstruction; using HTTP Range reads",
                     flush=True,
                 )
-                os.environ["HF_XET_HIGH_PERFORMANCE"] = "0"
+            os.environ["HF_HUB_DISABLE_XET"] = "1"
+            os.environ["HF_XET_HIGH_PERFORMANCE"] = "0"
         persistent = self.persistent_workers if self.persistent_workers is not None else workers > 0
         kwargs = {}
         if workers > 0:

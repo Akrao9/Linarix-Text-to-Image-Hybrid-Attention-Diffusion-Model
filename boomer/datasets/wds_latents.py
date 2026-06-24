@@ -916,10 +916,6 @@ class RollingStreamingWdsLatentCacheDataset(IterableDataset[LatentRecord]):
     seed: int | None = None
 
     def __post_init__(self) -> None:
-        if self.shuffle_buffer < 0:
-            raise ValueError("Parquet shuffle_buffer must be >= 0.")
-        if self.read_batch_size < 1:
-            raise ValueError("Parquet read_batch_size must be >= 1.")
         if isinstance(self.paths, str):
             raw_paths = split_csv(self.paths)
         else:
@@ -1342,6 +1338,15 @@ class ParquetStreamingLatentCacheDataset(IterableDataset[LatentRecord]):
     download_max_retries: int = 5
 
     def __post_init__(self) -> None:
+        if self.shuffle_buffer < 0:
+            raise ValueError("Parquet shuffle_buffer must be >= 0.")
+        if self.read_batch_size < 1:
+            raise ValueError("Parquet read_batch_size must be >= 1.")
+        # This loader is deliberately an HTTP Range reader. Set the transport before
+        # importing/constructing HfFileSystem below; huggingface_hub snapshots these
+        # environment flags at import time.
+        os.environ["HF_HUB_DISABLE_XET"] = "1"
+        os.environ["HF_XET_HIGH_PERFORMANCE"] = "0"
         if isinstance(self.paths, str):
             self._globs = split_csv(self.paths)
         else:
@@ -1430,19 +1435,18 @@ class ParquetStreamingLatentCacheDataset(IterableDataset[LatentRecord]):
             self.shuffle_buffer, num_workers
         )
 
-        # Xet high-performance mode owns a 16 GiB reconstruction buffer with a 64 GiB
-        # limit. In a spawned DataLoader every worker creates an independent Xet
-        # client, so HP mode can exhaust even a 177 GiB host. Adaptive/default Xet is
-        # already parallel; disable only HP mode for a multi-worker Parquet stream.
-        xet_hp = os.environ.get("HF_XET_HIGH_PERFORMANCE", "").strip().upper()
-        if num_workers > 1 and xet_hp in {"1", "ON", "YES", "TRUE"}:
-            os.environ["HF_XET_HIGH_PERFORMANCE"] = "0"
+        # Parquet needs small HTTP Range reads, not Xet whole-file reconstruction.
+        # Default Xet can retain up to 8 GiB of reconstruction buffers *per worker*
+        # (HP mode raises that to 64 GiB), which makes workers sit at step 0 while
+        # consuming ~10 GiB RSS each. DataModule sets this before spawn; keep this as
+        # a fallback for direct/single-process use.
+        os.environ["HF_HUB_DISABLE_XET"] = "1"
+        os.environ["HF_XET_HIGH_PERFORMANCE"] = "0"
 
         print(
             f"[parquet-wds worker {worker_id}/{num_workers}] "
             f"shuffle_buffer={worker_shuffle_buffer} (global={self.shuffle_buffer}) "
-            f"read_batch_size={self.read_batch_size} xet_hp="
-            f"{os.environ.get('HF_XET_HIGH_PERFORMANCE', 'default')}",
+            f"read_batch_size={self.read_batch_size} xet=disabled",
             flush=True,
         )
         epoch = 0
