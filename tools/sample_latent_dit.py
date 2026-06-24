@@ -90,8 +90,17 @@ def predict_velocity(
     uncond_attention_mask: torch.Tensor,
     cfg_scale: float,
     cfg_rescale: float = 0.0,
+    *,
+    sigma_value: float | None = None,
+    cfg_interval: tuple[float, float] = (0.0, 1.0),
 ) -> torch.Tensor:
-    if cfg_scale == 1.0:
+    # Guidance interval (Kynkäänniemi et al. 2024, "Applying Guidance in a Limited
+    # Interval"): only apply CFG while sigma is inside [low, high]. Outside it we run
+    # the single conditional pass — cheaper (one forward, not two) and avoids the
+    # over-saturation/detail loss CFG causes at very low noise, plus the wasted
+    # contrast at very high noise where cond/uncond barely differ.
+    in_interval = sigma_value is None or cfg_interval[0] <= float(sigma_value) <= cfg_interval[1]
+    if cfg_scale == 1.0 or not in_interval:
         return model(latent, timestep, text_embedding, attention_mask)
 
     latent_batch = latent.repeat(2, 1, 1, 1)
@@ -124,6 +133,7 @@ def sample_latent(
     flow_shift: float = 1.0,
     stork_derivative_order: int = 2,
     stork_substeps: int = 50,
+    cfg_interval: tuple[float, float] = (0.0, 1.0),
 ) -> torch.Tensor:
     generator = torch.Generator(device=device).manual_seed(seed)
     config = model.config
@@ -168,6 +178,8 @@ def sample_latent(
                 uncond_attention_mask,
                 cfg_scale,
                 cfg_rescale,
+                sigma_value=float(sigma),
+                cfg_interval=cfg_interval,
             )
             latent = scheduler.step(velocity, sigma, latent, return_dict=True).prev_sample
         return latent
@@ -188,6 +200,8 @@ def sample_latent(
             uncond_attention_mask,
             cfg_scale,
             cfg_rescale,
+            sigma_value=float(sigma),
+            cfg_interval=cfg_interval,
         )
         if sampler == "euler":
             latent = latent - velocity * dt
@@ -204,6 +218,8 @@ def sample_latent(
                 uncond_attention_mask,
                 cfg_scale,
                 cfg_rescale,
+                sigma_value=float(next_sigma),
+                cfg_interval=cfg_interval,
             )
             latent = latent - 0.5 * dt * (velocity + next_velocity)
         else:
@@ -295,6 +311,20 @@ def main() -> None:
         help="CFG variance rescale mix in [0, 1]. 0 disables. Try 0.5-0.7 when --cfg-scale > 1.",
     )
     parser.add_argument(
+        "--cfg-interval-low",
+        type=float,
+        default=0.0,
+        help="Apply CFG only while sigma >= this (guidance interval, Kynkaanniemi 2024). "
+             "Skips CFG at very low noise to reduce over-saturation. 0 = no lower bound.",
+    )
+    parser.add_argument(
+        "--cfg-interval-high",
+        type=float,
+        default=1.0,
+        help="Apply CFG only while sigma <= this. Skips CFG at very high noise (cheaper, cond/uncond "
+             "barely differ there). 1 = no upper bound. Try --cfg-interval-low 0.1 --cfg-interval-high 0.9.",
+    )
+    parser.add_argument(
         "--weights",
         choices=["auto", "model", "ema"],
         default="auto",
@@ -324,6 +354,8 @@ def main() -> None:
         parser.error("--cfg-scale must be non-negative.")
     if not 0.0 <= args.cfg_rescale <= 1.0:
         parser.error("--cfg-rescale must be in [0, 1].")
+    if not 0.0 <= args.cfg_interval_low <= args.cfg_interval_high <= 1.0:
+        parser.error("--cfg-interval-low/--cfg-interval-high must satisfy 0 <= low <= high <= 1 (sigma units).")
     if args.flow_shift is not None and args.flow_shift <= 0.0:
         parser.error("--flow-shift must be positive.")
     if args.stork_derivative_order not in {1, 2, 3}:
@@ -391,6 +423,7 @@ def main() -> None:
         flow_shift=flow_shift,
         stork_derivative_order=args.stork_derivative_order,
         stork_substeps=args.stork_substeps,
+        cfg_interval=(args.cfg_interval_low, args.cfg_interval_high),
     )
     latent = denormalize_latent(latent, latent_mean, latent_std)
 
@@ -403,7 +436,7 @@ def main() -> None:
     print(f"caption: {caption}")
     print(
         f"weights: {weights_name} sampler={args.sampler} steps={args.steps} cfg_scale={args.cfg_scale} "
-        f"cfg_rescale={args.cfg_rescale} "
+        f"cfg_rescale={args.cfg_rescale} cfg_interval=[{args.cfg_interval_low},{args.cfg_interval_high}] "
         f"model_type={model.config.model_type} flow_shift={flow_shift} "
         f"y_norm={model.config.y_norm} y_norm_scale_factor={model.config.y_norm_scale_factor}"
     )
