@@ -85,11 +85,19 @@ from boomer.sana_latent_cache import hf_token_value  # noqa: E402
 class BoomerLit(pl.LightningModule):
     def __init__(self, model_config: BoomerFLADiTConfig, **hp: Any) -> None:
         super().__init__()
-        self.save_hyperparameters(hp)
+        self.save_hyperparameters({**hp, "model_config": model_config.__dict__})
         self.config = model_config
         self.model = create_model(model_config)
         if hp.get("compile"):
             self.model = torch.compile(self.model, mode=hp.get("compile_mode", "default"))
+
+    def on_save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        # Keep inference self-describing even though Lightning's native state uses
+        # `state_dict`/`hyper_parameters`. Older sampling tools consume these fields.
+        checkpoint["config"] = dict(self.config.__dict__)
+        checkpoint["train_args"] = {
+            key: value for key, value in dict(self.hparams).items() if key != "model_config"
+        }
 
     def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         hp = self.hparams
