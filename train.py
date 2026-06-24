@@ -249,6 +249,7 @@ def make_wds_dataset(
     download_max_retries: int = 2,
     max_consecutive_skips: int = 8,
     parquet_read_batch_size: int = 32,
+    parquet_memory_trim_every: int = 4096,
 ):
     """Parquet caches range-stream via `datasets` (faster + stall-resilient); remote
     hf:// tar caches use the parallel download-ahead prefetch window (thread-pool into
@@ -261,6 +262,7 @@ def make_wds_dataset(
             seed=seed,
             download_max_retries=download_max_retries,
             read_batch_size=parquet_read_batch_size,
+            memory_trim_every=parquet_memory_trim_every,
         )
     if is_remote_cache(cache_wds):
         return PrefetchingWdsLatentCacheDataset(
@@ -304,6 +306,7 @@ class BoomerData(pl.LightningDataModule):
         download_max_retries: int = 2,
         max_consecutive_skips: int = 8,
         parquet_read_batch_size: int = 32,
+        parquet_memory_trim_every: int = 4096,
     ) -> None:
         super().__init__()
         self.cache_wds = cache_wds
@@ -323,6 +326,7 @@ class BoomerData(pl.LightningDataModule):
         self.download_max_retries = download_max_retries
         self.max_consecutive_skips = max_consecutive_skips
         self.parquet_read_batch_size = parquet_read_batch_size
+        self.parquet_memory_trim_every = parquet_memory_trim_every
 
     def _dataset(self):
         return make_wds_dataset(
@@ -338,6 +342,7 @@ class BoomerData(pl.LightningDataModule):
             download_max_retries=self.download_max_retries,
             max_consecutive_skips=self.max_consecutive_skips,
             parquet_read_batch_size=self.parquet_read_batch_size,
+            parquet_memory_trim_every=self.parquet_memory_trim_every,
         )
 
     def train_dataloader(self) -> DataLoader:
@@ -365,6 +370,9 @@ class BoomerData(pl.LightningDataModule):
                 )
             os.environ["HF_HUB_DISABLE_XET"] = "1"
             os.environ["HF_XET_HIGH_PERFORMANCE"] = "0"
+            # Applied when spawn starts fresh worker interpreters. This bounds glibc's
+            # per-thread arenas, which otherwise retain large Arrow/Python allocations.
+            os.environ.setdefault("MALLOC_ARENA_MAX", "2")
         persistent = self.persistent_workers if self.persistent_workers is not None else workers > 0
         kwargs = {}
         if workers > 0:
@@ -696,6 +704,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Rows materialized by Arrow at once per Parquet worker. The cache has "
                         "large 512-row groups; 32 bounds transient host RAM without changing "
                         "the DataLoader batch size.")
+    p.add_argument("--parquet-memory-trim-every", type=int, default=4096,
+                   help="Parquet rows per worker between best-effort Arrow/libc memory "
+                        "release calls. 0 disables; default prevents long-run RSS growth.")
     p.add_argument("--hf-token", default=None, help="HF token, or 'true' for the logged-in token.")
     p.add_argument("--latent-mean", type=float, default=0.0)
     p.add_argument("--latent-std", type=float, default=1.0)
@@ -918,6 +929,7 @@ def main() -> None:
         download_max_retries=args.wds_download_max_retries,
         max_consecutive_skips=args.wds_max_consecutive_skips,
         parquet_read_batch_size=args.parquet_read_batch_size,
+        parquet_memory_trim_every=args.parquet_memory_trim_every,
     )
 
     callbacks: list[Callback] = [

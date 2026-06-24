@@ -9,6 +9,7 @@ import os
 import random
 import shlex
 import shutil
+import sys
 import tarfile
 import threading
 from collections import deque
@@ -173,6 +174,53 @@ def split_shuffle_buffer_for_worker(total_buffer: int, num_workers: int) -> int:
         return 0
     workers = max(1, int(num_workers))
     return max(1, (int(total_buffer) + workers - 1) // workers)
+
+
+def release_parquet_worker_memory() -> tuple[int, int]:
+    """Best-effort return of unused Arrow/libc pages from a long-lived worker.
+
+    Streaming workers repeatedly materialize large binary Parquet batches. Python
+    releases the objects, but Arrow's native pool and glibc may retain the freed pages
+    indefinitely. Return ``(arrow_bytes_before, arrow_bytes_after)`` for diagnostics.
+    """
+    import gc
+
+    gc.collect()
+    before = after = 0
+    try:
+        import pyarrow as pa
+
+        pool = pa.default_memory_pool()
+        before = int(pool.bytes_allocated())
+        pool.release_unused()
+        after = int(pool.bytes_allocated())
+    except Exception:
+        pass
+
+    # release_unused() only covers Arrow's allocator. np.load, Python bytes and
+    # torch.from_numpy conversions use libc; malloc_trim is Linux/glibc-specific.
+    if sys.platform.startswith("linux"):
+        try:
+            import ctypes
+
+            libc = ctypes.CDLL(None)
+            malloc_trim = getattr(libc, "malloc_trim", None)
+            if malloc_trim is not None:
+                malloc_trim.argtypes = [ctypes.c_size_t]
+                malloc_trim.restype = ctypes.c_int
+                malloc_trim(0)
+        except Exception:
+            pass
+    return before, after
+
+
+def _current_rss_mib() -> float | None:
+    """Current Linux RSS (not peak), for sparse worker trim diagnostics."""
+    try:
+        pages = int(Path("/proc/self/statm").read_text().split()[1])
+        return pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
+    except Exception:
+        return None
 
 
 @dataclass(frozen=True)
@@ -1332,6 +1380,10 @@ class ParquetStreamingLatentCacheDataset(IterableDataset[LatentRecord]):
     # its default (one whole row group) creates a large transient allocation in every
     # DataLoader worker. 32 rows are ~21 MiB while retaining sequential range reads.
     read_batch_size: int = 32
+    # Long-lived Arrow/Python workers can retain freed native pages. Periodically
+    # return unused pages to the OS; 4096 rows is infrequent enough to avoid turning
+    # allocator maintenance into a throughput bottleneck. 0 disables trimming.
+    memory_trim_every: int = 4096
     # Streaming read retries (datasets re-opens the range on a transient drop). This is
     # the parquet analog of the tar loader's shard retry — but per 128 MiB range, not
     # per whole 2 GB file, so recovery is far cheaper.
@@ -1342,6 +1394,8 @@ class ParquetStreamingLatentCacheDataset(IterableDataset[LatentRecord]):
             raise ValueError("Parquet shuffle_buffer must be >= 0.")
         if self.read_batch_size < 1:
             raise ValueError("Parquet read_batch_size must be >= 1.")
+        if self.memory_trim_every < 0:
+            raise ValueError("Parquet memory_trim_every must be >= 0.")
         # This loader is deliberately an HTTP Range reader. Set the transport before
         # importing/constructing HfFileSystem below; huggingface_hub snapshots these
         # environment flags at import time.
@@ -1446,7 +1500,8 @@ class ParquetStreamingLatentCacheDataset(IterableDataset[LatentRecord]):
         print(
             f"[parquet-wds worker {worker_id}/{num_workers}] "
             f"shuffle_buffer={worker_shuffle_buffer} (global={self.shuffle_buffer}) "
-            f"read_batch_size={self.read_batch_size} xet=disabled",
+            f"read_batch_size={self.read_batch_size} "
+            f"trim_every={self.memory_trim_every} xet=disabled",
             flush=True,
         )
         epoch = 0
@@ -1456,6 +1511,22 @@ class ParquetStreamingLatentCacheDataset(IterableDataset[LatentRecord]):
             for row in stream:
                 yield self._row_to_record(row)
                 n += 1
+                if self.memory_trim_every > 0 and n % self.memory_trim_every == 0:
+                    rss_before = _current_rss_mib()
+                    arrow_before, arrow_after = release_parquet_worker_memory()
+                    rss_after = _current_rss_mib()
+                    if worker_id == 0:
+                        rss_text = (
+                            f" rss={rss_before:.0f}->{rss_after:.0f}MiB"
+                            if rss_before is not None and rss_after is not None
+                            else ""
+                        )
+                        print(
+                            f"[parquet-wds worker 0] memory trim rows={n}{rss_text} "
+                            f"arrow_live={arrow_before / (1024**2):.0f}->"
+                            f"{arrow_after / (1024**2):.0f}MiB",
+                            flush=True,
+                        )
             if n == 0:
                 raise RuntimeError(
                     f"[parquet-wds] stream yielded 0 rows for {self.paths} "
@@ -1478,6 +1549,7 @@ __all__ = [
     "load_wds_cache_manifest",
     "resolve_wds_urls",
     "sample_to_record",
+    "release_parquet_worker_memory",
     "split_shuffle_buffer_for_worker",
     "split_urls_for_worker",
 ]
