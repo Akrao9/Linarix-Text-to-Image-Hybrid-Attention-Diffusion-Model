@@ -396,6 +396,9 @@ def test_fla_bidirectional_mixer_runs_forward_and_reverse_with_separate_layers()
     mixer.mixer_fwd = DummyCausalMixer()
     mixer.mixer_bwd = DummyCausalMixer()
     mixer.bidirectional = True
+    mixer.out_proj = torch.nn.Linear(2, 1, bias=False)
+    with torch.no_grad():
+        mixer.out_proj.weight.fill_(0.5)
 
     x = torch.arange(1, 5, dtype=torch.float32).reshape(1, 4, 1)
     out = mixer(x)

@@ -248,6 +248,7 @@ def make_wds_dataset(
     shard_shuffle: int = 0,
     download_max_retries: int = 2,
     max_consecutive_skips: int = 8,
+    parquet_read_batch_size: int = 32,
 ):
     """Parquet caches range-stream via `datasets` (faster + stall-resilient); remote
     hf:// tar caches use the parallel download-ahead prefetch window (thread-pool into
@@ -259,6 +260,7 @@ def make_wds_dataset(
             shuffle_buffer=shuffle_buffer,
             seed=seed,
             download_max_retries=download_max_retries,
+            read_batch_size=parquet_read_batch_size,
         )
     if is_remote_cache(cache_wds):
         return PrefetchingWdsLatentCacheDataset(
@@ -301,6 +303,7 @@ class BoomerData(pl.LightningDataModule):
         persistent_workers: bool | None = None,
         download_max_retries: int = 2,
         max_consecutive_skips: int = 8,
+        parquet_read_batch_size: int = 32,
     ) -> None:
         super().__init__()
         self.cache_wds = cache_wds
@@ -319,6 +322,7 @@ class BoomerData(pl.LightningDataModule):
         self.persistent_workers = persistent_workers
         self.download_max_retries = download_max_retries
         self.max_consecutive_skips = max_consecutive_skips
+        self.parquet_read_batch_size = parquet_read_batch_size
 
     def _dataset(self):
         return make_wds_dataset(
@@ -333,6 +337,7 @@ class BoomerData(pl.LightningDataModule):
             shard_shuffle=self.shard_shuffle,
             download_max_retries=self.download_max_retries,
             max_consecutive_skips=self.max_consecutive_skips,
+            parquet_read_batch_size=self.parquet_read_batch_size,
         )
 
     def train_dataloader(self) -> DataLoader:
@@ -346,6 +351,20 @@ class BoomerData(pl.LightningDataModule):
             workers = 0
         else:
             workers = self.num_workers
+
+        # DataLoader spawn workers inherit the environment present when iteration
+        # begins. Disable Xet HP *before* they start: HP owns a 16 GiB reconstruction
+        # buffer (64 GiB limit) per process, so multiplying it across Parquet workers
+        # can OOM the host. Default adaptive Xet remains enabled.
+        if parquet and workers > 1:
+            xet_hp = os.environ.get("HF_XET_HIGH_PERFORMANCE", "").strip().upper()
+            if xet_hp in {"1", "ON", "YES", "TRUE"}:
+                print(
+                    "[parquet-wds] disabling HF_XET_HIGH_PERFORMANCE for multi-worker "
+                    "streaming (default adaptive Xet remains enabled)",
+                    flush=True,
+                )
+                os.environ["HF_XET_HIGH_PERFORMANCE"] = "0"
         persistent = self.persistent_workers if self.persistent_workers is not None else workers > 0
         kwargs = {}
         if workers > 0:
@@ -673,6 +692,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Batches prefetched per worker when --num-workers > 0.")
     p.add_argument("--persistent-workers", action=bo, default=None,
                    help="Keep DataLoader workers alive between epochs. Default: on when --num-workers > 0.")
+    p.add_argument("--parquet-read-batch-size", type=int, default=32,
+                   help="Rows materialized by Arrow at once per Parquet worker. The cache has "
+                        "large 512-row groups; 32 bounds transient host RAM without changing "
+                        "the DataLoader batch size.")
     p.add_argument("--hf-token", default=None, help="HF token, or 'true' for the logged-in token.")
     p.add_argument("--latent-mean", type=float, default=0.0)
     p.add_argument("--latent-std", type=float, default=1.0)
@@ -894,6 +917,7 @@ def main() -> None:
         persistent_workers=args.persistent_workers,
         download_max_retries=args.wds_download_max_retries,
         max_consecutive_skips=args.wds_max_consecutive_skips,
+        parquet_read_batch_size=args.parquet_read_batch_size,
     )
 
     callbacks: list[Callback] = [

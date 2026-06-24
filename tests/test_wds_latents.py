@@ -8,6 +8,7 @@ import torch
 from boomer.datasets.wds_latents import (
     WdsCacheManifest,
     sample_to_record,
+    split_shuffle_buffer_for_worker,
     split_urls_for_worker,
 )
 from tools.cache_hf_wds_to_boomer_wds import npy_bytes, raw_bytes, storage_dtype_to_numpy
@@ -29,6 +30,13 @@ def test_split_urls_for_worker():
     assert split_urls_for_worker(urls, 1, 4) == ["shard-001.tar", "shard-005.tar"]
     assert split_urls_for_worker(urls, 3, 4) == ["shard-003.tar", "shard-007.tar"]
     assert split_urls_for_worker(urls, 0, 1) == urls
+
+
+def test_split_shuffle_buffer_for_worker_treats_value_as_global_budget():
+    assert split_shuffle_buffer_for_worker(2000, 1) == 2000
+    assert split_shuffle_buffer_for_worker(2000, 6) == 334
+    assert split_shuffle_buffer_for_worker(3, 6) == 1
+    assert split_shuffle_buffer_for_worker(0, 6) == 0
 
 
 def test_sample_to_record_npy_fp16():
@@ -73,7 +81,7 @@ def test_sample_to_record_npy_fp8_text():
         ),
         manifest=manifest,
     )
-    assert record.text_embedding.dtype == torch.float16
+    assert record.text_embedding.dtype == torch.bfloat16
     assert record.text_embedding.shape == (300, 1152)
 
 

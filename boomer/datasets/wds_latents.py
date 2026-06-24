@@ -167,6 +167,14 @@ def split_urls_for_worker(urls: list[str], worker_id: int, num_workers: int) -> 
     return urls[worker_id::num_workers]
 
 
+def split_shuffle_buffer_for_worker(total_buffer: int, num_workers: int) -> int:
+    """Return one worker's share of a global streaming-shuffle row budget."""
+    if total_buffer <= 0:
+        return 0
+    workers = max(1, int(num_workers))
+    return max(1, (int(total_buffer) + workers - 1) // workers)
+
+
 @dataclass(frozen=True)
 class HfWdsShardRef:
     repo_id: str
@@ -908,6 +916,10 @@ class RollingStreamingWdsLatentCacheDataset(IterableDataset[LatentRecord]):
     seed: int | None = None
 
     def __post_init__(self) -> None:
+        if self.shuffle_buffer < 0:
+            raise ValueError("Parquet shuffle_buffer must be >= 0.")
+        if self.read_batch_size < 1:
+            raise ValueError("Parquet read_batch_size must be >= 1.")
         if isinstance(self.paths, str):
             raw_paths = split_csv(self.paths)
         else:
@@ -1319,6 +1331,11 @@ class ParquetStreamingLatentCacheDataset(IterableDataset[LatentRecord]):
     shuffle_buffer: int = 2000
     seed: int = 0
     download_timeout: float = 30.0
+    # Bound the Arrow RecordBatch converted to Python objects at once. The cache's
+    # row groups contain 512 large rows (~330 MiB uncompressed); letting datasets use
+    # its default (one whole row group) creates a large transient allocation in every
+    # DataLoader worker. 32 rows are ~21 MiB while retaining sequential range reads.
+    read_batch_size: int = 32
     # Streaming read retries (datasets re-opens the range on a transient drop). This is
     # the parquet analog of the tar loader's shard retry — but per 128 MiB range, not
     # per whole 2 GB file, so recovery is far cheaper.
@@ -1366,7 +1383,7 @@ class ParquetStreamingLatentCacheDataset(IterableDataset[LatentRecord]):
             raise FileNotFoundError(f"No parquet shards found for: {self.paths}")
         return files
 
-    def _make_stream(self, epoch: int):
+    def _make_stream(self, epoch: int, *, shuffle_buffer: int):
         import datasets
         from datasets import load_dataset
 
@@ -1379,9 +1396,10 @@ class ParquetStreamingLatentCacheDataset(IterableDataset[LatentRecord]):
             split="train",
             streaming=True,
             token=self._token(),
+            batch_size=max(1, int(self.read_batch_size)),
         )
-        if self.shuffle_buffer and self.shuffle_buffer > 0:
-            ds = ds.shuffle(seed=self.seed + epoch, buffer_size=self.shuffle_buffer)
+        if shuffle_buffer > 0:
+            ds = ds.shuffle(seed=self.seed + epoch, buffer_size=shuffle_buffer)
         return ds
 
     def _row_to_record(self, row: dict[str, Any]) -> LatentRecord:
@@ -1401,9 +1419,35 @@ class ParquetStreamingLatentCacheDataset(IterableDataset[LatentRecord]):
         return sample_to_record(sample, manifest=self.manifest)
 
     def __iter__(self):
+        worker = get_worker_info()
+        num_workers = worker.num_workers if worker is not None else 1
+        worker_id = worker.id if worker is not None else 0
+
+        # `datasets.shuffle(buffer_size=N)` lives inside each worker. Treat the CLI
+        # value as one global memory budget instead of silently multiplying it by
+        # num_workers (six workers x 2,000 of these rows is several GiB of raw text).
+        worker_shuffle_buffer = split_shuffle_buffer_for_worker(
+            self.shuffle_buffer, num_workers
+        )
+
+        # Xet high-performance mode owns a 16 GiB reconstruction buffer with a 64 GiB
+        # limit. In a spawned DataLoader every worker creates an independent Xet
+        # client, so HP mode can exhaust even a 177 GiB host. Adaptive/default Xet is
+        # already parallel; disable only HP mode for a multi-worker Parquet stream.
+        xet_hp = os.environ.get("HF_XET_HIGH_PERFORMANCE", "").strip().upper()
+        if num_workers > 1 and xet_hp in {"1", "ON", "YES", "TRUE"}:
+            os.environ["HF_XET_HIGH_PERFORMANCE"] = "0"
+
+        print(
+            f"[parquet-wds worker {worker_id}/{num_workers}] "
+            f"shuffle_buffer={worker_shuffle_buffer} (global={self.shuffle_buffer}) "
+            f"read_batch_size={self.read_batch_size} xet_hp="
+            f"{os.environ.get('HF_XET_HIGH_PERFORMANCE', 'default')}",
+            flush=True,
+        )
         epoch = 0
         while True:  # IterableDataset: loop epochs forever; Trainer stops at max_steps
-            stream = self._make_stream(epoch)
+            stream = self._make_stream(epoch, shuffle_buffer=worker_shuffle_buffer)
             n = 0
             for row in stream:
                 yield self._row_to_record(row)
@@ -1430,5 +1474,6 @@ __all__ = [
     "load_wds_cache_manifest",
     "resolve_wds_urls",
     "sample_to_record",
+    "split_shuffle_buffer_for_worker",
     "split_urls_for_worker",
 ]
