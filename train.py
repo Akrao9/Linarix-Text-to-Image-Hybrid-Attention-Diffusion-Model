@@ -339,7 +339,8 @@ class BoomerData(pl.LightningDataModule):
         # The rolling remote TAR cache REQUIRES num_workers=0 (single-process shard
         # download). Parquet range-streaming and local globs use multiple workers
         # (datasets shards parquet files across workers automatically).
-        if is_parquet_cache(self.cache_wds):
+        parquet = is_parquet_cache(self.cache_wds)
+        if parquet:
             workers = self.num_workers
         elif is_remote_cache(self.cache_wds):
             workers = 0
@@ -351,6 +352,17 @@ class BoomerData(pl.LightningDataModule):
             # Each worker stages prefetch_factor batches ahead so the pinned-memory +
             # non_blocking H2D copy always has something ready, overlapping decode with compute.
             kwargs["prefetch_factor"] = self.prefetch_factor
+            if parquet:
+                # FORK-SAFETY: the parquet loader touches HF (HfFileSystem glob / datasets
+                # streaming) which leaves live fsspec/`requests` session + connection-pool
+                # locks in this process. Default fork() workers inherit that half-initialized
+                # state and DEADLOCK on their first range read (silent hang). `spawn` starts
+                # each worker as a fresh interpreter that builds its own HF session, so there
+                # is nothing poisoned to inherit. The dataset pickles cleanly (manifest dict +
+                # str globs + token), and env (HF_TOKEN) propagates to spawned children.
+                import multiprocessing as _mp
+
+                kwargs["multiprocessing_context"] = _mp.get_context("spawn")
         return DataLoader(
             self._dataset(),
             batch_size=self.batch_size,
