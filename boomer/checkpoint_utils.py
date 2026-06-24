@@ -559,7 +559,35 @@ def load_checkpoint(path: str | Path, map_location: str = "cpu") -> dict[str, An
     path = Path(path)
     if path.suffix == ".safetensors":
         return load_inference_checkpoint(path, map_location=map_location)
-    return load_torch_file(path, map_location=map_location)
+    checkpoint = load_torch_file(path, map_location=map_location)
+
+    # Lightning stores BoomerLit as `state_dict` with a `model.` prefix; a compiled
+    # module adds `_orig_mod.`. Normalize it to the older inference-checkpoint schema
+    # used by sample_latent_dit.py. EMACallback similarly writes `ema` directly.
+    if "model" not in checkpoint and isinstance(checkpoint.get("state_dict"), dict):
+        model_state: dict[str, torch.Tensor] = {}
+        for name, tensor in checkpoint["state_dict"].items():
+            if name.startswith("model._orig_mod."):
+                model_state[name.removeprefix("model._orig_mod.")] = tensor
+            elif name.startswith("model."):
+                model_state[name.removeprefix("model.")] = tensor
+        if model_state:
+            checkpoint["model"] = model_state
+
+    if "ema_model" not in checkpoint and isinstance(checkpoint.get("ema"), dict):
+        ema_state: dict[str, torch.Tensor] = {}
+        for name, tensor in checkpoint["ema"].items():
+            if name.startswith("_orig_mod."):
+                name = name.removeprefix("_orig_mod.")
+            ema_state[name] = tensor
+        if ema_state:
+            checkpoint["ema_model"] = ema_state
+
+    hp = checkpoint.get("hyper_parameters") or {}
+    checkpoint.setdefault("train_args", {k: v for k, v in hp.items() if k != "model_config"})
+    if not checkpoint.get("config") and isinstance(hp.get("model_config"), dict):
+        checkpoint["config"] = hp["model_config"]
+    return checkpoint
 
 
 def config_from_checkpoint(checkpoint: dict[str, Any]) -> Config:

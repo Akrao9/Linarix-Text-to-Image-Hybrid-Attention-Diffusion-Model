@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import gc
+import json
 import random
 import sys
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -22,6 +25,11 @@ from boomer.checkpoint_utils import (  # noqa: E402
 from boomer.datasets.latent_shards import load_latent_record  # noqa: E402
 from boomer.latent_norm import LatentStat, denormalize_latent, latent_stat_summary  # noqa: E402
 from boomer.models.factory import create_model  # noqa: E402
+from boomer.models.qwen_connector import (  # noqa: E402
+    QwenConnectorConfig,
+    QwenReferenceEncoder,
+    encode_qwen_text_fixed,
+)
 from boomer.sana_flow import make_inference_sigmas  # noqa: E402
 from boomer.sana_latent_cache import (  # noqa: E402
     CacheConfig,
@@ -212,9 +220,37 @@ def load_condition_from_prompt(args: argparse.Namespace, cache_config: CacheConf
     if not args.prompt:
         raise ValueError("Provide either --condition-cache or --prompt.")
     hf_token = hf_token_value(args.hf_token)
-    text_processor, text_encoder = load_text_encoder(cache_config, hf_token=hf_token)
-    text_embedding, attention_mask = encode_caption(text_processor, text_encoder, args.prompt, cache_config)
+    if "qwen" in cache_config.text_encoder_id.lower():
+        qwen_config = QwenConnectorConfig(
+            qwen_model_id=cache_config.text_encoder_id,
+            readout_layer=-1,
+            dtype=cache_config.dtype,
+            instruction=QwenConnectorConfig.instruction,
+            max_text_tokens=cache_config.max_length,
+            pad_to_max_length=True,
+        )
+        encoder = QwenReferenceEncoder(qwen_config, hf_token=hf_token)
+        encoder.load()
+        encoder.to(cache_config.device)
+        text_embedding, attention_mask = encode_qwen_text_fixed(
+            encoder, [args.prompt], cache_config.max_length
+        )
+        del encoder
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    else:
+        text_processor, text_encoder = load_text_encoder(cache_config, hf_token=hf_token)
+        text_embedding, attention_mask = encode_caption(text_processor, text_encoder, args.prompt, cache_config)
     return text_embedding.cpu(), attention_mask.cpu(), args.prompt
+
+
+def model_config_override(value: str | None) -> dict[str, Any] | None:
+    if not value:
+        return None
+    if value.startswith("@"):
+        return json.loads(Path(value[1:]).read_text(encoding="utf-8"))
+    return json.loads(value)
 
 
 def validate_condition_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -269,6 +305,11 @@ def main() -> None:
     parser.add_argument("--vae-id", default=CacheConfig.vae_id)
     parser.add_argument("--text-encoder-id", default=CacheConfig.text_encoder_id)
     parser.add_argument("--max-length", type=int, default=CacheConfig.max_length)
+    parser.add_argument(
+        "--model-config-json",
+        help="Model config JSON, or @path/to/config.json. Required for legacy Lightning "
+             "checkpoints that predate embedded model_config metadata.",
+    )
     parser.add_argument("--scaling-factor", type=float, default=CacheConfig.scaling_factor)
     parser.add_argument("--latent-mean", type=float, help="Override checkpoint latent normalization mean.")
     parser.add_argument("--latent-std", type=float, help="Override checkpoint latent normalization std.")
@@ -306,6 +347,12 @@ def main() -> None:
     )
 
     checkpoint = load_checkpoint(args.checkpoint)
+    if override := model_config_override(args.model_config_json):
+        checkpoint["config"] = override
+    if not checkpoint.get("config"):
+        parser.error(
+            "checkpoint has no embedded model config; pass --model-config-json @config.json"
+        )
     model_config = config_from_checkpoint(checkpoint)
     flow_shift, y_norm, y_norm_scale_factor = condition_settings_from_args(args, checkpoint)
     if args.y_norm is not None or args.y_norm_scale_factor is not None:
