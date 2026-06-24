@@ -433,7 +433,13 @@ class EMACallback(Callback):
             return
         sd = pl_module.model.state_dict()
         for key, ema_v in self.ema.items():
-            ema_v.mul_(self.decay).add_(sd[key].detach().float(), alpha=1.0 - self.decay)
+            target = sd[key].detach().float()
+            if ema_v.device != target.device:
+                # On resume the EMA shadow is restored on CPU while the live model is
+                # already on GPU; realign once (later steps are a cheap device compare).
+                ema_v = ema_v.to(target.device)
+                self.ema[key] = ema_v
+            ema_v.mul_(self.decay).add_(target, alpha=1.0 - self.decay)
 
     def on_save_checkpoint(self, trainer, pl_module, checkpoint) -> None:
         checkpoint["ema"] = self.ema
