@@ -230,6 +230,11 @@ class BoomerLit(pl.LightningModule):
             self.log("train/dispersive_loss", disp_loss, prog_bar=True, on_step=True, on_epoch=False, batch_size=bs)
             self.log("train/dispersive_w", disp_w, on_step=True, on_epoch=False, batch_size=bs)
             self.log("train/dispersive_term", disp_term, on_step=True, on_epoch=False, batch_size=bs)
+            # Debug: the actual batch dim the loss sees and the l2 floor (-log B). If
+            # dispersive_loss ever prints below dispersive_floor, B isn't what you think.
+            disp_bs = disp_feat.shape[0]
+            self.log("train/dispersive_bs", float(disp_bs), on_step=True, on_epoch=False, batch_size=bs)
+            self.log("train/dispersive_floor", -math.log(disp_bs), on_step=True, on_epoch=False, batch_size=bs)
 
         self.log("train/total_loss", loss, prog_bar=True, on_step=True, on_epoch=False, batch_size=bs)
         return loss
