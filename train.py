@@ -80,6 +80,36 @@ from boomer.sana_latent_cache import hf_token_value  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
+# Dispersive loss (https://arxiv.org/abs/2506.09027)
+# --------------------------------------------------------------------------- #
+def dispersive_loss(z: torch.Tensor, temperature: float, metric: str) -> torch.Tensor:
+    """InfoNCE-style dispersive regularizer (no positives, no external target).
+
+    Pushes the batch's per-sample features apart by minimizing the log-mean-exp of
+    pairwise similarity. `metric="l2"` uses negative squared distance as the score
+    (the paper's recommended default); `metric="cosine"` uses cosine similarity on
+    L2-normalized features. Diagonal pairs are included, matching the paper.
+    """
+    z = z.float()
+    batch = z.shape[0]
+    if batch < 2:
+        return z.new_zeros(())
+    if metric == "cosine":
+        z = F.normalize(z, dim=-1)
+        scores = (z @ z.t()) / temperature              # [B, B] similarity / tau
+    else:  # l2
+        # Squared distance via the gram identity ||a-b||^2 = |a|^2 + |b|^2 - 2 a.b:
+        # one matmul, no sqrt (cdist would sqrt then we'd square it back). Normalize
+        # by feature dim so tau is scale-stable across hidden sizes; otherwise high-dim
+        # distances underflow exp() and the gradient vanishes (regularizer does nothing).
+        sq_norm = z.pow(2).sum(dim=-1)                          # [B]
+        sq_dist = (sq_norm[:, None] + sq_norm[None, :] - 2.0 * (z @ z.t())).clamp_min(0.0)
+        scores = -sq_dist / (z.shape[-1] * temperature)         # [B, B]
+    # log( mean_{i,j} exp(scores) ) -- minimizing this disperses the features.
+    return torch.logsumexp(scores.reshape(-1), dim=0) - math.log(batch * batch)
+
+
+# --------------------------------------------------------------------------- #
 # LightningModule
 # --------------------------------------------------------------------------- #
 class BoomerLit(pl.LightningModule):
@@ -140,11 +170,24 @@ class BoomerLit(pl.LightningModule):
             and getattr(self.config, "repa_dim", 0) > 0
             and repa_target is not None
         )
-        if want_repa:
-            pred, repa_feat = self.model(x_t, t, text, mask, return_repa=True)
-        else:
-            pred = self.model(x_t, t, text, mask)
+        # Dispersive loss needs no external target, so it only depends on its weight.
+        want_disp = hp.dispersive_weight > 0.0
+        out = self.model(
+            x_t, t, text, mask,
+            return_repa=want_repa,
+            return_dispersive=want_disp,
+        )
+        if want_repa and want_disp:
+            pred, repa_feat, disp_feat = out
+        elif want_repa:
+            pred, repa_feat = out
+            disp_feat = None
+        elif want_disp:
+            pred, disp_feat = out
             repa_feat = None
+        else:
+            pred = out
+            repa_feat = disp_feat = None
 
         per_sample = (pred.float() - target.float()).pow(2).mean(dim=(1, 2, 3))
         if hp.timestep_weight:
@@ -174,6 +217,19 @@ class BoomerLit(pl.LightningModule):
             loss = flow_loss + repa_w * repa_loss
             self.log("train/repa_loss", repa_loss, prog_bar=True, on_step=True, on_epoch=False, batch_size=bs)
             self.log("train/repa_w", repa_w, on_step=True, on_epoch=False, batch_size=bs)
+
+        if disp_feat is not None:
+            disp_loss = dispersive_loss(disp_feat, hp.dispersive_temp, hp.dispersive_metric)
+            disp_w = hp.dispersive_weight
+            if hp.dispersive_anneal_steps > 0:
+                disp_w *= max(0.0, 1.0 - self.global_step / hp.dispersive_anneal_steps)
+            disp_term = disp_w * disp_loss          # actual contribution to total loss
+            loss = loss + disp_term
+            # raw dispersive_loss is negative by construction; dispersive_term is the
+            # signed amount actually added to total_loss (clearer to read on W&B).
+            self.log("train/dispersive_loss", disp_loss, prog_bar=True, on_step=True, on_epoch=False, batch_size=bs)
+            self.log("train/dispersive_w", disp_w, on_step=True, on_epoch=False, batch_size=bs)
+            self.log("train/dispersive_term", disp_term, on_step=True, on_epoch=False, batch_size=bs)
 
         self.log("train/total_loss", loss, prog_bar=True, on_step=True, on_epoch=False, batch_size=bs)
         return loss
@@ -672,6 +728,7 @@ def build_config(args: argparse.Namespace, record: Any) -> BoomerFLADiTConfig:
         gradient_checkpointing=args.gradient_checkpointing,
         repa_dim=args.repa_dim,
         repa_layer=args.repa_layer,
+        dispersive_layer=args.dispersive_layer,
     )
 
 
@@ -774,6 +831,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--repa-layer", type=int, default=-1, help="DiT block to align; -1 => depth//2")
     p.add_argument("--repa-weight", type=float, default=0.0, help="REPA loss weight (e.g. 0.5)")
     p.add_argument("--repa-anneal-steps", type=int, default=0, help="decay REPA weight to 0 by this step")
+
+    # Dispersive loss (arxiv 2506.09027): target-free batch-dispersion regularizer.
+    # Works on the existing cache (no dino needed). 0 weight = off.
+    p.add_argument("--dispersive-weight", type=float, default=0.0,
+                   help="Dispersive loss weight (e.g. 0.25–0.5). 0=off.")
+    p.add_argument("--dispersive-layer", type=int, default=-1,
+                   help="DiT block whose pooled hidden state to disperse; -1 => depth//2.")
+    p.add_argument("--dispersive-temp", type=float, default=0.5,
+                   help="Temperature tau in the InfoNCE-style dispersive loss.")
+    p.add_argument("--dispersive-metric", default="l2", choices=["l2", "cosine"],
+                   help="Pairwise score: 'l2' (neg squared distance, paper default) or 'cosine'.")
+    p.add_argument("--dispersive-anneal-steps", type=int, default=0,
+                   help="decay dispersive weight to 0 by this step (0 = constant).")
 
     # optim / flow
     p.add_argument("--batch-size", type=int, default=64)
@@ -912,6 +982,10 @@ def main() -> None:
         latent_std=args.latent_std,
         repa_weight=args.repa_weight,
         repa_anneal_steps=args.repa_anneal_steps,
+        dispersive_weight=args.dispersive_weight,
+        dispersive_temp=args.dispersive_temp,
+        dispersive_metric=args.dispersive_metric,
+        dispersive_anneal_steps=args.dispersive_anneal_steps,
         compile=args.compile,
         compile_mode=args.compile_mode,
     )

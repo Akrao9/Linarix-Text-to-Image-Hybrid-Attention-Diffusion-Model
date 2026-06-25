@@ -57,6 +57,11 @@ class BoomerFLADiTConfig:
     # can align it to an external SSL target (monet's DINOv2 ViT-G/14 CLS = 1536). 0 = off.
     repa_dim: int = 0
     repa_layer: int = -1  # block whose output to align; -1 => depth // 2
+    # Dispersive loss (https://arxiv.org/abs/2506.09027): a parameter-free regularizer
+    # that pushes a mid-depth block's pooled hidden state apart across the batch. Needs
+    # no external target (unlike REPA), so it works on the existing cache. The loss weight
+    # is a training hyperparameter; this only selects which block's features to expose.
+    dispersive_layer: int = -1  # block whose hidden state to disperse; -1 => depth // 2
 
 
 def maybe_add_sibling_fla_repo() -> None:
@@ -1062,6 +1067,10 @@ class BoomerFLADiT(nn.Module):
         # REPA: pooled mid-depth feature -> SSL embedding space. 3-layer MLP head per the
         # REPA paper; only built (and only run) when repa_dim > 0 and return_repa is set.
         self.repa_layer = config.repa_layer if config.repa_layer >= 0 else config.depth // 2
+        # Dispersive loss: no projector (parameter-free); only the capture layer is needed.
+        self.dispersive_layer = (
+            config.dispersive_layer if config.dispersive_layer >= 0 else config.depth // 2
+        )
         self.repa_proj = (
             nn.Sequential(
                 nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6),
@@ -1162,7 +1171,8 @@ class BoomerFLADiT(nn.Module):
         attention_mask: torch.Tensor,
         cond_input: torch.Tensor | None = None,
         return_repa: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
+        return_dispersive: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         batch, channels, height, width = noisy_latent.shape
         if channels != self.config.latent_channels:
             raise ValueError(
@@ -1227,7 +1237,9 @@ class BoomerFLADiT(nn.Module):
         t_emb = self.t_embedder(timesteps)
         use_ckpt = self.config.gradient_checkpointing and self.training
         want_repa = return_repa and self.repa_proj is not None
+        want_dispersive = return_dispersive
         repa_feat: torch.Tensor | None = None
+        dispersive_feat: torch.Tensor | None = None
         for layer_idx, block in enumerate(self.blocks):
             if getattr(block, "updates_text", False):
                 # Dual-stream block: returns (x, text_tokens).
@@ -1270,6 +1282,10 @@ class BoomerFLADiT(nn.Module):
             if want_repa and layer_idx == self.repa_layer:
                 # Pool image tokens -> project to the SSL space for alignment.
                 repa_feat = self.repa_proj(x.mean(dim=1))
+            if want_dispersive and layer_idx == self.dispersive_layer:
+                # Pool image tokens -> per-sample feature; dispersion is computed in the
+                # loss. No projector: the regularizer acts on the raw hidden state.
+                dispersive_feat = x.mean(dim=1)
         final_mod = self.final_t_block(t_emb)
         shift, scale = final_mod.reshape(batch, 2, -1).chunk(2, dim=1)
         x = modulate(self.final_norm(x), shift, scale)
@@ -1281,6 +1297,15 @@ class BoomerFLADiT(nn.Module):
             x = x.reshape(batch, token_height, token_width, channels, patch, patch)
             x = x.permute(0, 3, 1, 4, 2, 5).contiguous()
             out = x.reshape(batch, channels, height, width)
+        # Return contract (kept backward-compatible for existing callers):
+        #   return_repa only            -> (out, repa_feat)
+        #   return_dispersive only      -> (out, dispersive_feat)
+        #   both                        -> (out, repa_feat, dispersive_feat)
+        #   neither                     -> out
+        if return_repa and return_dispersive:
+            return out, repa_feat, dispersive_feat
         if return_repa:
             return out, repa_feat
+        if return_dispersive:
+            return out, dispersive_feat
         return out
