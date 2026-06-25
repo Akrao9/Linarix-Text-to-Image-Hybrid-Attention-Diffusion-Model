@@ -1028,6 +1028,105 @@ class AsyncHubUploader:
         self._executor.shutdown(wait=True)
 
 
+class ParquetShardWriter:
+    """Drop-in stand-in for ``wds.ShardWriter`` that writes one Parquet shard per
+    ``maxcount``/``maxsize`` window (one row per sample), matching the
+    range-streamable cache format consumed by ``ParquetStreamingLatentCacheDataset``.
+
+    Array members (``latents.npy``/``text.npy``/``text_mask.npy``[/``dino.npy``]) are
+    stored as their ``.npy`` bytes in binary columns — byte-identical to the tar
+    members, self-describing dtype/shape, decoded with ``np.load(BytesIO(col))``.
+    ``caption.txt`` becomes a utf-8 string column and ``meta.json`` a JSON-string
+    column (this tool emits both as bytes, so they are decoded here). ``post(path)``
+    fires per finished shard so ``AsyncHubUploader`` batches upload/delete exactly
+    as for tar. ``maxsize`` is the UNCOMPRESSED binary-payload budget; the on-disk
+    Parquet file is usually a touch smaller after compression.
+    """
+
+    _MEMBER_TO_COLUMN = {
+        "latents.npy": "latents",
+        "text.npy": "text",
+        "text_mask.npy": "text_mask",
+        "dino.npy": "dino",
+    }
+
+    def __init__(
+        self, pattern: str, *, maxcount: int, maxsize: int, start_shard: int = 0,
+        post: Any = None, row_group_size: int = 512, compression: str = "zstd",
+    ) -> None:
+        self.pattern = pattern
+        self.maxcount = max(1, maxcount)
+        self.maxsize = max(1, maxsize)
+        self.shard = start_shard
+        self.post = post
+        self.row_group_size = max(1, row_group_size)
+        self.compression = compression
+        self._reset()
+
+    def _reset(self) -> None:
+        self._cols: dict[str, list] = {}
+        self._schema_cols: list[str] | None = None
+        self._count = 0
+        self._bytes = 0
+
+    @staticmethod
+    def _as_text(value: Any) -> str:
+        if isinstance(value, (bytes, bytearray)):
+            return value.decode("utf-8")
+        if isinstance(value, str):
+            return value
+        return json.dumps(value, separators=(",", ":"))
+
+    def write(self, sample: dict[str, Any]) -> None:
+        rec: dict[str, Any] = {
+            "__key__": str(sample["__key__"]),
+            "latents": sample["latents.npy"],
+            "text": sample["text.npy"],
+            "text_mask": sample["text_mask.npy"],
+            "caption": self._as_text(sample.get("caption.txt", "")),
+            "meta": self._as_text(sample.get("meta.json", "{}")),
+        }
+        if "dino.npy" in sample:
+            rec["dino"] = sample["dino.npy"]
+        # Fix the column set from the first row; keep every shard rectangular even if a
+        # later/earlier row is missing an optional member (e.g. dino) by padding nulls.
+        if self._schema_cols is None:
+            self._schema_cols = list(rec.keys())
+            self._cols = {c: [] for c in self._schema_cols}
+        for c in self._schema_cols:
+            self._cols[c].append(rec.get(c))
+        for c in rec:
+            if c not in self._cols:  # a new optional column appeared mid-shard: backfill
+                self._cols[c] = [None] * self._count + [rec[c]]
+                self._schema_cols.append(c)
+        self._count += 1
+        self._bytes += sum(len(sample[m]) for m in self._MEMBER_TO_COLUMN if m in sample)
+        if self._count >= self.maxcount or self._bytes >= self.maxsize:
+            self.flush()
+
+    def flush(self) -> None:
+        if self._count == 0:
+            return
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        path = self.pattern % self.shard
+        table = pa.table(self._cols)
+        pq.write_table(
+            table, path,
+            row_group_size=min(self.row_group_size, self._count),
+            compression=self.compression,
+            use_dictionary=False,  # unique binary blobs: dictionary encoding only bloats
+        )
+        if self.post is not None:
+            self.post(path)
+        self.shard += 1
+        self._reset()
+
+    def close(self) -> None:
+        self.flush()
+
+
 class UploadingShardWriter:
     def __init__(
         self,
@@ -1039,22 +1138,38 @@ class UploadingShardWriter:
         uploader: AsyncHubUploader,
         rank_tag: str = "",
         on_shard_close: Callable[[str], None] | None = None,
+        output_format: str = "wds",
+        maxcount: int = 10_000_000,
+        row_group_size: int = 512,
+        compression: str = "zstd",
     ) -> None:
-        import webdataset as wds
-
         self.output_dir = Path(output_dir)
         self.split = split
         self.uploader = uploader
         self.on_shard_close = on_shard_close
         self.closed_paths: list[Path] = []
         suffix = f"-{rank_tag}" if rank_tag else ""
-        pattern = str(self.output_dir / f"{split}{suffix}-%06d.tar")
-        self._writer = wds.ShardWriter(
-            pattern,
-            maxsize=maxsize,
-            start_shard=start_shard,
-            post=self._on_close,
-        )
+        if output_format == "parquet":
+            pattern = str(self.output_dir / f"{split}{suffix}-%06d.parquet")
+            self._writer: Any = ParquetShardWriter(
+                pattern,
+                maxcount=maxcount,
+                maxsize=maxsize,
+                start_shard=start_shard,
+                post=self._on_close,
+                row_group_size=row_group_size,
+                compression=compression,
+            )
+        else:
+            import webdataset as wds
+
+            pattern = str(self.output_dir / f"{split}{suffix}-%06d.tar")
+            self._writer = wds.ShardWriter(
+                pattern,
+                maxsize=maxsize,
+                start_shard=start_shard,
+                post=self._on_close,
+            )
 
     def _on_close(self, path: str) -> None:
         closed = Path(path)
@@ -1065,10 +1180,14 @@ class UploadingShardWriter:
             self.on_shard_close(path)
 
     def __enter__(self):
-        return self._writer.__enter__()
+        return self
+
+    def write(self, sample: dict[str, Any]) -> None:
+        self._writer.write(sample)
 
     def __exit__(self, exc_type, exc, tb):
-        return self._writer.__exit__(exc_type, exc, tb)
+        self._writer.close()
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1272,6 +1391,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=True,
         help="Write raw bytes instead of .npy. Smaller files and faster writes; disable with --no-raw-tensors.",
     )
+    parser.add_argument(
+        "--output-format",
+        choices=["wds", "parquet"],
+        default="wds",
+        help="Shard container. 'parquet' writes range-streamable Parquet shards "
+             "(consumed by ParquetStreamingLatentCacheDataset) instead of WebDataset "
+             "tar; forces .npy member encoding (overrides --raw-tensors).",
+    )
+    parser.add_argument(
+        "--parquet-row-group-size", type=int, default=512,
+        help="Rows per Parquet row group (the range-read unit). 512 ~ the streaming sweet spot.",
+    )
+    parser.add_argument(
+        "--parquet-compression", default="zstd",
+        help="Parquet compression codec (zstd/snappy/none). Only used with --output-format parquet.",
+    )
+    parser.add_argument(
+        "--parquet-max-count", type=int, default=10_000_000,
+        help="Hard row cap per Parquet shard; shards normally roll on --shard-size-gb first.",
+    )
     parser.add_argument("--world-size", type=int, default=None)
     parser.add_argument("--rank", type=int, default=None)
     parser.add_argument(
@@ -1337,6 +1476,11 @@ def save_resume(path: Path, state: dict[str, int]) -> None:
 
 def main() -> None:  # noqa: C901 — single-file script, complexity is fine.
     args = build_arg_parser().parse_args()
+    if args.output_format == "parquet" and args.raw_tensors:
+        # Parquet stores arrays as self-describing .npy bytes; raw .bin has no header,
+        # and both np.load (loader) and ParquetShardWriter's column map require .npy.
+        print("[cache] --output-format parquet: forcing --no-raw-tensors (.npy member encoding)")
+        args.raw_tensors = False
     if args.max_samples <= 0:
         raise ValueError("--max-samples must be positive.")
     if args.batch_size <= 0 or args.image_encode_batch <= 0 or args.text_encode_batch <= 0:
@@ -2072,6 +2216,10 @@ def main() -> None:  # noqa: C901 — single-file script, complexity is fine.
             uploader=uploader,
             rank_tag=rank_tag,
             on_shard_close=on_output_shard_closed,
+            output_format=args.output_format,
+            maxcount=args.parquet_max_count,
+            row_group_size=args.parquet_row_group_size,
+            compression=args.parquet_compression,
         ) as sink:
             while True:
                 source_started = time.time()
@@ -2177,6 +2325,10 @@ def main() -> None:  # noqa: C901 — single-file script, complexity is fine.
         "channels_last": args.channels_last,
         "raw_tensors": args.raw_tensors,
         "shard_size_gb": args.shard_size_gb,
+        "output_format": args.output_format,
+        "column_encoding": "npy_bytes" if args.output_format == "parquet" else None,
+        "parquet_row_group_size": args.parquet_row_group_size if args.output_format == "parquet" else None,
+        "parquet_compression": args.parquet_compression if args.output_format == "parquet" else None,
         "schema": (
             ["latents.bin", "text.bin", "text_mask.bin", "caption.txt", "meta.json"]
             if args.raw_tensors
