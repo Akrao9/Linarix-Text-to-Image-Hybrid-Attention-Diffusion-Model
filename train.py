@@ -201,6 +201,12 @@ class BoomerLit(pl.LightningModule):
         bs = x0.shape[0]
         loss = flow_loss
         self.log("train/flow_loss", flow_loss, prog_bar=True, on_step=True, on_epoch=False, batch_size=bs)
+        # Training-health canaries: scheduled LR (warmup/decay visibility) and the mean
+        # sampled sigma (confirms the timestep sampler + the polish-phase switch).
+        sched = self.lr_schedulers()
+        if sched is not None:
+            self.log("train/lr", sched.get_last_lr()[0], on_step=True, on_epoch=False, batch_size=bs)
+        self.log("train/sigma_mean", t.float().mean(), on_step=True, on_epoch=False, batch_size=bs)
         if hp.t_sampler_final:
             self.log("train/t_polish", float(polish), on_step=True, on_epoch=False, batch_size=bs)
 
@@ -217,6 +223,9 @@ class BoomerLit(pl.LightningModule):
             loss = flow_loss + repa_w * repa_loss
             self.log("train/repa_loss", repa_loss, prog_bar=True, on_step=True, on_epoch=False, batch_size=bs)
             self.log("train/repa_w", repa_w, on_step=True, on_epoch=False, batch_size=bs)
+            self.log("train/repa_cos", cos.mean(), on_step=True, on_epoch=False, batch_size=bs)
+            self.log("train/repa_feat_norm", repa_feat.float().norm(dim=-1).mean(),
+                     on_step=True, on_epoch=False, batch_size=bs)
 
         if disp_feat is not None:
             disp_loss = dispersive_loss(disp_feat, hp.dispersive_temp, hp.dispersive_metric)
@@ -235,6 +244,10 @@ class BoomerLit(pl.LightningModule):
             disp_bs = disp_feat.shape[0]
             self.log("train/dispersive_bs", float(disp_bs), on_step=True, on_epoch=False, batch_size=bs)
             self.log("train/dispersive_floor", -math.log(disp_bs), on_step=True, on_epoch=False, batch_size=bs)
+            # Mean pooled-feature norm: with the l2 metric the paper attributes its gains
+            # partly to growing representation norms, so watch this trend upward.
+            self.log("train/dispersive_feat_norm", disp_feat.float().norm(dim=-1).mean(),
+                     on_step=True, on_epoch=False, batch_size=bs)
 
         self.log("train/total_loss", loss, prog_bar=True, on_step=True, on_epoch=False, batch_size=bs)
         return loss
@@ -276,7 +289,10 @@ class BoomerLit(pl.LightningModule):
         # unscales internally). Under bf16-mixed there is no grad scaler, so a manual
         # norm-clip on the raw grads is correct and lets us keep fused AdamW.
         if gradient_clip_val and gradient_clip_val > 0:
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), float(gradient_clip_val))
+            # clip_grad_norm_ returns the total norm BEFORE clipping -- log it so you can
+            # see grad-norm spikes and how often clipping is active (norm > clip_val).
+            total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), float(gradient_clip_val))
+            self.log("train/grad_norm", total_norm, on_step=True, on_epoch=False, prog_bar=True)
 
     def transfer_batch_to_device(self, batch, device, dataloader_idx):
         # Explicit non_blocking H2D copies. The DataLoader pins memory (pin_memory=True),
