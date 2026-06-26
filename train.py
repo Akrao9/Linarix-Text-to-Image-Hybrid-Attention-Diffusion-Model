@@ -104,6 +104,10 @@ def dispersive_loss(z: torch.Tensor, temperature: float, metric: str) -> torch.T
         # distances underflow exp() and the gradient vanishes (regularizer does nothing).
         sq_norm = z.pow(2).sum(dim=-1)                          # [B]
         sq_dist = (sq_norm[:, None] + sq_norm[None, :] - 2.0 * (z @ z.t())).clamp_min(0.0)
+        # Self-distance is exactly 0 by definition. The gram matmul runs under bf16
+        # autocast, so its diagonal is imprecise and grows with |z|^2 -- left alone it
+        # drags the loss below the true -log(B) floor once feature norms get large.
+        sq_dist.fill_diagonal_(0.0)
         scores = -sq_dist / (z.shape[-1] * temperature)         # [B, B]
     # log( mean_{i,j} exp(scores) ) -- minimizing this disperses the features.
     return torch.logsumexp(scores.reshape(-1), dim=0) - math.log(batch * batch)
