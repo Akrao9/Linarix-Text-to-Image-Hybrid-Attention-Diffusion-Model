@@ -941,6 +941,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--wandb-entity", default=None, help="Optional W&B entity/team.")
     p.add_argument("--wandb-mode", choices=["online", "offline", "disabled"], default="online",
                    help="W&B mode. Use offline on air-gapped machines and sync later.")
+    p.add_argument("--wandb-run-id", default=None,
+                   help="Stable W&B run id for resuming the SAME run across sessions. "
+                        "Defaults to the WANDB_RUN_ID env var. The run name is just a "
+                        "display label and is not a stable key -- set this to resume.")
     p.add_argument("--resume-weights-only", action="store_true",
                    help="With --resume, load model weights only; reset optimizer/scheduler/step.")
     p.add_argument("--compile", action="store_true",
@@ -1074,9 +1078,15 @@ def main() -> None:
 
     logger: Any = True
     if args.wandb:
+        # A stable `id` (not the display `name`) is what lets W&B resume the same run
+        # across Colab sessions. Without it, Lightning's WandbLogger mints a fresh random
+        # id every launch, so each relaunch becomes a NEW run even with the same name.
+        run_id = args.wandb_run_id or os.environ.get("WANDB_RUN_ID")
         logger = WandbLogger(
             project=args.wandb_project,
             name=args.wandb_run_name,
+            id=run_id,
+            resume="allow" if run_id else None,
             entity=args.wandb_entity,
             mode=args.wandb_mode,
             save_dir=args.checkpoint_dir,
