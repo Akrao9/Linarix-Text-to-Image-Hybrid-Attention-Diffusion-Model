@@ -162,6 +162,8 @@ class BoomerLit(pl.LightningModule):
             logit_std=hp.logit_std,
             plateau_low=hp.plateau_low,
             plateau_high=hp.plateau_high,
+            stretch_q_low=hp.stretch_q_low,
+            stretch_q_high=hp.stretch_q_high,
         )
         x_t, _ = noise_latent_at_sigma(x0, t, noise=noise)
         target = noise - x0
@@ -194,9 +196,11 @@ class BoomerLit(pl.LightningModule):
             repa_feat = disp_feat = None
 
         per_sample = (pred.float() - target.float()).pow(2).mean(dim=(1, 2, 3))
+        # Exactly one per-timestep reweighting (mutual exclusion enforced at startup in
+        # main()); timestep_weight takes precedence if both ever slip through.
         if hp.timestep_weight:
             per_sample = per_sample * flow_training_loss_weight(t, target).mean(dim=(1, 2, 3))
-        if hp.min_snr_gamma > 0.0:
+        elif hp.min_snr_gamma > 0.0:
             per_sample = per_sample * flow_min_snr_loss_weight(t, target, hp.min_snr_gamma).mean(dim=(1, 2, 3))
         flow_loss = per_sample.mean()
 
@@ -890,12 +894,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--accumulate", type=int, default=1)
     p.add_argument("--cond-dropout", type=float, default=0.1)
     p.add_argument("--t-sampler", default="plateau-logit-normal",
-                   choices=["uniform", "high", "low", "logit-normal", "bounded-logit-normal", "plateau-logit-normal"])
+                   choices=["uniform", "high", "low", "logit-normal", "bounded-logit-normal",
+                            "stretched-logit-normal", "plateau-logit-normal"])
     # "Texture polish" final phase: from --t-sampler-final-step onward, switch the timestep
     # sampler (e.g. to uniform), shifting compute to the low-noise t~0 regime to sharpen
     # textures/edges. Off unless --t-sampler-final is set.
     p.add_argument("--t-sampler-final", default=None,
-                   choices=["uniform", "high", "low", "logit-normal", "bounded-logit-normal", "plateau-logit-normal"],
+                   choices=["uniform", "high", "low", "logit-normal", "bounded-logit-normal",
+                            "stretched-logit-normal", "plateau-logit-normal"],
                    help="Sampler to switch to for the final polish phase (e.g. uniform).")
     p.add_argument("--t-sampler-final-step", type=int, default=80000,
                    help="global_step at which to switch to --t-sampler-final.")
@@ -905,6 +911,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--logit-std", type=float, default=1.0)
     p.add_argument("--plateau-low", type=float, default=0.0)
     p.add_argument("--plateau-high", type=float, default=1.0)
+    # SANA stretched-logit-normal quantile window (normal CDF space). Truncates the
+    # logit-normal to [q-low, q-high] quantiles and stretches the central band back to
+    # [0,1] — flattens the peaked logit-normal toward uniform (wider sigma coverage).
+    # Narrower window => flatter; 0/1 == plain logit-normal (no truncation).
+    p.add_argument("--stretch-q-low", type=float, default=0.0)
+    p.add_argument("--stretch-q-high", type=float, default=1.0)
     p.add_argument("--timestep-weight", action="store_true")
     p.add_argument("--min-snr-gamma", type=float, default=5.0)
 
@@ -963,6 +975,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    # `--timestep-weight` (Sana sqrt(1+sigma^2)/sigma, upweights detail) and
+    # `--min-snr-gamma` (downweights detail) are *alternative* per-timestep loss
+    # reweightings, not composable — stacking them multiplies into a product no one
+    # designed. Refuse both at once rather than silently compounding.
+    if args.timestep_weight and args.min_snr_gamma > 0.0:
+        raise SystemExit(
+            "Use only one per-timestep loss weighting: --timestep-weight "
+            "(Sana sqrt(1+sigma^2)/sigma) OR --min-snr-gamma, not both."
+        )
     pl.seed_everything(args.seed, workers=True)
     torch.set_float32_matmul_precision("high")
 
@@ -1005,6 +1026,8 @@ def main() -> None:
         logit_std=args.logit_std,
         plateau_low=args.plateau_low,
         plateau_high=args.plateau_high,
+        stretch_q_low=args.stretch_q_low,
+        stretch_q_high=args.stretch_q_high,
         timestep_weight=args.timestep_weight,
         min_snr_gamma=args.min_snr_gamma,
         latent_mean=args.latent_mean,

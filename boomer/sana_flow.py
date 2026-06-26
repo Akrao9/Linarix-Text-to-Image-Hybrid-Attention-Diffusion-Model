@@ -68,6 +68,51 @@ def _sample_plateau_logit_normal(
     return torch.where(branch, plateau, left).to(dtype=dtype)
 
 
+def _sample_stretched_logit_normal(
+    batch_size: int,
+    *,
+    device: torch.device | str,
+    dtype: torch.dtype,
+    mu: float,
+    sigma: float,
+    q_low: float,
+    q_high: float,
+) -> torch.Tensor:
+    """SANA `stretched_logit_normal`: logit-normal truncated to a quantile window,
+    then renormalized back to full [0, 1].
+
+    Cuts the extreme tails beyond the [q_low, q_high] normal quantiles *in z-space*
+    via exact inverse-CDF truncation, then stretches the surviving central band so
+    its edges land on 0 and 1. Net effect: flattens the peaked logit-normal toward
+    uniform — wider sigma coverage (higher variance, more mass pushed off 0.5 toward
+    the boundaries) while staying smooth, a tunable interpolation between peaked
+    logit-normal (q=0/1) and near-uniform (narrow window). Unlike
+    `bounded-logit-normal`, which affine-squeezes the whole curve into a sub-range,
+    this keeps the full [0, 1] span. q_low=0, q_high=1 reduces exactly to plain
+    logit-normal. Mirrors NVlabs/Sana diffusion/model/respace.py:stretched_logit_normal.
+    """
+    calc_dtype = torch.float32 if dtype in {torch.float16, torch.bfloat16} else dtype
+    mu_t = torch.tensor(float(mu), device=device, dtype=calc_dtype)
+    sigma_t = torch.tensor(float(sigma), device=device, dtype=calc_dtype)
+    # Quantile window edges in z-space (clamp away from +/-inf at q=0/1).
+    q_lo = torch.tensor(min(max(float(q_low), 1e-6), 1.0 - 1e-6), device=device, dtype=calc_dtype)
+    q_hi = torch.tensor(min(max(float(q_high), 1e-6), 1.0 - 1e-6), device=device, dtype=calc_dtype)
+    z_lo = mu_t + sigma_t * _standard_normal_icdf(q_lo)
+    z_hi = mu_t + sigma_t * _standard_normal_icdf(q_hi)
+    # Exact inverse-CDF sampling of N(mu, sigma^2) truncated to [z_lo, z_hi].
+    phi_a = _standard_normal_cdf((z_lo - mu_t) / sigma_t)
+    phi_b = _standard_normal_cdf((z_hi - mu_t) / sigma_t)
+    r = torch.rand(batch_size, device=device, dtype=calc_dtype)
+    q = (phi_a + r * (phi_b - phi_a)).clamp(1e-6, 1.0 - 1e-6)
+    z = mu_t + sigma_t * _standard_normal_icdf(q)
+    # Map to sigma-space and stretch [u_lo, u_hi] -> [0, 1].
+    u_raw = torch.sigmoid(z)
+    u_lo = torch.sigmoid(z_lo)
+    u_hi = torch.sigmoid(z_hi)
+    u = (u_raw - u_lo) / (u_hi - u_lo).clamp_min(1e-12)
+    return u.clamp(0.0, 1.0).to(dtype=dtype)
+
+
 def shift_sigma(sigma: torch.Tensor, shift: float = 1.0) -> torch.Tensor:
     """Apply Sana/FlowMatch sigma shift."""
     if shift <= 0.0:
@@ -98,6 +143,8 @@ def sample_flow_sigmas(
     logit_std: float = 1.0,
     plateau_low: float = 0.1,
     plateau_high: float = 0.9,
+    stretch_q_low: float = 0.0,
+    stretch_q_high: float = 1.0,
 ) -> torch.Tensor:
     """Sample flow noise levels in [0, 1] (already flow-shifted)."""
     if bias <= 0.0:
@@ -106,6 +153,8 @@ def sample_flow_sigmas(
         raise ValueError(f"logit std must be positive, got {logit_std}")
     if not 0.0 <= plateau_low < plateau_high <= 1.0:
         raise ValueError(f"plateau bounds must satisfy 0 <= low < high <= 1, got {plateau_low}, {plateau_high}")
+    if not 0.0 <= stretch_q_low < stretch_q_high <= 1.0:
+        raise ValueError(f"stretch quantiles must satisfy 0 <= low < high <= 1, got {stretch_q_low}, {stretch_q_high}")
     uniform = torch.rand(batch_size, device=device, dtype=dtype)
     if sampler == "uniform":
         sigma = uniform
@@ -120,6 +169,16 @@ def sample_flow_sigmas(
         logits = torch.randn(batch_size, device=device, dtype=dtype) * logit_std + logit_mean
         sigma = torch.sigmoid(logits)
         sigma = plateau_low + (plateau_high - plateau_low) * sigma
+    elif sampler == "stretched-logit-normal":
+        sigma = _sample_stretched_logit_normal(
+            batch_size,
+            device=device,
+            dtype=dtype,
+            mu=logit_mean,
+            sigma=logit_std,
+            q_low=stretch_q_low,
+            q_high=stretch_q_high,
+        )
     elif sampler == "plateau-logit-normal":
         sigma = _sample_plateau_logit_normal(
             batch_size,
