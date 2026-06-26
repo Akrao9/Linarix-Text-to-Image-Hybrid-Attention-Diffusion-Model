@@ -1346,6 +1346,33 @@ class PrefetchingWdsLatentCacheDataset(IterableDataset[LatentRecord]):
             thread.join(timeout=5.0)
 
 
+def _is_transient_stream_error(exc: BaseException) -> bool:
+    """True for streaming/network errors worth a reconnect, not real data/code bugs.
+
+    Covers the huggingface_hub/httpx "client has been closed" RuntimeError that killed
+    long runs, plus connection drops/resets and range-read timeouts. Decode errors,
+    KeyErrors, the empty-shard guard, etc. are NOT transient and must surface.
+    """
+    if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+        return True
+    msg = str(exc).lower()
+    markers = (
+        "client has been closed",      # httpx client closed mid-stream (the 65k crash)
+        "cannot send a request",
+        "connection",
+        "timed out",
+        "timeout",
+        "reset by peer",
+        "remotedisconnected",
+        "incompleteread",
+        "read error",
+        "broken pipe",
+        "temporarily unavailable",
+        "502", "503", "504",
+    )
+    return any(m in msg for m in markers)
+
+
 @dataclass
 class ParquetStreamingLatentCacheDataset(IterableDataset[LatentRecord]):
     """Stream Boomer's *Parquet* latent/text cache from HF via `datasets
@@ -1388,6 +1415,15 @@ class ParquetStreamingLatentCacheDataset(IterableDataset[LatentRecord]):
     # the parquet analog of the tar loader's shard retry — but per 128 MiB range, not
     # per whole 2 GB file, so recovery is far cheaper.
     download_max_retries: int = 5
+    # Stream-level reconnect, one level up from datasets' per-range retry above. When the
+    # underlying httpx client dies (e.g. "client has been closed" after a dropped socket
+    # over a long run), datasets' read-retry can't recover because it reuses the dead
+    # client. So on a transient streaming error we rebuild the WHOLE datasets stream — a
+    # fresh HfFileSystem + HTTP client — and continue, instead of letting the worker
+    # abort and take down training. Bounded so a *persistent* failure (deleted repo,
+    # auth, truly empty shards) still raises; the counter resets after any successful row.
+    stream_reconnect_max_retries: int = 20
+    stream_reconnect_backoff: float = 5.0
 
     def __post_init__(self) -> None:
         if self.shuffle_buffer < 0:
@@ -1504,11 +1540,48 @@ class ParquetStreamingLatentCacheDataset(IterableDataset[LatentRecord]):
             f"trim_every={self.memory_trim_every} xet=disabled",
             flush=True,
         )
-        epoch = 0
+        import time
+
+        # build_no (not an epoch counter) seeds each (re)build's shuffle so every rebuild
+        # reshuffles; with no reconnects it advances 0,1,2,... exactly like the old epoch
+        # seed. reconnects counts CONSECUTIVE transient failures and resets on any
+        # successful row, so only a sustained outage trips the budget.
+        build_no = 0
+        reconnects = 0
         while True:  # IterableDataset: loop epochs forever; Trainer stops at max_steps
-            stream = self._make_stream(epoch, shuffle_buffer=worker_shuffle_buffer)
+            stream = self._make_stream(build_no, shuffle_buffer=worker_shuffle_buffer)
+            build_no += 1
             n = 0
-            for row in stream:
+            completed = False
+            stream_iter = iter(stream)
+            while True:
+                try:
+                    row = next(stream_iter)
+                except StopIteration:
+                    completed = True
+                    break
+                except Exception as exc:  # noqa: BLE001 - classify transient vs fatal
+                    if not _is_transient_stream_error(exc):
+                        raise
+                    reconnects += 1
+                    if reconnects > self.stream_reconnect_max_retries:
+                        raise RuntimeError(
+                            f"[parquet-wds] streaming failed {reconnects} times in a row "
+                            f"without progress for {self.paths}; giving up. "
+                            f"Last error: {exc!r}"
+                        ) from exc
+                    delay = min(self.stream_reconnect_backoff * 2.0 ** (reconnects - 1), 60.0)
+                    print(
+                        f"[parquet-wds worker {worker_id}] transient stream error "
+                        f"({type(exc).__name__}: {exc}); rebuilding stream "
+                        f"(retry {reconnects}/{self.stream_reconnect_max_retries}) "
+                        f"after {delay:.0f}s",
+                        flush=True,
+                    )
+                    time.sleep(delay)
+                    break  # leave inner loop -> rebuild a fresh stream + HTTP client
+                # A successful read clears the consecutive-failure budget.
+                reconnects = 0
                 yield self._row_to_record(row)
                 n += 1
                 if self.memory_trim_every > 0 and n % self.memory_trim_every == 0:
@@ -1527,12 +1600,13 @@ class ParquetStreamingLatentCacheDataset(IterableDataset[LatentRecord]):
                             f"{arrow_after / (1024**2):.0f}MiB",
                             flush=True,
                         )
-            if n == 0:
+            # Only a cleanly-completed pass can trip the empty-shard guard; a
+            # reconnect-break just rebuilds without falsely flagging "empty".
+            if completed and n == 0:
                 raise RuntimeError(
                     f"[parquet-wds] stream yielded 0 rows for {self.paths} "
                     "(empty/unreadable shards?) — refusing to spin an empty epoch loop."
                 )
-            epoch += 1
 
 
 __all__ = [
