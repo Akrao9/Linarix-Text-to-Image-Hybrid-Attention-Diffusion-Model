@@ -76,7 +76,15 @@ from boomer.sana_flow import (  # noqa: E402
     noise_latent_at_sigma,
     sample_flow_sigmas,
 )
-from boomer.sana_latent_cache import hf_token_value  # noqa: E402
+from boomer.latent_norm import denormalize_latent  # noqa: E402
+from boomer.sampling import sample_latent  # noqa: E402
+from boomer.sana_latent_cache import (  # noqa: E402
+    CacheConfig,
+    decode_image_latent,
+    hf_token_value,
+    load_vae,
+    tensor_to_image,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -535,6 +543,185 @@ class EMACallback(Callback):
 
 
 # --------------------------------------------------------------------------- #
+# In-training sample previews -> W&B
+# --------------------------------------------------------------------------- #
+class SamplePreviewCallback(Callback):
+    """Every N optimizer steps, sample a fixed set of prompts and log the images to W&B.
+
+    Designed to add ~zero steady-state VRAM and never disturb training:
+      * Reuses the resident DiT — no second model copy.
+      * Samples on the UNCOMPILED module (``model._orig_mod``), so torch.compile's
+        training graph is never re-traced for the inference shapes.
+      * Text is PRE-encoded (see tools/encode_prompts.py), so Qwen is never loaded
+        here; only the small DC-AE decoder is touched, and it's parked on CPU between
+        previews and moved to GPU just for the decode.
+      * Optionally swaps in EMA weights for the preview, then restores the live weights
+        (backup kept on CPU to avoid a GPU spike).
+      * The whole preview is wrapped in try/except: a preview failure (e.g. a transient
+        OOM) logs a warning and training continues — a preview must never kill a run.
+    """
+
+    def __init__(
+        self,
+        *,
+        every_n_steps: int,
+        prompts_cache: str,
+        ema_callback: "EMACallback | None",
+        use_ema: bool,
+        steps: int,
+        sampler: str,
+        stork_substeps: int,
+        cfg_scale: float,
+        cfg_rescale: float,
+        cfg_interval: tuple[float, float],
+        flow_shift: float,
+        latent_mean: float,
+        latent_std: float,
+        seed: int,
+        dtype: str,
+        vae_id: str,
+        scaling_factor: float,
+        max_length: int,
+        hf_token: str | bool | None,
+    ) -> None:
+        self.every_n_steps = every_n_steps
+        self.prompts_cache = prompts_cache
+        self.ema_callback = ema_callback
+        self.use_ema = use_ema
+        self.steps = steps
+        self.sampler = sampler
+        self.stork_substeps = stork_substeps
+        self.cfg_scale = cfg_scale
+        self.cfg_rescale = cfg_rescale
+        self.cfg_interval = cfg_interval
+        self.flow_shift = flow_shift
+        self.latent_mean = latent_mean
+        self.latent_std = latent_std
+        self.seed = seed
+        self.dtype = dtype
+        self.hf_token = hf_token
+        self._enabled = False
+        self._prompts: list[str] = []
+        self._text_embeddings: torch.Tensor | None = None
+        self._attention_masks: torch.Tensor | None = None
+        self._vae = None
+        self._cache_config = CacheConfig(
+            vae_id=vae_id,
+            max_length=max_length,
+            dtype=dtype,
+            device="cuda",
+            scaling_factor=scaling_factor,
+        )
+
+    def on_fit_start(self, trainer, pl_module) -> None:
+        if trainer.global_rank != 0:
+            return
+        if not isinstance(trainer.logger, WandbLogger):
+            print("[sample-preview] no WandbLogger; previews disabled.", flush=True)
+            return
+        path = Path(self.prompts_cache)
+        if not path.is_file():
+            print(f"[sample-preview] prompts cache not found ({path}); previews disabled. "
+                  f"Run tools/encode_prompts.py --out {path} first.", flush=True)
+            return
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        self._prompts = list(payload["prompts"])
+        self._text_embeddings = payload["text_embeddings"]
+        self._attention_masks = payload["attention_masks"]
+        self._enabled = True
+        print(f"[sample-preview] {len(self._prompts)} prompts, every {self.every_n_steps} steps "
+              f"({'EMA' if self.use_ema else 'live'} weights, {self.sampler}, {self.steps} steps).",
+              flush=True)
+
+    @staticmethod
+    def _strip_compile_prefix(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        prefix = "_orig_mod."
+        return {(k[len(prefix):] if k.startswith(prefix) else k): v for k, v in state.items()}
+
+    @torch.no_grad()
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:
+        if not self._enabled:
+            return
+        step = trainer.global_step
+        if step == 0 or step % self.every_n_steps != 0:
+            return
+        try:
+            self._run_preview(trainer, pl_module, step)
+        except Exception as exc:  # noqa: BLE001 - a preview must never kill training
+            print(f"[sample-preview] step {step} failed ({type(exc).__name__}: {exc}); "
+                  "skipping and continuing training.", flush=True)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def _run_preview(self, trainer, pl_module, step: int) -> None:
+        import wandb
+
+        device = str(pl_module.device)
+        device_type = "cuda" if "cuda" in device else "cpu"
+        amp_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[self.dtype]
+        # Sample on the eager module so torch.compile's training graph isn't re-traced.
+        eager = getattr(pl_module.model, "_orig_mod", pl_module.model)
+        was_training = eager.training
+        eager.eval()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # Optionally swap in EMA weights (backup the live weights on CPU to avoid a spike).
+        backup = None
+        if self.use_ema and self.ema_callback is not None and self.ema_callback.ema:
+            backup = {k: v.detach().to("cpu", copy=True) for k, v in eager.state_dict().items()}
+            eager.load_state_dict(self._strip_compile_prefix(self.ema_callback.ema), strict=False)
+
+        try:
+            self._ensure_vae(device)
+            images, captions = [], []
+            for i, prompt in enumerate(self._prompts):
+                text_embedding = self._text_embeddings[i : i + 1]
+                attention_mask = self._attention_masks[i : i + 1]
+                with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=self.dtype != "fp32"):
+                    latent = sample_latent(
+                        eager,
+                        text_embedding,
+                        attention_mask,
+                        steps=self.steps,
+                        seed=self.seed,
+                        dtype=torch.float32,
+                        device=device,
+                        cfg_scale=self.cfg_scale,
+                        cfg_rescale=self.cfg_rescale,
+                        sampler=self.sampler,
+                        flow_shift=self.flow_shift,
+                        stork_substeps=self.stork_substeps,
+                        cfg_interval=self.cfg_interval,
+                    )
+                latent = denormalize_latent(latent.float(), self.latent_mean, self.latent_std)
+                decoded = decode_image_latent(self._vae, latent, self._cache_config)
+                images.append(wandb.Image(tensor_to_image(decoded), caption=prompt))
+                captions.append(prompt)
+            trainer.logger.experiment.log({"samples": images, "trainer/global_step": step})
+            print(f"[sample-preview] logged {len(images)} images at step {step}.", flush=True)
+        finally:
+            if backup is not None:
+                eager.load_state_dict(backup, strict=False)
+                del backup
+            if was_training:
+                eager.train()
+            self._park_vae()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def _ensure_vae(self, device: str) -> None:
+        if self._vae is None:
+            self._vae = load_vae(self._cache_config, hf_token=self.hf_token)
+        self._vae = self._vae.to(device)
+
+    def _park_vae(self) -> None:
+        # Keep the decoder on CPU between previews so it costs ~0 steady-state GPU memory.
+        if self._vae is not None:
+            self._vae = self._vae.to("cpu")
+
+
+# --------------------------------------------------------------------------- #
 # Async checkpoint upload (local -> Google Drive / rclone, in the background)
 # --------------------------------------------------------------------------- #
 class CheckpointUploadCallback(Callback):
@@ -961,6 +1148,23 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Stable W&B run id for resuming the SAME run across sessions. "
                         "Defaults to the WANDB_RUN_ID env var. The run name is just a "
                         "display label and is not a stable key -- set this to resume.")
+    # In-training sample previews -> W&B. Pre-encode prompts with tools/encode_prompts.py.
+    p.add_argument("--sample-every-steps", type=int, default=0,
+                   help="Sample the eval prompts every N optimizer steps and log to W&B. 0 disables.")
+    p.add_argument("--sample-prompts-cache", default="prompts_cond.pt",
+                   help="Path to the .pt produced by tools/encode_prompts.py (embeddings + masks).")
+    p.add_argument("--sample-weights", choices=["ema", "live"], default="ema",
+                   help="Which weights the preview samples: EMA shadow (default) or live training weights.")
+    p.add_argument("--sample-steps", type=int, default=32, help="Inference steps per preview image.")
+    p.add_argument("--sample-sampler", choices=["stork2", "stork4", "euler", "heun"], default="stork2")
+    p.add_argument("--sample-stork-substeps", type=int, default=5)
+    p.add_argument("--sample-cfg-scale", type=float, default=4.0)
+    p.add_argument("--sample-cfg-rescale", type=float, default=0.5)
+    p.add_argument("--sample-cfg-interval-low", type=float, default=0.1)
+    p.add_argument("--sample-cfg-interval-high", type=float, default=0.9)
+    p.add_argument("--sample-seed", type=int, default=0, help="Fixed seed so previews are comparable across steps.")
+    p.add_argument("--sample-vae-id", default=CacheConfig.vae_id, help="DC-AE decoder id for previews.")
+    p.add_argument("--sample-scaling-factor", type=float, default=CacheConfig.scaling_factor)
     p.add_argument("--resume-weights-only", action="store_true",
                    help="With --resume, load model weights only; reset optimizer/scheduler/step.")
     p.add_argument("--compile", action="store_true",
@@ -1085,8 +1289,32 @@ def main() -> None:
         # progress bar to the same cadence as metric logging instead of every step.
         TQDMProgressBar(refresh_rate=max(1, args.log_every_steps)),
     ]
+    ema_cb = None
     if args.ema_decay > 0.0:
-        callbacks.append(EMACallback(decay=args.ema_decay, update_every=args.ema_update_every))
+        ema_cb = EMACallback(decay=args.ema_decay, update_every=args.ema_update_every)
+        callbacks.append(ema_cb)
+    if args.sample_every_steps > 0:
+        callbacks.append(SamplePreviewCallback(
+            every_n_steps=args.sample_every_steps,
+            prompts_cache=args.sample_prompts_cache,
+            ema_callback=ema_cb,
+            use_ema=args.sample_weights == "ema",
+            steps=args.sample_steps,
+            sampler=args.sample_sampler,
+            stork_substeps=args.sample_stork_substeps,
+            cfg_scale=args.sample_cfg_scale,
+            cfg_rescale=args.sample_cfg_rescale,
+            cfg_interval=(args.sample_cfg_interval_low, args.sample_cfg_interval_high),
+            flow_shift=args.flow_shift,
+            latent_mean=args.latent_mean,
+            latent_std=args.latent_std,
+            seed=args.sample_seed,
+            dtype=args.dtype or "bf16",
+            vae_id=args.sample_vae_id,
+            scaling_factor=args.sample_scaling_factor,
+            max_length=args.text_seq_len,
+            hf_token=hf_token,
+        ))
     # Appended AFTER ModelCheckpoint so a checkpoint written this step already exists on
     # disk when this callback's hook runs and enqueues it for async upload.
     if args.checkpoint_upload_remote:
