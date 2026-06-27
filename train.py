@@ -17,7 +17,7 @@ Example (from scratch, 701M GDN-2 on the PD12M Qwen cache):
       --wds-local-dir /content/_wds_cache --wds-rolling-shards 2 --wds-shuffle-buffer 2000 \
       --hidden-dim 896 --depth 24 --num-heads 14 --mlp-ratio 2.5 \
       --mixer-type fla_gdn2 --fla-bidirectional --use-short-conv \
-      --image-attn-every 6 --cross-attn-qk-norm --extra-input-channels 33 \
+      --image-attn-every 6 --image-attn-qk-rmsnorm --cross-attn-qk-rmsnorm --extra-input-channels 33 \
       --batch-size 64 --lr 1e-4 --cond-dropout 0.1 \
       --t-sampler plateau-logit-normal --flow-shift 1.5 --min-snr-gamma 5 \
       --ema-decay 0.9999 --max-steps 100000 \
@@ -931,6 +931,7 @@ def build_config(args: argparse.Namespace, record: Any) -> BoomerFLADiTConfig:
         conv_size=args.conv_size,
         image_attention_every=args.image_attn_every,
         image_attention_backend=args.image_attn_backend,
+        image_attention_qk_rmsnorm=args.image_attn_qk_rmsnorm,
         image_attention_rope=args.image_rope,
         image_rope_theta=args.image_rope_theta,
         cross_attention_backend=args.cross_attn_backend,
@@ -1022,13 +1023,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--image-attn-every", type=int, default=6)
     p.add_argument("--image-attn-backend", default="sdpa",
                    choices=["sdpa", "flash2", "flash3", "flash4", "auto"])
+    p.add_argument("--image-attn-qk-rmsnorm", "--image-attn-qk-norm", dest="image_attn_qk_rmsnorm",
+                   action=bo, default=True,
+                   help="Sana-style per-head Q/K RMSNorm inside full image self-attention.")
     p.add_argument("--image-rope", action=bo, default=False,
                    help="Apply 2D RoPE to full image self-attention anchor blocks.")
     p.add_argument("--image-rope-theta", type=float, default=10000.0,
                    help="RoPE frequency base for --image-rope.")
     p.add_argument("--cross-attn-backend", default="sdpa", choices=["sdpa", "xformers", "auto", "mha"])
-    p.add_argument("--cross-attn-qk-norm", action=bo, default=True,
-                   help="Sana-style q/k RMSNorm inside text cross-attention.")
+    p.add_argument("--cross-attn-qk-rmsnorm", "--cross-attn-qk-norm", dest="cross_attn_qk_norm",
+                   action=bo, default=True,
+                   help="Sana-style Q/K RMSNorm inside text cross-attention.")
     p.add_argument("--parallel-block", action=bo, default=False,
                    help="FLUX/SD3-style parallel residual branches inside blocks.")
     p.add_argument("--dual-stream-depth", type=int, default=0)

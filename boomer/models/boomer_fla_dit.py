@@ -42,9 +42,12 @@ class BoomerFLADiTConfig:
     conv_size: int = 4
     image_attention_every: int = 0
     image_attention_backend: str = "sdpa"
+    image_attention_qk_rmsnorm: bool = True
     image_attention_rope: bool = False
     image_rope_theta: float = 10000.0
     cross_attention_backend: str = "sdpa"
+    # Kept as "qk_norm" for backward compatibility with older checkpoints/configs.
+    # The implementation is Q/K RMSNorm, matching Sana-style attention stabilization.
     cross_attention_qk_norm: bool = True
     parallel_block: bool = False
     dual_stream_depth: int = 0
@@ -321,6 +324,7 @@ class FullImageSelfAttention(nn.Module):
         num_heads: int,
         *,
         backend: str = "sdpa",
+        qk_rmsnorm: bool = True,
         grid_size: int | None = None,
         rope: bool = False,
         rope_theta: float = 10000.0,
@@ -337,6 +341,8 @@ class FullImageSelfAttention(nn.Module):
         self.head_dim = hidden_dim // num_heads
         self.backend = backend
         self.qkv = nn.Linear(hidden_dim, hidden_dim * 3)
+        self.q_norm = AttentionRMSNorm(self.head_dim, scale_factor=1.0, eps=1e-6) if qk_rmsnorm else nn.Identity()
+        self.k_norm = AttentionRMSNorm(self.head_dim, scale_factor=1.0, eps=1e-6) if qk_rmsnorm else nn.Identity()
         self.out_proj = nn.Linear(hidden_dim, hidden_dim)
         nn.init.zeros_(self.out_proj.weight)
         nn.init.zeros_(self.out_proj.bias)
@@ -460,6 +466,9 @@ class FullImageSelfAttention(nn.Module):
         batch, tokens, channels = x.shape
         qkv = self.qkv(x).reshape(batch, tokens, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)
+        # Sana-style Q/K RMSNorm caps attention-logit growth in full image attention.
+        q = self.q_norm(q)
+        k = self.k_norm(k)
         if self.rope is not None:
             q, k = self.rope(q, k)
 
@@ -511,7 +520,7 @@ class SanaMultiHeadCrossAttention(nn.Module):
         num_heads: int,
         *,
         backend: str = "sdpa",
-        qk_norm: bool = True,
+        qk_rmsnorm: bool = True,
     ) -> None:
         super().__init__()
         if hidden_dim % num_heads != 0:
@@ -524,8 +533,8 @@ class SanaMultiHeadCrossAttention(nn.Module):
         self.backend = backend
         self.q_linear = nn.Linear(hidden_dim, hidden_dim)
         self.kv_linear = nn.Linear(hidden_dim, hidden_dim * 2)
-        self.q_norm = AttentionRMSNorm(hidden_dim, scale_factor=1.0, eps=1e-6) if qk_norm else nn.Identity()
-        self.k_norm = AttentionRMSNorm(hidden_dim, scale_factor=1.0, eps=1e-6) if qk_norm else nn.Identity()
+        self.q_norm = AttentionRMSNorm(hidden_dim, scale_factor=1.0, eps=1e-6) if qk_rmsnorm else nn.Identity()
+        self.k_norm = AttentionRMSNorm(hidden_dim, scale_factor=1.0, eps=1e-6) if qk_rmsnorm else nn.Identity()
         self.proj = nn.Linear(hidden_dim, hidden_dim)
         # adaLN-Zero style: cross-attn starts as a no-op so Gemma text cannot spike GDN states early.
         nn.init.zeros_(self.proj.weight)
@@ -739,6 +748,7 @@ class BoomerFLABlock(nn.Module):
                 hidden_dim,
                 config.num_heads,
                 backend=config.image_attention_backend,
+                qk_rmsnorm=config.image_attention_qk_rmsnorm,
                 grid_size=config.latent_size // config.patch_size,
                 rope=config.image_attention_rope,
                 rope_theta=config.image_rope_theta,
@@ -757,7 +767,7 @@ class BoomerFLABlock(nn.Module):
                 hidden_dim,
                 config.num_heads,
                 backend=cross_backend,
-                qk_norm=config.cross_attention_qk_norm,
+                qk_rmsnorm=config.cross_attention_qk_norm,
             )
         self.mod = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 9))
         self.norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
