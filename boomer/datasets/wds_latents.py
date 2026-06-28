@@ -1549,7 +1549,31 @@ class ParquetStreamingLatentCacheDataset(IterableDataset[LatentRecord]):
         build_no = 0
         reconnects = 0
         while True:  # IterableDataset: loop epochs forever; Trainer stops at max_steps
-            stream = self._make_stream(build_no, shuffle_buffer=worker_shuffle_buffer)
+            # The (re)build itself hits the network: _list_files globs the HF tree API and
+            # load_dataset opens the first shard, so a transient 5xx/timeout here is just as
+            # recoverable as a mid-stream read error. Retry it on the SAME consecutive-failure
+            # budget instead of letting it kill the worker (HF's tree API 504s intermittently).
+            try:
+                stream = self._make_stream(build_no, shuffle_buffer=worker_shuffle_buffer)
+            except Exception as exc:  # noqa: BLE001 - classify transient vs fatal
+                if not _is_transient_stream_error(exc):
+                    raise
+                reconnects += 1
+                if reconnects > self.stream_reconnect_max_retries:
+                    raise RuntimeError(
+                        f"[parquet-wds] stream build failed {reconnects} times in a row "
+                        f"for {self.paths}; giving up. Last error: {exc!r}"
+                    ) from exc
+                delay = min(self.stream_reconnect_backoff * 2.0 ** (reconnects - 1), 60.0)
+                print(
+                    f"[parquet-wds worker {worker_id}] transient build error "
+                    f"({type(exc).__name__}: {exc}); retrying stream build "
+                    f"(retry {reconnects}/{self.stream_reconnect_max_retries}) "
+                    f"after {delay:.0f}s",
+                    flush=True,
+                )
+                time.sleep(delay)
+                continue
             build_no += 1
             n = 0
             completed = False
