@@ -153,6 +153,24 @@ image.save("out.png")
 Requires: `torch diffusers transformers accelerate safetensors` and
 `flash-linear-attention` (`pip install git+https://github.com/fla-org/flash-linear-attention.git`).
 The STORK scheduler is bundled (Tan et al. 2025, arXiv:2505.24210).
+
+## Samples
+
+![{model_name} samples](showcase.png)
+
+All {config['latent_size'] * 32}px, EMA weights, STORK-2 / 32 steps, `cfg_scale=3.5`, `cfg_rescale=0.5`. Prompts (left→right, top→bottom):
+
+1. a misty pine forest at dawn, sunbeams through the trees
+2. a calm lake reflecting autumn mountains, golden hour
+3. a lavender field under a dramatic stormy sky
+4. a lighthouse on a rocky cliff above crashing waves
+5. a close-up portrait of a young woman, natural window light
+6. an old craftsman working at a wooden workbench, warm lamplight
+7. a red fox standing in fresh snow, looking at the camera
+8. a pair of swans on a still pond at sunrise
+9. a steam locomotive crossing a stone bridge
+10. a quiet cobblestone street in an old European town, evening
+11. a rustic bowl of strawberries on a linen cloth
 """
     (out_dir / "README.md").write_text(card)
 
