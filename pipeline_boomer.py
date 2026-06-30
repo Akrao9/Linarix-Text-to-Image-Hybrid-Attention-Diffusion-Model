@@ -229,6 +229,13 @@ class BoomerPipeline(DiffusionPipeline):
         self._hf_token       = None
         self._snapshot_dir   = getattr(transformer, "_snapshot_dir", None)
         self.last_run_stats  = BoomerRunStats()
+        # VAE memory savers. Slicing decodes one image at a time so batched-decode peak
+        # memory stays flat (diffusers best practice: ~free for batches, no single-image
+        # cost). Stored as flags because the VAE is lazy-loaded in _ensure_vae — they are
+        # (re)applied there, so enable_vae_slicing/tiling work whether called before or
+        # after the VAE exists. Slicing defaults on since this pipeline supports batching.
+        self._vae_slicing = True
+        self._vae_tiling  = False
 
     # ── lazy component loading ─────────────────────────────────────────────────
     def _ensure_vae(self):
@@ -240,6 +247,8 @@ class BoomerPipeline(DiffusionPipeline):
         self.vae = AutoencoderDC.from_pretrained(
             self._vae_repo, torch_dtype=dtype, token=self._hf_token,
         ).to(self._execution_device).eval()
+        # Apply any savers requested before the VAE existed (default: slicing on).
+        self._apply_vae_memory_savers()
 
     def _ensure_text_encoder(self):
         if self.text_encoder is not None:
@@ -261,6 +270,45 @@ class BoomerPipeline(DiffusionPipeline):
         self.text_encoder = (te.get_decoder() if hasattr(te, "get_decoder") else te).to(
             self._execution_device
         ).eval()
+
+    # ── VAE memory savers (deferred to the lazily-loaded VAE) ──────────────────
+    def _apply_vae_memory_savers(self) -> None:
+        """Apply the requested slicing/tiling flags to the VAE if it is loaded.
+
+        No-op when the VAE is still None; _ensure_vae() calls this after loading, so
+        enable_vae_slicing()/enable_vae_tiling() take effect even when called before the
+        VAE exists (the diffusers-stock methods touch self.vae directly and silently
+        no-op — or crash — when it is None).
+        """
+        if self.vae is None:
+            return
+        slicing = "enable_slicing" if self._vae_slicing else "disable_slicing"
+        tiling = "enable_tiling" if self._vae_tiling else "disable_tiling"
+        for name in (slicing, tiling):
+            fn = getattr(self.vae, name, None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception as exc:  # noqa: BLE001 - saver is best-effort
+                    logger.warning(f"VAE {name}() unavailable: {exc!r}")
+
+    def enable_vae_slicing(self) -> None:
+        """Decode one image at a time so batched-decode peak memory stays flat."""
+        self._vae_slicing = True
+        self._apply_vae_memory_savers()
+
+    def disable_vae_slicing(self) -> None:
+        self._vae_slicing = False
+        self._apply_vae_memory_savers()
+
+    def enable_vae_tiling(self) -> None:
+        """Decode each image in overlapping tiles — for very large images / low VRAM."""
+        self._vae_tiling = True
+        self._apply_vae_memory_savers()
+
+    def disable_vae_tiling(self) -> None:
+        self._vae_tiling = False
+        self._apply_vae_memory_savers()
 
     # ── from_pretrained override (direct BoomerPipeline.from_pretrained calls) ─
     @classmethod
@@ -299,7 +347,7 @@ class BoomerPipeline(DiffusionPipeline):
         prompt: Union[str, List[str]],
         steps: int = 32,
         seed: int | None = None,
-        cfg_scale: float = 4.5,
+        cfg_scale: float = 4.0,
         cfg_rescale: float = 0.5,
         substeps: int = 5,
         offload_text_encoder: bool = True,
@@ -311,7 +359,7 @@ class BoomerPipeline(DiffusionPipeline):
         prompt       : str or list[str]
         steps        : denoising steps (32 recommended with STORK-2)
         seed         : random seed — None (default) picks a random seed each call
-        cfg_scale    : classifier-free guidance scale (4.0–5.0)
+        cfg_scale    : classifier-free guidance scale (4.0 recommended)
         cfg_rescale  : CFG variance rescale (0.5 recommended)
         substeps     : STORK-2 internal RK micro-steps
         offload_text_encoder : unload text encoder after encoding to free VRAM
