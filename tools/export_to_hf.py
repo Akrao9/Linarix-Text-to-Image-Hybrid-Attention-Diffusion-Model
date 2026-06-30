@@ -241,10 +241,24 @@ def main() -> None:
     # ── copy code + scheduler + card ──
     for fname in ("pipeline_boomer.py", "modeling_boomer_fla.py"):
         shutil.copy2(REPO_ROOT / fname, out_dir / fname)
+    # diffusers loads the `transformer` component (declared in model_index.json) by
+    # resolving its class relative to the transformer/ subfolder under trust_remote_code,
+    # so the modeling file MUST also live there — matching the working akrao9/Boomer-T2I
+    # layout. The root copy is for pipeline_boomer.py's sibling import in its override path.
+    shutil.copy2(REPO_ROOT / "modeling_boomer_fla.py", tf_dir / "modeling_boomer_fla.py")
     _copy_stork(out_dir, Path(args.stork_dir) if args.stork_dir else None)
+    try:
+        import diffusers
+        diffusers_version = diffusers.__version__
+    except Exception:
+        diffusers_version = "0.33.0"
+    # Declaring the transformer component is what lets the documented one-liner
+    # DiffusionPipeline.from_pretrained(custom_pipeline="pipeline_boomer", trust_remote_code=True)
+    # work — without it diffusers loads 0 components and raises "expected ['transformer']".
     (out_dir / "model_index.json").write_text(json.dumps({
         "_class_name": "BoomerPipeline",
-        "custom_pipeline": "pipeline_boomer",
+        "_diffusers_version": diffusers_version,
+        "transformer": ["modeling_boomer_fla", "BoomerFLADiT"],
     }, indent=2))
     _write_model_card(out_dir, args.model_name, args.repo_id, config)
     print(f"[done] repo assembled at {out_dir}")
