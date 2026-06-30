@@ -93,6 +93,7 @@ class BoomerFLADiTConfig:
     conv_size: int = 4
     image_attention_every: int = 0
     image_attention_backend: str = "sdpa"
+    image_attention_qk_rmsnorm: bool = True
     image_attention_rope: bool = False
     image_rope_theta: float = 10000.0
     cross_attention_backend: str = "sdpa"
@@ -362,6 +363,7 @@ class FullImageSelfAttention(nn.Module):
         num_heads: int,
         *,
         backend: str = "sdpa",
+        qk_rmsnorm: bool = True,
         grid_size: int | None = None,
         rope: bool = False,
         rope_theta: float = 10000.0,
@@ -369,7 +371,9 @@ class FullImageSelfAttention(nn.Module):
         super().__init__()
         if hidden_dim % num_heads != 0:
             raise ValueError(f"hidden_dim={hidden_dim} must be divisible by num_heads={num_heads}")
-        if backend not in {"sdpa", "flash3", "flash4", "auto"}:
+        # "flash2" is the training-time backend; the standalone has no FA2 path, so it
+        # validates and falls through to SDPA below (numerically identical for inference).
+        if backend not in {"sdpa", "flash2", "flash3", "flash4", "auto"}:
             raise ValueError(f"Unsupported image_attention_backend: {backend}")
         if rope and grid_size is None:
             raise ValueError("grid_size is required when rope=True")
@@ -378,6 +382,10 @@ class FullImageSelfAttention(nn.Module):
         self.head_dim = hidden_dim // num_heads
         self.backend = backend
         self.qkv = nn.Linear(hidden_dim, hidden_dim * 3)
+        # Sana-style Q/K RMSNorm on the per-head dim (matches the training model's
+        # FullImageSelfAttention so checkpoint weights map 1:1).
+        self.q_norm = AttentionRMSNorm(self.head_dim, scale_factor=1.0, eps=1e-6) if qk_rmsnorm else nn.Identity()
+        self.k_norm = AttentionRMSNorm(self.head_dim, scale_factor=1.0, eps=1e-6) if qk_rmsnorm else nn.Identity()
         self.out_proj = nn.Linear(hidden_dim, hidden_dim)
         nn.init.zeros_(self.out_proj.weight)
         nn.init.zeros_(self.out_proj.bias)
@@ -476,6 +484,9 @@ class FullImageSelfAttention(nn.Module):
         batch, tokens, channels = x.shape
         qkv = self.qkv(x).reshape(batch, tokens, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)
+        # Sana-style Q/K RMSNorm caps attention-logit growth in full image attention.
+        q = self.q_norm(q)
+        k = self.k_norm(k)
         if self.rope is not None:
             q, k = self.rope(q, k)
 
@@ -744,6 +755,7 @@ class BoomerFLABlock(nn.Module):
                 hidden_dim,
                 config.num_heads,
                 backend=config.image_attention_backend,
+                qk_rmsnorm=config.image_attention_qk_rmsnorm,
                 grid_size=config.latent_size // config.patch_size,
                 rope=config.image_attention_rope,
                 rope_theta=config.image_rope_theta,

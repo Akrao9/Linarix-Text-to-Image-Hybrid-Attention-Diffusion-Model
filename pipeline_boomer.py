@@ -139,7 +139,29 @@ def _make_stork_scheduler(
 
 # ── text encoding ──────────────────────────────────────────────────────────────
 @torch.inference_mode()
-def _encode_prompts(tokenizer, text_encoder, prompts, max_length, device, dtype):
+def _encode_prompts(tokenizer, text_encoder, prompts, max_length, device, dtype, instruction=None):
+    # Qwen readout (instruction set): reproduce the training QwenReferenceEncoder exactly —
+    # prepend the instruction, render through the chat template, then read the decoder's
+    # post-final-norm last_hidden_state, right-padded/truncated to max_length. This MUST
+    # match how the CaptionEmbedder was trained, or prompt-following degrades badly.
+    if instruction:
+        rendered = []
+        for prompt in prompts:
+            messages = [{"role": "user", "content": f"{instruction}\n\n{prompt}"}]
+            rendered.append(
+                tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+            )
+        tokens = tokenizer(rendered, max_length=max_length, padding="max_length",
+                           truncation=True, return_tensors="pt")
+        ids  = tokens["input_ids"].to(device)
+        mask = tokens["attention_mask"].to(device)
+        out  = text_encoder(ids, attention_mask=mask, output_hidden_states=True,
+                            use_cache=False, return_dict=True)
+        hidden = out.last_hidden_state
+        # Right-padding keeps valid tokens at the front, so a head slice is safe.
+        return hidden[:, :max_length].to(dtype=dtype), mask[:, :max_length]
+
+    # Legacy (no instruction, e.g. gemma): plain tokenize + last_hidden_state.
     token_kwargs = dict(max_length=max_length, padding="max_length",
                         truncation=True, return_tensors="pt")
     try:
@@ -192,6 +214,8 @@ class BoomerPipeline(DiffusionPipeline):
         self.scaling_factor  = cfg.get("_scaling_factor",  0.41407)
         self.flow_shift      = cfg.get("_flow_shift",      1.5)
         self.max_text_length = cfg.get("_max_text_length", 300)
+        # Instruction prefix for the Qwen readout (None => legacy plain-tokenize path).
+        self.instruction     = cfg.get("_instruction",     None)
         self._vae_repo       = cfg.get("_vae_repo",  "mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers")
         self._te_repo        = cfg.get("_te_repo",   "google/gemma-4-E2B-it")
         self._hf_token       = None
@@ -303,7 +327,7 @@ class BoomerPipeline(DiffusionPipeline):
         self.text_encoder.to(device)
         text_emb, attn_mask = _encode_prompts(
             self.tokenizer, self.text_encoder, prompts,
-            self.max_text_length, device, dtype,
+            self.max_text_length, device, dtype, instruction=self.instruction,
         )
         if track_vram:
             run_stats.peak_encode_gb = _cuda_peak_gb()
