@@ -1371,6 +1371,18 @@ def main() -> None:
     resume_ckpt = None if args.resume_weights_only else args.resume
     trainer.fit(module, datamodule=datamodule, ckpt_path=resume_ckpt)
 
+    # Close the W&B run cleanly once training genuinely reaches max_steps, so it reads
+    # "finished" instead of lingering as "crashed". Lightning's WandbLogger does NOT
+    # reliably call finish() on fit-end. Guard on (not interrupted) and reaching max_steps
+    # so an early-stopped / ^C session stays "crashed" and resumable under
+    # WANDB_RESUME=allow (an OOM/SIGKILL never reaches here at all, so it stays crashed).
+    if args.wandb and not trainer.interrupted and trainer.global_step >= args.max_steps:
+        import wandb
+
+        if wandb.run is not None:
+            wandb.finish()
+            print(f"[wandb] run finished cleanly at step {trainer.global_step}", flush=True)
+
 
 if __name__ == "__main__":
     main()
