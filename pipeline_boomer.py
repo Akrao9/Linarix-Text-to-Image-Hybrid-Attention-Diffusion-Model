@@ -151,8 +151,16 @@ def _encode_prompts(tokenizer, text_encoder, prompts, max_length, device, dtype,
             rendered.append(
                 tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
             )
-        tokens = tokenizer(rendered, max_length=max_length, padding="max_length",
-                           truncation=True, return_tensors="pt")
+        # Qwen3.5 is a VL model: its AutoProcessor.__call__ is (images, text, ...), so the
+        # text MUST be passed as text=; positionally it gets treated as images and the
+        # processor tries to fetch_images() the chat string. Fall back to positional for
+        # plain tokenizers that don't accept text=.
+        tok_kwargs = dict(max_length=max_length, padding="max_length",
+                          truncation=True, return_tensors="pt")
+        try:
+            tokens = tokenizer(text=rendered, **tok_kwargs)
+        except TypeError:
+            tokens = tokenizer(rendered, **tok_kwargs)
         ids  = tokens["input_ids"].to(device)
         mask = tokens["attention_mask"].to(device)
         out  = text_encoder(ids, attention_mask=mask, output_hidden_states=True,
