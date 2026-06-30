@@ -1,5 +1,5 @@
 ---
-title: BoomerV2 T2I
+title: Linarix V1 T2I
 emoji: 🎨
 colorFrom: indigo
 colorTo: purple
@@ -9,41 +9,40 @@ app_file: app.py
 python_version: 3.11
 pinned: false
 license: other
-short_description: 1024px text-to-image with BoomerV2 (GDN-2) on ZeroGPU
+short_description: 1024px text-to-image with Linarix-v1 (GDN-2) on ZeroGPU
 models:
-  - akrao9/BoomerV2-Text-to-Image
-  - google/gemma-4-E2B-it
+  - Akrao9/Linarix-v1
+  - Qwen/Qwen3.5-2B
   - mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers
 preload_from_hub:
-  - akrao9/BoomerV2-Text-to-Image
+  - Akrao9/Linarix-v1
 ---
 
-# BoomerV2 — Text to Image Demo
+# Linarix-v1 — Text to Image Demo
 
-Interactive demo for [akrao9/BoomerV2-Text-to-Image](https://huggingface.co/akrao9/BoomerV2-Text-to-Image): a 701M-param 1024×1024 text-to-image flow-matching model with GatedDeltaNet-2 (Flash Linear Attention).
+Interactive demo for [Akrao9/Linarix-v1](https://huggingface.co/Akrao9/Linarix-v1): a ~712M-param 1024×1024 text-to-image flow-matching model with GatedDeltaNet-2 (Flash Linear Attention) and Q/K-RMSNorm full-attention layers every 4th block.
 
-**Capabilities:** strong on landscapes, scenic/architectural scenes, **people/portraits** (use composed prompts; ¾/profile poses; CFG 4.0–4.5), and dense multi-attribute prompts. Less reliable for domestic animals, hands, and legible text. Trained on JourneyDB (512px) + FineT2I (1024px).
+**Capabilities:** strong on landscapes, scenic/architectural scenes, **rigid man-made structures** (lighthouses, locomotives, bridges), and composed portraits (use descriptive prompts; **CFG 4.0**). Eyes/iris are the remaining frontier and exact object counts are seed-driven. Text conditioning via **Qwen3.5-2B**; decode via **DC-AE f32c32**; sampling via **STORK-2**.
 
 ## Space setup
 
 1. Create a new **Gradio** Space on Hugging Face.
 2. Upload the contents of this `Space/` folder (or point the Space repo here).
 3. In **Settings → Hardware**, select **ZeroGPU** (requires HF PRO for hosting). This allocates a shared **NVIDIA RTX Pro 6000 Blackwell** GPU (48 GB via `@spaces.GPU(size="large")`).
-4. Add a Space secret **`HF_TOKEN`** (Settings → Secrets) — **required**. Use a [HF access token](https://huggingface.co/settings/tokens) from an account that has accepted the [Gemma Terms of Use](https://ai.google.dev/gemma/terms).
-5. Restart the Space after the first build (model + VAE + text encoder download can take several minutes).
+4. **No secret is required** — Qwen3.5-2B is not gated. Optionally add an `HF_TOKEN` secret (Settings → Secrets) to lift anonymous download rate limits.
+5. Restart the Space after the first build (model + VAE + text encoder download can take a few minutes).
 
 ## Local test
 
 ```bash
 cd Space
 pip install -r requirements.txt
-export HF_TOKEN=hf_...
 python app.py
 ```
 
 The `@spaces.GPU` decorator is a no-op locally; use a CUDA machine for full inference.
 
-Pinned deps for ZeroGPU: do **not** pin `torch` in `requirements.txt` — the Space builder injects `torch<=2.11.0`. Include **`torchvision`** (unpinned) for Gemma 4 `AutoProcessor`. Other pins: diffusers 0.38.0, transformers 5.9.0, flash-linear-attention 0.5.0.
+Pinned deps for ZeroGPU: do **not** pin `torch` in `requirements.txt` — the Space builder injects `torch<=2.11.0`. Include **`torchvision`** (unpinned) for the Qwen3.5 `AutoProcessor`. Other pins: diffusers 0.38.0, transformers 5.9.0, flash-linear-attention 0.5.0.
 
 `app.py` redirects Hugging Face caches to `/tmp/huggingface` (ZeroGPU `~/.cache` is often read-only).
 
@@ -62,4 +61,5 @@ Set **`python_version: 3.11`** in this README (Spaces default is 3.10). After ch
 
 - Uses `@spaces.GPU(size="large", duration=150)` — RTX Pro 6000 Blackwell 48 GB tier — for 32-step STORK-2 at 1024px ([Tan et al., 2025](https://arxiv.org/abs/2505.24210)).
 - Example prompts run generation on click (`run_on_click=True`).
-- VAE and Gemma 4 E2B are fetched from their upstream repos on first startup.
+- **CFG 4.0** is the recommended default; higher (5+) over-saturates and hardens fine detail. For exact object counts, sweep a few seeds.
+- VAE and Qwen3.5-2B are fetched from their upstream repos on first startup.

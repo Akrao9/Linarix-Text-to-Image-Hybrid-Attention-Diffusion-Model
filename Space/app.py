@@ -1,4 +1,4 @@
-"""Boomer FLA — Hugging Face Space demo (ZeroGPU / RTX Pro 6000 Blackwell + Gradio)."""
+"""Linarix-v1 — Hugging Face Space demo (ZeroGPU / RTX Pro 6000 Blackwell + Gradio)."""
 
 from __future__ import annotations
 
@@ -30,44 +30,42 @@ import spaces
 import torch
 from huggingface_hub import snapshot_download
 
-MODEL_ID = os.environ.get("BOOMER_MODEL_ID", "akrao9/BoomerV2-Text-to-Image")
+MODEL_ID = os.environ.get("BOOMER_MODEL_ID", "Akrao9/Linarix-v1")
 DEFAULT_STEPS = 32
 DEFAULT_CFG = 4.0
 DEFAULT_CFG_RESCALE = 0.5
 
 DEFAULT_PROMPT = (
-    "A hyper-detailed, cinematic landscape photography shot of a pristine, mirror-like alpine lake "
-    "nestled deeply between towering, jagged snow-capped mountain peaks. The scene is captured during "
-    "the perfect golden hour, with the low-angled warm sun casting deep amber and violet hues across "
-    "the rugged granite rock faces. In the foreground, vibrant clusters of purple lupines and orange "
-    "poppies dot a lush emerald meadow that meets the crystal-clear turquoise edge of the water. "
-    "Wisps of soft, low-hanging morning mist drift lazily across the lake's surface, breaking the "
-    "perfect reflection of the monumental peaks above. Shot on 35mm lens, ultra-sharp focus, dramatic "
-    "depth of field, 8k resolution, path-traced lighting textures."
+    "a lighthouse on a rocky cliff above crashing waves at golden hour, "
+    "dramatic stormy sky, cinematic photography"
 )
 
 EXAMPLE_PROMPTS: list[tuple[str, str]] = [
     (
-        "Cyberpunk Highland",
-        "A sweeping cinematic view of a futuristic Scottish highland at twilight, glowing neon purple and blue moss creeping over ancient rock formations, distant futuristic spires reflecting off a dark loch, dramatic low-angle photography.",
+        "Misty Forest",
+        "a misty pine forest at dawn, sunbeams streaming through the tall trees, soft volumetric light, atmospheric and serene.",
     ),
     (
-        "Volcanic Caldera",
-        "A high-contrast shot looking down into an active volcanic caldera, vibrant flowing rivers of orange lava cutting through pitch-black obsidian stone, thick plumes of dark smoke catching the crimson glow, hyper-detailed geological textures.",
+        "Autumn Lake",
+        "a calm mountain lake at golden hour mirroring snow-dusted peaks and blazing autumn foliage, crisp reflections, ultra-clear air.",
     ),
     (
-        "Nordic Winter Fjords",
-        "A breathtaking winter view of deep Norwegian fjords during the blue hour, snow-laden mountain slopes plunging into dark mirror-like ocean water, vibrant emerald green Northern Lights stretching across the sky, crisp and ultra-clear atmospheric rendering.",
+        "Steam Locomotive",
+        "a vintage steam locomotive crossing a tall stone arch bridge over a river valley, billowing smoke, late afternoon sunlight, cinematic wide shot.",
     ),
     (
-        "Ancient Sunken Ruins",
-        "A wide landscape shot of ancient stone ruins submerged in a shallow, crystal-clear tropical ocean, vibrant coral reefs and schools of exotic fish visible beneath the surface, sun rays slicing through the water, warm cinematic lighting.",
+        "Old European Street",
+        "a quiet cobblestone street in an old European town at dusk, warm glowing windows, wet stones reflecting lamplight, moody and atmospheric.",
     ),
 ]
 
 
 def _hf_token() -> str | None:
-    """Return HF token from Space secrets; None if unset (do not pass token=True)."""
+    """Return HF token from Space secrets if set; None otherwise.
+
+    Linarix-v1's text encoder (Qwen3.5-2B) is NOT gated, so a token is optional —
+    it is only used to lift anonymous rate limits / access private mirrors.
+    """
     for key in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGING_HUB_TOKEN"):
         value = os.environ.get(key, "").strip()
         if value:
@@ -76,14 +74,8 @@ def _hf_token() -> str | None:
 
 
 _hf = _hf_token()
-if _hf is None:
-    print(
-        "WARNING: No HF_TOKEN secret found. Add one in Space Settings → Secrets "
-        "(required for gated Gemma text encoder).",
-        flush=True,
-    )
 
-print(f"Loading Boomer pipeline from {MODEL_ID} ...", flush=True)
+print(f"Loading Linarix pipeline from {MODEL_ID} ...", flush=True)
 _model_dir = Path(
     snapshot_download(
         MODEL_ID,
@@ -102,11 +94,8 @@ pipe._hf_token = _hf
 
 print("Pre-loading VAE on cuda ...", flush=True)
 pipe._ensure_vae()
-if _hf is not None:
-    print("Pre-loading text encoder on cuda ...", flush=True)
-    pipe._ensure_text_encoder()
-else:
-    print("Skipping text encoder preload (HF_TOKEN not set).", flush=True)
+print("Pre-loading text encoder (Qwen3.5-2B) on cuda ...", flush=True)
+pipe._ensure_text_encoder()
 print("Model ready.", flush=True)
 
 
@@ -166,12 +155,6 @@ def generate_image(
     prompt = (prompt or "").strip()
     if not prompt:
         raise gr.Error("Please enter a prompt before generating.")
-    if pipe._hf_token is None:
-        raise gr.Error(
-            "HF_TOKEN Space secret is required. In Space Settings → Secrets, add "
-            "HF_TOKEN with a Hugging Face token that has accepted the "
-            "Gemma Terms of Use (https://ai.google.dev/gemma/terms)."
-        )
 
     resolved_seed = _resolve_seed(seed)
     step_count = max(1, int(steps))
@@ -225,13 +208,14 @@ def reset_form() -> tuple[str, None, str, float]:
 def build_ui() -> gr.Blocks:
     example_rows = [[text, -1, DEFAULT_STEPS, DEFAULT_CFG] for _, text in EXAMPLE_PROMPTS]
 
-    with gr.Blocks(title="BoomerV2") as demo:
+    with gr.Blocks(title="Linarix-v1") as demo:
         gr.Markdown(
             """
-            # BoomerV2 — Text to Image
-            Generate **1024×1024** images from text. **Strong on landscapes, scenic
-            environments, and people** (use composed prompts; CFG 4.0–4.5). Less reliable
-            for domestic animals, hands, and legible text.
+            # Linarix-v1 — Text to Image
+            Generate **1024×1024** images from text with a **~712M** GatedDeltaNet-2
+            (linear-attention) diffusion model. **Strong on landscapes, scenic and
+            man-made structures, and composed portraits** — use descriptive prompts;
+            **CFG 4.0** is the sweet spot. For exact object counts, try a few seeds.
             Runs on **ZeroGPU** (NVIDIA RTX Pro 6000 Blackwell, 48 GB). First run may
             take a minute while a GPU is allocated.
             """

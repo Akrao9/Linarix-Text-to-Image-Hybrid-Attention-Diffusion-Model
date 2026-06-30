@@ -146,7 +146,7 @@ pipe = DiffusionPipeline.from_pretrained(
     torch_dtype=torch.bfloat16,
 ).to("cuda")
 
-image = pipe("a lighthouse on a rocky cliff above crashing waves", cfg_scale=3.5)[0]
+image = pipe("a lighthouse on a rocky cliff above crashing waves", cfg_scale=4.0)[0]
 image.save("out.png")
 ```
 
@@ -158,7 +158,7 @@ The STORK scheduler is bundled (Tan et al. 2025, arXiv:2505.24210).
 
 ![{model_name} samples](showcase.png)
 
-All {config['latent_size'] * 32}px, EMA weights, STORK-2 / 32 steps, `cfg_scale=3.5`, `cfg_rescale=0.5`. Prompts (left→right, top→bottom):
+All {config['latent_size'] * 32}px, EMA weights, STORK-2 / 32 steps, `cfg_scale=4.0`, `cfg_rescale=0.5`. Prompts (left→right, top→bottom):
 
 1. a misty pine forest at dawn, sunbeams through the trees
 2. a calm lake reflecting autumn mountains, golden hour
