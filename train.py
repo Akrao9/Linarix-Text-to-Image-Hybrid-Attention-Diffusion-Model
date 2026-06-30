@@ -1369,19 +1369,46 @@ def main() -> None:
     )
     # resume-weights-only already loaded the weights above; don't restore trainer state.
     resume_ckpt = None if args.resume_weights_only else args.resume
-    trainer.fit(module, datamodule=datamodule, ckpt_path=resume_ckpt)
+    fit_error: BaseException | None = None
+    try:
+        trainer.fit(module, datamodule=datamodule, ckpt_path=resume_ckpt)
+    except BaseException as exc:  # noqa: BLE001 - see the teardown note below
+        fit_error = exc
 
-    # Close the W&B run cleanly once training genuinely reaches max_steps, so it reads
-    # "finished" instead of lingering as "crashed". Lightning's WandbLogger does NOT
-    # reliably call finish() on fit-end. Guard on (not interrupted) and reaching max_steps
-    # so an early-stopped / ^C session stays "crashed" and resumable under
-    # WANDB_RESUME=allow (an OOM/SIGKILL never reaches here at all, so it stays crashed).
-    if args.wandb and not trainer.interrupted and trainer.global_step >= args.max_steps:
+    completed = trainer.global_step >= args.max_steps and not trainer.interrupted
+
+    # Lightning tears down the persistent DataLoader workers at fit-end. Our streaming
+    # IterableDataset loops forever, so a worker is typically blocked in an in-flight HF
+    # range read when the shutdown signal lands; it can't unwind the C-level httpx/Arrow
+    # call, the interpreter finalizes under it ("PyGILState_Release ... finalizing"), and
+    # it abort()s -> "DataLoader worker ... killed by signal: Aborted", which propagates
+    # out of fit() as a teardown RuntimeError. When this happens AFTER max_steps was
+    # reached, training and checkpoints are already complete, so treat it as success.
+    # Re-raise anything that happened BEFORE completion (a real OOM/bug/^C).
+    if fit_error is not None and not completed:
+        raise fit_error
+    if fit_error is not None:
+        print(f"[teardown] reached max_steps={args.max_steps}; ignoring DataLoader "
+              f"shutdown error: {type(fit_error).__name__}: {fit_error}", flush=True)
+
+    # Close the W&B run cleanly so it reads "finished" instead of lingering as "crashed".
+    # Lightning's WandbLogger does NOT reliably call finish() on fit-end. An early-stopped
+    # / ^C / OOM session never sets completed, so it stays crashed-but-resumable under
+    # WANDB_RESUME=allow.
+    if args.wandb and completed:
         import wandb
 
         if wandb.run is not None:
             wandb.finish()
             print(f"[wandb] run finished cleanly at step {trainer.global_step}", flush=True)
+
+    if completed:
+        # Everything durable (checkpoints, their Drive upload, W&B) is already flushed.
+        # Skip Python's interpreter finalization, which otherwise re-triggers the same
+        # httpx/Arrow worker-thread GIL fatal on the way out and gives a non-zero exit.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
 
 if __name__ == "__main__":
