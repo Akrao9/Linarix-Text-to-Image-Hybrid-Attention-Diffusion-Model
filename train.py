@@ -880,6 +880,33 @@ class CheckpointUploadCallback(Callback):
         self._stop.set()
         self._worker.join(timeout=30.0)
 
+    def finalize_uploads(self, trainer) -> None:
+        """Synchronously ensure every local step checkpoint is on the remote.
+
+        Safe to call from the main thread after fit(). Lightning's on_fit_end async drain
+        can be pre-empted by the DataLoader-teardown crash (the final checkpoint is saved
+        locally but its Drive copy is killed mid-flight), and the os._exit() fast-path would
+        kill the worker thread too — so this is the reliable last flush before exit.
+        """
+        if getattr(trainer, "global_rank", 0) != 0:
+            return
+        # Stop the async worker, letting it finish any in-flight copy first.
+        if self._worker is not None:
+            self._stop.set()
+            self._worker.join(timeout=120.0)
+            self._worker = None
+        # Synchronously copy anything not yet confirmed on the remote (worker has exited,
+        # so no concurrent copy of the same file).
+        for ckpt in sorted(self._local_step_ckpts(), key=lambda p: p.stat().st_mtime):
+            if ckpt.name in self._uploaded:
+                continue
+            try:
+                self._upload_one(ckpt)
+                with self._lock:
+                    self._uploaded.add(ckpt.name)
+            except Exception as exc:  # noqa: BLE001 - a flush failure must not abort exit
+                print(f"[ckpt-upload] final flush FAILED {ckpt.name}: {exc}", flush=True)
+
 
 # --------------------------------------------------------------------------- #
 # dim auto-detection
@@ -1322,15 +1349,17 @@ def main() -> None:
         ))
     # Appended AFTER ModelCheckpoint so a checkpoint written this step already exists on
     # disk when this callback's hook runs and enqueues it for async upload.
+    upload_cb: CheckpointUploadCallback | None = None
     if args.checkpoint_upload_remote:
-        callbacks.append(CheckpointUploadCallback(
+        upload_cb = CheckpointUploadCallback(
             checkpoint_dir=args.checkpoint_dir,
             remote=args.checkpoint_upload_remote,
             local_retain=args.checkpoint_local_retain,
             keep_uploaded=args.checkpoint_keep_uploaded,
             rclone_bin=args.checkpoint_rclone_bin,
             chunk_size=args.checkpoint_upload_chunk_size,
-        ))
+        )
+        callbacks.append(upload_cb)
 
     precision = args.precision
     if args.dtype is not None:
@@ -1375,6 +1404,17 @@ def main() -> None:
     except BaseException as exc:  # noqa: BLE001 - see the teardown note below
         fit_error = exc
 
+    # Flush pending checkpoint uploads synchronously before any exit path. Lightning's
+    # on_fit_end async drain can be pre-empted by the teardown crash (final checkpoint saved
+    # locally but its Drive copy killed mid-flight), and the os._exit() fast-path below would
+    # kill the upload worker — so the newest checkpoint reaches the remote only if we drain
+    # here, regardless of how fit() ended.
+    if upload_cb is not None:
+        try:
+            upload_cb.finalize_uploads(trainer)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[ckpt-upload] finalize failed: {exc}", flush=True)
+
     completed = trainer.global_step >= args.max_steps and not trainer.interrupted
 
     # Lightning tears down the persistent DataLoader workers at fit-end. Our streaming
@@ -1403,9 +1443,9 @@ def main() -> None:
             print(f"[wandb] run finished cleanly at step {trainer.global_step}", flush=True)
 
     if completed:
-        # Everything durable (checkpoints, their Drive upload, W&B) is already flushed.
-        # Skip Python's interpreter finalization, which otherwise re-triggers the same
-        # httpx/Arrow worker-thread GIL fatal on the way out and gives a non-zero exit.
+        # Durable state is flushed above: checkpoints uploaded via finalize_uploads(), W&B
+        # finished. Skip Python's interpreter finalization, which otherwise re-triggers the
+        # same httpx/Arrow worker-thread GIL fatal on the way out and gives a non-zero exit.
         sys.stdout.flush()
         sys.stderr.flush()
         os._exit(0)
