@@ -16,6 +16,7 @@ os.environ.setdefault("TRANSFORMERS_CACHE", str(_hf_root / "transformers"))
 os.environ.setdefault("DIFFUSERS_CACHE", str(_hf_root / "diffusers"))
 
 import gc
+import secrets
 import sys
 import time
 import warnings
@@ -101,7 +102,10 @@ print("Model ready.", flush=True)
 
 def _resolve_seed(seed: float | int | None) -> int:
     if seed is None or int(seed) < 0:
-        return torch.randint(0, 2**32 - 1, (1,)).item()
+        # OS entropy, NOT torch.randint: ZeroGPU forks a worker per @spaces.GPU call
+        # with an identical torch RNG snapshot (and the pipeline re-seeds the global
+        # generator via torch.manual_seed), so torch draws here repeat the same value.
+        return secrets.randbelow(2**32)
     return int(seed)
 
 

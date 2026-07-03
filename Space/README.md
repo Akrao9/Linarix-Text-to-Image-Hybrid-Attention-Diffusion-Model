@@ -4,7 +4,7 @@ emoji: 🎨
 colorFrom: indigo
 colorTo: purple
 sdk: gradio
-sdk_version: 6.15.2
+sdk_version: 6.19.0
 app_file: app.py
 python_version: 3.11
 pinned: false
@@ -42,7 +42,7 @@ python app.py
 
 The `@spaces.GPU` decorator is a no-op locally; use a CUDA machine for full inference.
 
-Pinned deps for ZeroGPU: do **not** pin `torch` in `requirements.txt` — the Space builder injects `torch<=2.11.0`. Include **`torchvision`** (unpinned) for the Qwen3.5 `AutoProcessor`. Other pins: diffusers 0.38.0, transformers 5.9.0, flash-linear-attention 0.5.0.
+Pinned deps for ZeroGPU: do **not** pin `torch` or `gradio` in `requirements.txt` — the Space builder injects `torch<=2.11.0` and `gradio[oauth,mcp]==<sdk_version from this README>` into the same pip install, so a gradio pin that differs from `sdk_version` makes the build fail with `ResolutionImpossible`. Include **`torchvision`** (unpinned) for the Qwen3.5 `AutoProcessor`. Other pins: diffusers 0.38.0, transformers 5.9.0, flash-linear-attention 0.5.0.
 
 `app.py` redirects Hugging Face caches to `/tmp/huggingface` (ZeroGPU `~/.cache` is often read-only).
 
