@@ -351,6 +351,8 @@ def make_wds_dataset(
     max_consecutive_skips: int = 8,
     parquet_read_batch_size: int = 32,
     parquet_memory_trim_every: int = 4096,
+    parquet_prefetch_ranges: bool = True,
+    parquet_range_size_mib: int = 64,
 ):
     """Parquet caches range-stream via `datasets` (faster + stall-resilient); remote
     hf:// tar caches use the parallel download-ahead prefetch window (thread-pool into
@@ -364,6 +366,8 @@ def make_wds_dataset(
             download_max_retries=download_max_retries,
             read_batch_size=parquet_read_batch_size,
             memory_trim_every=parquet_memory_trim_every,
+            prefetch_ranges=parquet_prefetch_ranges,
+            range_size_mib=parquet_range_size_mib,
         )
     if is_remote_cache(cache_wds):
         return PrefetchingWdsLatentCacheDataset(
@@ -408,6 +412,8 @@ class BoomerData(pl.LightningDataModule):
         max_consecutive_skips: int = 8,
         parquet_read_batch_size: int = 32,
         parquet_memory_trim_every: int = 4096,
+        parquet_prefetch_ranges: bool = True,
+        parquet_range_size_mib: int = 64,
     ) -> None:
         super().__init__()
         self.cache_wds = cache_wds
@@ -428,8 +434,23 @@ class BoomerData(pl.LightningDataModule):
         self.max_consecutive_skips = max_consecutive_skips
         self.parquet_read_batch_size = parquet_read_batch_size
         self.parquet_memory_trim_every = parquet_memory_trim_every
+        self.parquet_prefetch_ranges = parquet_prefetch_ranges
+        self.parquet_range_size_mib = parquet_range_size_mib
 
-    def _dataset(self):
+    def _resume_seed_salt(self) -> int:
+        """Salt the stream seed with the resumed global step so a restarted run does not
+        replay the identical shard order + shuffle from the head of the stream (over many
+        Colab preemptions that systematically oversamples early rows). Same salt for every
+        worker, preserving the disjoint file sharding; 0 for a fresh run, deterministic
+        given the checkpoint."""
+        try:
+            if self.trainer is not None:
+                return int(self.trainer.global_step)
+        except RuntimeError:
+            pass  # not attached to a trainer (direct/offline use)
+        return 0
+
+    def _dataset(self, *, seed_salt: int = 0):
         return make_wds_dataset(
             cache_wds=self.cache_wds,
             local_dir=self.local_dir,
@@ -437,13 +458,15 @@ class BoomerData(pl.LightningDataModule):
             download_workers=self.download_workers,
             shuffle_buffer=self.shuffle_buffer,
             hf_token=self.hf_token,
-            seed=self.seed,
+            seed=self.seed + seed_salt,
             decode_queue_size=self.decode_queue_size,
             shard_shuffle=self.shard_shuffle,
             download_max_retries=self.download_max_retries,
             max_consecutive_skips=self.max_consecutive_skips,
             parquet_read_batch_size=self.parquet_read_batch_size,
             parquet_memory_trim_every=self.parquet_memory_trim_every,
+            parquet_prefetch_ranges=self.parquet_prefetch_ranges,
+            parquet_range_size_mib=self.parquet_range_size_mib,
         )
 
     def train_dataloader(self) -> DataLoader:
@@ -474,6 +497,14 @@ class BoomerData(pl.LightningDataModule):
             # Applied when spawn starts fresh worker interpreters. This bounds glibc's
             # per-thread arenas, which otherwise retain large Arrow/Python allocations.
             os.environ.setdefault("MALLOC_ARENA_MAX", "2")
+        seed_salt = self._resume_seed_salt()
+        if seed_salt:
+            print(
+                f"[data] resume detected (global_step={seed_salt}); salting stream seed "
+                f"{self.seed} -> {self.seed + seed_salt} so the restarted stream does not "
+                "replay the same head-of-stream rows",
+                flush=True,
+            )
         persistent = self.persistent_workers if self.persistent_workers is not None else workers > 0
         kwargs = {}
         if workers > 0:
@@ -492,7 +523,7 @@ class BoomerData(pl.LightningDataModule):
 
                 kwargs["multiprocessing_context"] = _mp.get_context("spawn")
         return DataLoader(
-            self._dataset(),
+            self._dataset(seed_salt=seed_salt),
             batch_size=self.batch_size,
             num_workers=workers,
             collate_fn=collate_latent_records,
@@ -963,6 +994,10 @@ def build_config(args: argparse.Namespace, record: Any) -> BoomerFLADiTConfig:
         image_rope_theta=args.image_rope_theta,
         cross_attention_backend=args.cross_attn_backend,
         cross_attention_qk_norm=args.cross_attn_qk_norm,
+        cross_attention_every=args.cross_attn_every,
+        shared_adaln=args.shared_adaln,
+        fourier_timestep_embed=args.fourier_timestep_embed,
+        hilbert_mixer_order=args.hilbert_mixer_order,
         parallel_block=args.parallel_block,
         dual_stream_depth=args.dual_stream_depth,
         multimodal_coord_ids=args.multimodal_coord_ids,
@@ -1022,6 +1057,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--parquet-memory-trim-every", type=int, default=4096,
                    help="Parquet rows per worker between best-effort Arrow/libc memory "
                         "release calls. 0 disables; default prevents long-run RSS growth.")
+    p.add_argument("--parquet-prefetch", dest="parquet_prefetch_ranges", action=bo, default=True,
+                   help="Background-prefetch the next Parquet byte range while the current one "
+                        "decodes (pyarrow CacheOptions). Skipped automatically on datasets/"
+                        "pyarrow versions without fragment_scan_options support.")
+    p.add_argument("--parquet-range-mib", dest="parquet_range_size_mib", type=int, default=64,
+                   help="Per-request Parquet range size in MiB (pyarrow default 32). Larger = "
+                        "fewer requests but ~2x this buffered per worker with prefetch on; "
+                        "0 keeps the pyarrow default.")
     p.add_argument("--hf-token", default=None, help="HF token, or 'true' for the logged-in token.")
     p.add_argument("--latent-mean", type=float, default=0.0)
     p.add_argument("--latent-std", type=float, default=1.0)
@@ -1061,6 +1104,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cross-attn-qk-rmsnorm", "--cross-attn-qk-norm", dest="cross_attn_qk_norm",
                    action=bo, default=True,
                    help="Sana-style Q/K RMSNorm inside text cross-attention.")
+    p.add_argument("--cross-attn-every", type=int, default=1,
+                   help="Cross-attend to text every Nth single-stream block (1 = every block). "
+                        "PixArt-Sigma-style thinning; pilot-ablate before a long run.")
+    p.add_argument("--shared-adaln", action=bo, default=False,
+                   help="PixArt-alpha adaLN-single: one shared timestep-modulation projection for "
+                        "all blocks (per-block scale_shift_table keeps layer variation). Saves ~27% "
+                        "params at the deployed size.")
+    p.add_argument("--fourier-timestep", dest="fourier_timestep_embed", action=bo, default=False,
+                   help="DiT-style sinusoidal timestep features before the timestep MLP instead of "
+                        "feeding the raw sigma scalar to Linear(1, hidden).")
+    p.add_argument("--hilbert-order", dest="hilbert_mixer_order", action=bo, default=False,
+                   help="Feed the FLA mixers Hilbert-curve token order (restored afterward) so "
+                        "sequence adjacency tracks 2D adjacency. Needs a square power-of-two grid.")
     p.add_argument("--parallel-block", action=bo, default=False,
                    help="FLUX/SD3-style parallel residual branches inside blocks.")
     p.add_argument("--dual-stream-depth", type=int, default=0)
@@ -1306,6 +1362,8 @@ def main() -> None:
         max_consecutive_skips=args.wds_max_consecutive_skips,
         parquet_read_batch_size=args.parquet_read_batch_size,
         parquet_memory_trim_every=args.parquet_memory_trim_every,
+        parquet_prefetch_ranges=args.parquet_prefetch_ranges,
+        parquet_range_size_mib=args.parquet_range_size_mib,
     )
 
     callbacks: list[Callback] = [

@@ -97,6 +97,34 @@ class TimestepEmbedder(nn.Module):
         return self.net(timesteps.to(dtype=dtype).view(-1, 1))
 
 
+class FourierTimestepEmbedder(nn.Module):
+    """DiT-style sinusoidal timestep features followed by an MLP.
+
+    Flow sigmas live in [0, 1]; they are scaled by 1000 before the frequency bank
+    (matching the DiT/SD3 convention) so the sinusoids resolve fine timestep
+    distinctions near the endpoints, where a raw-scalar Linear gives the network
+    only one feature to carve the whole range from.
+    """
+
+    def __init__(self, hidden_dim: int, freq_dim: int = 256, max_period: float = 10000.0) -> None:
+        super().__init__()
+        if freq_dim % 2 != 0:
+            raise ValueError(f"freq_dim must be even, got {freq_dim}")
+        half = freq_dim // 2
+        freqs = torch.exp(-math.log(max_period) * torch.arange(half).float() / half)
+        self.register_buffer("freqs", freqs, persistent=False)
+        self.net = nn.Sequential(
+            nn.Linear(freq_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+    def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
+        angles = timesteps.float().view(-1, 1) * 1000.0 * self.freqs[None]
+        features = torch.cat([angles.cos(), angles.sin()], dim=-1)
+        return self.net(features.to(dtype=self.net[0].weight.dtype))
+
+
 class LatentDiT(nn.Module):
     """A tiny transformer baseline over f32c32 latent tokens.
 

@@ -13,7 +13,12 @@ from torch import nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _ckpt
 
-from boomer.models.latent_dit import AttentionRMSNorm, CaptionEmbedder, TimestepEmbedder
+from boomer.models.latent_dit import (
+    AttentionRMSNorm,
+    CaptionEmbedder,
+    FourierTimestepEmbedder,
+    TimestepEmbedder,
+)
 
 
 @dataclass(frozen=True)
@@ -49,6 +54,25 @@ class BoomerFLADiTConfig:
     # Kept as "qk_norm" for backward compatibility with older checkpoints/configs.
     # The implementation is Q/K RMSNorm, matching Sana-style attention stabilization.
     cross_attention_qk_norm: bool = True
+    # Cross-attend to text every Nth single-stream block (1 = every block, the historical
+    # behavior). PixArt-Sigma-style thinning: text tokens are static after the dual-stream
+    # prefix, so per-block cross-attention is partly redundant. Blocks without cross-attn
+    # keep the 9-way modulation layout; their cross rows are simply unused.
+    cross_attention_every: int = 1
+    # PixArt-alpha adaLN-single: one shared SiLU+Linear timestep projection for all blocks
+    # instead of a ~7M-param projection per block; the per-block scale_shift_table (which
+    # already exists in both layouts) provides the layer-to-layer variation. Saves ~27% of
+    # parameters at the deployed size with published evidence of parity.
+    shared_adaln: bool = False
+    # DiT-style sinusoidal timestep features (256 freqs, then MLP) instead of feeding the
+    # raw sigma scalar through Linear(1, hidden). Multi-scale resolution over t matters
+    # most near the endpoints where flow dynamics change fastest.
+    fourier_timestep_embed: bool = False
+    # Feed the FLA mixers tokens in Hilbert-curve order (undone right after the mixer) so
+    # sequence adjacency tracks 2D adjacency; raster order puts vertical neighbors a full
+    # row apart, which starves the recurrent mixers' implicit positional signal. Full/cross
+    # attention and GLUMBConv still see raster order. Needs a square power-of-two grid.
+    hilbert_mixer_order: bool = False
     parallel_block: bool = False
     dual_stream_depth: int = 0
     multimodal_coord_ids: bool = False
@@ -95,6 +119,46 @@ def maybe_add_sibling_flash_attention_repo() -> None:
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return x * (1.0 + scale) + shift
+
+
+def _hilbert_d2xy(n: int, d: int) -> tuple[int, int]:
+    """Distance along an n x n Hilbert curve -> (x, y) grid coordinate."""
+    x = y = 0
+    t = d
+    s = 1
+    while s < n:
+        rx = 1 & (t // 2)
+        ry = 1 & (t ^ rx)
+        if ry == 0:
+            if rx == 1:
+                x = s - 1 - x
+                y = s - 1 - y
+            x, y = y, x
+        x += s * rx
+        y += s * ry
+        t //= 4
+        s *= 2
+    return x, y
+
+
+def hilbert_permutation(height: int, width: int) -> torch.Tensor:
+    """Map sequence position -> raster token index along a Hilbert curve.
+
+    `x[:, perm]` reorders raster-flattened tokens into Hilbert order, where every
+    sequential step is a 2D-adjacent grid move (raster order jumps a full row at
+    each wrap, so the recurrent mixers' recency signal mistracks vertical
+    adjacency). Invert with `argsort(perm)`.
+    """
+    if height != width:
+        raise ValueError(f"hilbert_mixer_order needs a square token grid, got {height}x{width}")
+    n = height
+    if n <= 0 or (n & (n - 1)) != 0:
+        raise ValueError(f"hilbert_mixer_order needs a power-of-two grid, got {n}")
+    perm = torch.empty(n * n, dtype=torch.long)
+    for d in range(n * n):
+        x, y = _hilbert_d2xy(n, d)
+        perm[d] = y * n + x
+    return perm
 
 
 class ConvLayer(nn.Module):
@@ -600,8 +664,9 @@ class SanaMultiHeadCrossAttention(nn.Module):
         v = v.transpose(1, 2)
         attn_mask = attn_bias
         if attn_mask is None and key_padding_mask is not None:
-            attn_mask = key_padding_mask[:, None, None, :].to(dtype=q.dtype)
-            attn_mask = attn_mask.masked_fill(attn_mask > 0, -10000.0)
+            # Bool SDPA mask (True = attend): dispatches to fused kernels more readily
+            # than a dense additive float bias and skips the masked_fill materialization.
+            attn_mask = (~key_padding_mask.bool())[:, None, None, :]
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
         return out.transpose(1, 2)
 
@@ -709,7 +774,13 @@ class FLASelfMixer(nn.Module):
         self.mixer_bwd = make_mixer() if self.bidirectional else None
         if self.bidirectional:
             self.out_proj = nn.Linear(hidden_dim * 2, hidden_dim, bias=False)
-            nn.init.zeros_(self.out_proj.weight)
+            # Identity for the forward mixer, zero for the reverse. The residual branch is
+            # already gated by the near-zero adaLN gate; an all-zero fusion on top of that
+            # double-gates the mixer at init (product of two ~0 factors) and starves early
+            # training of the layers doing most of the token mixing.
+            with torch.no_grad():
+                self.out_proj.weight.zero_()
+                self.out_proj.weight[:, :hidden_dim].copy_(torch.eye(hidden_dim))
 
     @staticmethod
     def _run_mixer(mixer: nn.Module, x: torch.Tensor) -> torch.Tensor:
@@ -743,7 +814,9 @@ class BoomerFLABlock(nn.Module):
             self.self_attn = FLASelfMixer(config, layer_idx=layer_idx)
         if self.use_image_attention:
             self.image_attn_norm = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
-            self.image_attn_mod = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 3))
+            self.image_attn_mod = (
+                None if config.shared_adaln else nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 3))
+            )
             self.image_attn = FullImageSelfAttention(
                 hidden_dim,
                 config.num_heads,
@@ -754,22 +827,26 @@ class BoomerFLABlock(nn.Module):
                 rope_theta=config.image_rope_theta,
             )
             self.image_attn_scale_shift_table = nn.Parameter(torch.zeros(3, hidden_dim))
-        cross_backend = config.cross_attention_backend
-        if config.cross_attention_qk_norm and cross_backend == "mha":
-            raise ValueError(
-                "cross_attention_qk_norm requires SanaMultiHeadCrossAttention "
-                "(cross_attention_backend sdpa/xformers/auto), not mha"
-            )
-        if cross_backend == "mha":
-            self.cross_attn = nn.MultiheadAttention(hidden_dim, config.num_heads, batch_first=True)
+        self.use_cross_attention = (layer_idx + 1) % config.cross_attention_every == 0
+        if not self.use_cross_attention:
+            self.cross_attn = None
         else:
-            self.cross_attn = SanaMultiHeadCrossAttention(
-                hidden_dim,
-                config.num_heads,
-                backend=cross_backend,
-                qk_rmsnorm=config.cross_attention_qk_norm,
-            )
-        self.mod = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 9))
+            cross_backend = config.cross_attention_backend
+            if config.cross_attention_qk_norm and cross_backend == "mha":
+                raise ValueError(
+                    "cross_attention_qk_norm requires SanaMultiHeadCrossAttention "
+                    "(cross_attention_backend sdpa/xformers/auto), not mha"
+                )
+            if cross_backend == "mha":
+                self.cross_attn = nn.MultiheadAttention(hidden_dim, config.num_heads, batch_first=True)
+            else:
+                self.cross_attn = SanaMultiHeadCrossAttention(
+                    hidden_dim,
+                    config.num_heads,
+                    backend=cross_backend,
+                    qk_rmsnorm=config.cross_attention_qk_norm,
+                )
+        self.mod = None if config.shared_adaln else nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 9))
         self.norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
         self.norm3 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
         self.mlp = GLUMBConv(hidden_dim, config.mlp_ratio)
@@ -792,6 +869,18 @@ class BoomerFLABlock(nn.Module):
             )[0]
         return self.cross_attn(x, text_tokens, text_key_padding_mask, text_attn_bias)
 
+    def _mixer(
+        self,
+        x: torch.Tensor,
+        mixer_perm: torch.Tensor | None,
+        mixer_perm_inv: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if mixer_perm is None:
+            return self.self_attn(x)
+        # Hilbert order in, raster order out: only the sequence-order-sensitive FLA mixer
+        # sees the permutation; everything else in the block stays raster.
+        return self.self_attn(x.index_select(1, mixer_perm)).index_select(1, mixer_perm_inv)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -802,8 +891,17 @@ class BoomerFLABlock(nn.Module):
         *,
         height: int,
         width: int,
+        t_mod: torch.Tensor | None = None,
+        image_attn_t_mod: torch.Tensor | None = None,
+        mixer_perm: torch.Tensor | None = None,
+        mixer_perm_inv: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        timestep_mod = self.mod(t_emb)
+        if self.mod is not None:
+            timestep_mod = self.mod(t_emb)
+        elif t_mod is None:
+            raise ValueError("shared_adaln blocks need the precomputed t_mod from BoomerFLADiT.forward")
+        else:
+            timestep_mod = t_mod
         (
             shift_msa,
             scale_msa,
@@ -815,42 +913,48 @@ class BoomerFLABlock(nn.Module):
             scale_mlp,
             gate_mlp,
         ) = (self.scale_shift_table[None] + timestep_mod.reshape(x.shape[0], 9, -1)).chunk(9, dim=1)
+        if self.use_image_attention:
+            if self.image_attn_mod is not None:
+                img_mod = self.image_attn_mod(t_emb)
+            elif image_attn_t_mod is None:
+                raise ValueError("shared_adaln blocks need the precomputed image_attn_t_mod")
+            else:
+                img_mod = image_attn_t_mod
+            shift_img, scale_img, gate_img = (
+                self.image_attn_scale_shift_table[None] + img_mod.reshape(x.shape[0], 3, -1)
+            ).chunk(3, dim=1)
         if self.parallel_block:
             base = x
             branches = [
-                gate_msa * self.self_attn(modulate(self.norm1(base), shift_msa, scale_msa)),
-                gate_cross
-                * self._cross_attention(
-                    modulate(self.norm3(base), shift_cross, scale_cross),
-                    text_tokens,
-                    text_key_padding_mask,
-                    text_attn_bias,
-                ),
+                gate_msa * self._mixer(modulate(self.norm1(base), shift_msa, scale_msa), mixer_perm, mixer_perm_inv),
                 gate_mlp * self.mlp(modulate(self.norm2(base), shift_mlp, scale_mlp), height=height, width=width),
             ]
+            if self.use_cross_attention:
+                branches.append(
+                    gate_cross
+                    * self._cross_attention(
+                        modulate(self.norm3(base), shift_cross, scale_cross),
+                        text_tokens,
+                        text_key_padding_mask,
+                        text_attn_bias,
+                    )
+                )
             if self.use_image_attention:
-                image_attn_mod = self.image_attn_mod(t_emb)
-                shift_img, scale_img, gate_img = (
-                    self.image_attn_scale_shift_table[None] + image_attn_mod.reshape(x.shape[0], 3, -1)
-                ).chunk(3, dim=1)
                 branches.append(
                     gate_img * self.image_attn(modulate(self.image_attn_norm(base), shift_img, scale_img))
                 )
             return base + sum(branches)
 
-        x = x + gate_msa * self.self_attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        x = x + gate_msa * self._mixer(modulate(self.norm1(x), shift_msa, scale_msa), mixer_perm, mixer_perm_inv)
         if self.use_image_attention:
-            image_attn_mod = self.image_attn_mod(t_emb)
-            shift_img, scale_img, gate_img = (
-                self.image_attn_scale_shift_table[None] + image_attn_mod.reshape(x.shape[0], 3, -1)
-            ).chunk(3, dim=1)
             x = x + gate_img * self.image_attn(modulate(self.image_attn_norm(x), shift_img, scale_img))
-        x = x + gate_cross * self._cross_attention(
-            modulate(self.norm3(x), shift_cross, scale_cross),
-            text_tokens,
-            text_key_padding_mask,
-            text_attn_bias,
-        )
+        if self.use_cross_attention:
+            x = x + gate_cross * self._cross_attention(
+                modulate(self.norm3(x), shift_cross, scale_cross),
+                text_tokens,
+                text_key_padding_mask,
+                text_attn_bias,
+            )
         x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp), height=height, width=width)
         return x
 
@@ -870,7 +974,9 @@ class BoomerFLADualStreamBlock(nn.Module):
         self.hidden_dim = hidden_dim
         self.parallel_block = config.parallel_block
 
-        self.image_mod = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
+        self.image_mod = (
+            None if config.shared_adaln else nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
+        )
         self.image_norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
         self.image_qkv = nn.Linear(hidden_dim, hidden_dim * 3)
         self.image_q_norm = AttentionRMSNorm(self.head_dim, scale_factor=1.0, eps=1e-6)
@@ -880,7 +986,9 @@ class BoomerFLADualStreamBlock(nn.Module):
         self.image_mlp = GLUMBConv(hidden_dim, config.mlp_ratio)
         self.image_scale_shift_table = nn.Parameter(torch.zeros(6, hidden_dim))
 
-        self.text_mod = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
+        self.text_mod = (
+            None if config.shared_adaln else nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
+        )
         self.text_norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
         self.text_qkv = nn.Linear(hidden_dim, hidden_dim * 3)
         self.text_q_norm = AttentionRMSNorm(self.head_dim, scale_factor=1.0, eps=1e-6)
@@ -933,15 +1041,15 @@ class BoomerFLADualStreamBlock(nn.Module):
             coord_ids = torch.cat([text_coord_ids, image_coord_ids], dim=1)
             q, k = coord_rope.apply(q, k, coord_ids)
 
-        image_mask = torch.zeros(
+        # Bool SDPA mask (True = attend): image tokens always attend; padded text is masked.
+        image_attend = torch.ones(
             image_tokens.shape[0],
             image_tokens.shape[1],
             device=image_tokens.device,
-            dtype=text_key_padding_mask.dtype,
+            dtype=torch.bool,
         )
-        key_padding_mask = torch.cat([text_key_padding_mask, image_mask], dim=1)
-        attn_bias = key_padding_mask[:, None, None, :].to(dtype=q.dtype)
-        attn_bias = attn_bias.masked_fill(attn_bias > 0, -10000.0)
+        attend_mask = torch.cat([~text_key_padding_mask.bool(), image_attend], dim=1)
+        attn_bias = attend_mask[:, None, None, :]
         out = F.scaled_dot_product_attention(
             q.transpose(1, 2),
             k.transpose(1, 2),
@@ -967,10 +1075,18 @@ class BoomerFLADualStreamBlock(nn.Module):
         coord_rope: MultimodalCoordinateRoPE | None = None,
         image_coord_ids: torch.Tensor | None = None,
         text_coord_ids: torch.Tensor | None = None,
+        image_t_mod: torch.Tensor | None = None,
+        text_t_mod: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         del text_attn_bias
-        image_timestep_mod = self.image_mod(t_emb)
-        text_timestep_mod = self.text_mod(t_emb)
+        if self.image_mod is not None:
+            image_timestep_mod = self.image_mod(t_emb)
+            text_timestep_mod = self.text_mod(t_emb)
+        elif image_t_mod is None or text_t_mod is None:
+            raise ValueError("shared_adaln dual-stream blocks need precomputed image_t_mod/text_t_mod")
+        else:
+            image_timestep_mod = image_t_mod
+            text_timestep_mod = text_t_mod
         image_shift_attn, image_scale_attn, image_gate_attn, image_shift_mlp, image_scale_mlp, image_gate_mlp = (
             self.image_scale_shift_table[None] + image_timestep_mod.reshape(x.shape[0], 6, -1)
         ).chunk(6, dim=1)
@@ -1029,6 +1145,8 @@ class BoomerFLADiT(nn.Module):
             raise ValueError(f"dual_stream_depth must be non-negative, got {config.dual_stream_depth}")
         if config.dual_stream_depth > config.depth:
             raise ValueError(f"dual_stream_depth={config.dual_stream_depth} exceeds depth={config.depth}")
+        if config.cross_attention_every < 1:
+            raise ValueError(f"cross_attention_every must be >= 1, got {config.cross_attention_every}")
         self.config = config
         hidden_dim = config.hidden_dim
         self.patch_size = config.patch_size
@@ -1046,7 +1164,31 @@ class BoomerFLADiT(nn.Module):
             )
         )
         self.pos_embed = nn.Parameter(torch.zeros(1, token_count, hidden_dim)) if config.use_abs_pos_embed else None
-        self.t_embedder = TimestepEmbedder(hidden_dim)
+        self.t_embedder = (
+            FourierTimestepEmbedder(hidden_dim) if config.fourier_timestep_embed else TimestepEmbedder(hidden_dim)
+        )
+        # adaLN-single (PixArt-alpha): shared timestep modulation projections, computed once
+        # per forward and consumed by every block alongside its per-block scale_shift_table.
+        # Each is only built if a block of that shape exists, so no parameter is ever unused.
+        self.shared_mod = None
+        self.shared_image_attn_mod = None
+        self.shared_dual_image_mod = None
+        self.shared_dual_text_mod = None
+        if config.shared_adaln:
+            if config.dual_stream_depth < config.depth:
+                self.shared_mod = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 9))
+            has_image_attn = config.image_attention_every > 0 and any(
+                (i + 1) % config.image_attention_every == 0
+                for i in range(config.dual_stream_depth, config.depth)
+            )
+            if has_image_attn:
+                self.shared_image_attn_mod = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 3))
+            if config.dual_stream_depth > 0:
+                self.shared_dual_image_mod = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
+                self.shared_dual_text_mod = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
+        # Hilbert mixer-order permutations, cached per (height, width, device); index
+        # tensors only, never serialized.
+        self._hilbert_perms: dict[tuple[int, int, str], tuple[torch.Tensor, torch.Tensor]] = {}
         self.caption_embedder = CaptionEmbedder(config.text_dim, hidden_dim, config.text_seq_len)
         self.attention_y_norm = (
             AttentionRMSNorm(hidden_dim, scale_factor=config.y_norm_scale_factor) if config.y_norm else None
@@ -1099,20 +1241,33 @@ class BoomerFLADiT(nn.Module):
 
         for block in self.blocks:
             if isinstance(block, BoomerFLADualStreamBlock):
-                nn.init.zeros_(block.image_mod[1].weight)
-                nn.init.zeros_(block.image_mod[1].bias)
-                nn.init.zeros_(block.text_mod[1].weight)
-                nn.init.zeros_(block.text_mod[1].bias)
+                if block.image_mod is not None:
+                    nn.init.zeros_(block.image_mod[1].weight)
+                    nn.init.zeros_(block.image_mod[1].bias)
+                    nn.init.zeros_(block.text_mod[1].weight)
+                    nn.init.zeros_(block.text_mod[1].bias)
                 nn.init.normal_(block.image_scale_shift_table, std=0.02)
                 nn.init.normal_(block.text_scale_shift_table, std=0.02)
             else:
-                nn.init.zeros_(block.mod[1].weight)
-                nn.init.zeros_(block.mod[1].bias)
+                if block.mod is not None:
+                    nn.init.zeros_(block.mod[1].weight)
+                    nn.init.zeros_(block.mod[1].bias)
                 nn.init.normal_(block.scale_shift_table, std=0.02)
                 if block.use_image_attention:
-                    nn.init.zeros_(block.image_attn_mod[1].weight)
-                    nn.init.zeros_(block.image_attn_mod[1].bias)
+                    if block.image_attn_mod is not None:
+                        nn.init.zeros_(block.image_attn_mod[1].weight)
+                        nn.init.zeros_(block.image_attn_mod[1].bias)
                     nn.init.normal_(block.image_attn_scale_shift_table, std=0.02)
+
+        for shared in (
+            self.shared_mod,
+            self.shared_image_attn_mod,
+            self.shared_dual_image_mod,
+            self.shared_dual_text_mod,
+        ):
+            if shared is not None:
+                nn.init.zeros_(shared[1].weight)
+                nn.init.zeros_(shared[1].bias)
 
         nn.init.zeros_(self.final_t_block[1].weight)
         nn.init.zeros_(self.final_t_block[1].bias)
@@ -1124,6 +1279,17 @@ class BoomerFLADiT(nn.Module):
         if self.config.extra_input_channels > 0:
             with torch.no_grad():
                 self.x_embedder.weight[:, self.config.latent_channels :].zero_()
+
+    def _mixer_perm(
+        self, height: int, width: int, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (height, width, str(device))
+        cached = self._hilbert_perms.get(key)
+        if cached is None:
+            perm = hilbert_permutation(height, width).to(device)
+            cached = (perm, torch.argsort(perm))
+            self._hilbert_perms[key] = cached
+        return cached
 
     def apply_y_norm(self, caption_tokens: torch.Tensor) -> torch.Tensor:
         if self.attention_y_norm is None:
@@ -1242,9 +1408,23 @@ class BoomerFLADiT(nn.Module):
                 device=x.device,
             )
             text_coord_ids = self.coord_embedder.text_ids(batch, text_tokens.shape[1], device=text_tokens.device)
-        text_attn_bias = text_key_padding_mask[:, None, None, :].to(dtype=x.dtype)
-        text_attn_bias = text_attn_bias.masked_fill(text_attn_bias > 0, -10000.0)
+        # Bool SDPA mask (True = attend); built once and reused by every cross-attn block.
+        text_attn_bias = ~text_key_padding_mask[:, None, None, :]
         t_emb = self.t_embedder(timesteps)
+        # adaLN-single: one shared projection per modulation shape, computed once per forward.
+        t_mod = self.shared_mod(t_emb) if self.shared_mod is not None else None
+        image_attn_t_mod = (
+            self.shared_image_attn_mod(t_emb) if self.shared_image_attn_mod is not None else None
+        )
+        dual_image_t_mod = (
+            self.shared_dual_image_mod(t_emb) if self.shared_dual_image_mod is not None else None
+        )
+        dual_text_t_mod = (
+            self.shared_dual_text_mod(t_emb) if self.shared_dual_text_mod is not None else None
+        )
+        mixer_perm = mixer_perm_inv = None
+        if self.config.hilbert_mixer_order:
+            mixer_perm, mixer_perm_inv = self._mixer_perm(token_height, token_width, x.device)
         use_ckpt = self.config.gradient_checkpointing and self.training
         want_repa = return_repa and self.repa_proj is not None
         want_dispersive = return_dispersive
@@ -1253,17 +1433,20 @@ class BoomerFLADiT(nn.Module):
         for layer_idx, block in enumerate(self.blocks):
             if getattr(block, "updates_text", False):
                 # Dual-stream block: returns (x, text_tokens).
-                # Non-tensor args (height, width, coord_rope, coord IDs) captured via closure.
+                # Non-tensor args (height, width, coord_rope, coord IDs) captured via closure;
+                # shared-adaLN mods are passed as tensor args so checkpointing tracks them.
                 _h, _w = token_height, token_width
                 _cr, _ii, _ti = self.coord_embedder, image_coord_ids, text_coord_ids
                 if use_ckpt:
-                    def _dual_fn(x, tt, te, mk, bi,
+                    def _dual_fn(x, tt, te, mk, bi, im, tm,
                                  _blk=block, h=_h, w=_w, cr=_cr, ii=_ii, ti=_ti):
                         return _blk(x, tt, te, mk, bi,
                                     height=h, width=w, coord_rope=cr,
-                                    image_coord_ids=ii, text_coord_ids=ti)
+                                    image_coord_ids=ii, text_coord_ids=ti,
+                                    image_t_mod=im, text_t_mod=tm)
                     x, text_tokens = _ckpt(_dual_fn, x, text_tokens, t_emb,
                                            text_key_padding_mask, text_attn_bias,
+                                           dual_image_t_mod, dual_text_t_mod,
                                            use_reentrant=False,
                                            preserve_rng_state=False)
                 else:
@@ -1272,22 +1455,29 @@ class BoomerFLADiT(nn.Module):
                         height=token_height, width=token_width,
                         coord_rope=self.coord_embedder,
                         image_coord_ids=image_coord_ids, text_coord_ids=text_coord_ids,
+                        image_t_mod=dual_image_t_mod, text_t_mod=dual_text_t_mod,
                     )
             else:
                 # Single-stream block: returns x only.
                 _h, _w = token_height, token_width
                 if use_ckpt:
-                    def _single_fn(x, tt, te, mk, bi,
-                                   _blk=block, h=_h, w=_w):
-                        return _blk(x, tt, te, mk, bi, height=h, width=w)
+                    def _single_fn(x, tt, te, mk, bi, tm, iam,
+                                   _blk=block, h=_h, w=_w,
+                                   mp=mixer_perm, mpi=mixer_perm_inv):
+                        return _blk(x, tt, te, mk, bi, height=h, width=w,
+                                    t_mod=tm, image_attn_t_mod=iam,
+                                    mixer_perm=mp, mixer_perm_inv=mpi)
                     x = _ckpt(_single_fn, x, text_tokens, t_emb,
                                text_key_padding_mask, text_attn_bias,
+                               t_mod, image_attn_t_mod,
                                use_reentrant=False,
                                preserve_rng_state=False)
                 else:
                     x = block(
                         x, text_tokens, t_emb, text_key_padding_mask, text_attn_bias,
                         height=token_height, width=token_width,
+                        t_mod=t_mod, image_attn_t_mod=image_attn_t_mod,
+                        mixer_perm=mixer_perm, mixer_perm_inv=mixer_perm_inv,
                     )
             if want_repa and layer_idx == self.repa_layer:
                 # Pool image tokens -> project to the SSL space for alignment.

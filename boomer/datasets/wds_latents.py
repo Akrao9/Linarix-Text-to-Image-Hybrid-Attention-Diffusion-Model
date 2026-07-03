@@ -1411,6 +1411,16 @@ class ParquetStreamingLatentCacheDataset(IterableDataset[LatentRecord]):
     # return unused pages to the OS; 4096 rows is infrequent enough to avoid turning
     # allocator maintenance into a throughput bottleneck. 0 disables trimming.
     memory_trim_every: int = 4096
+    # pyarrow range-read tuning (huggingface.co/blog/streaming-datasets). prefetch_ranges
+    # fetches the next byte range in the background while the current one decodes, so the
+    # worker isn't latency-bound on a synchronous socket fill. range_size_mib raises the
+    # per-request size from pyarrow's 32 MiB default, cutting request count against the
+    # ~2 GiB shards. Buffered cost is roughly 2x range per worker with prefetch on, so the
+    # default stays at 64 (not the blog's 128) to protect worker RSS; 0 keeps pyarrow's
+    # default range size. Silently skipped (with a log line) on datasets/pyarrow versions
+    # that don't accept fragment_scan_options.
+    prefetch_ranges: bool = True
+    range_size_mib: int = 64
     # Streaming read retries (datasets re-opens the range on a transient drop). This is
     # the parquet analog of the tar loader's shard retry — but per 128 MiB range, not
     # per whole 2 GB file, so recovery is far cheaper.
@@ -1432,6 +1442,11 @@ class ParquetStreamingLatentCacheDataset(IterableDataset[LatentRecord]):
             raise ValueError("Parquet read_batch_size must be >= 1.")
         if self.memory_trim_every < 0:
             raise ValueError("Parquet memory_trim_every must be >= 0.")
+        if self.range_size_mib < 0:
+            raise ValueError("Parquet range_size_mib must be >= 0 (0 = pyarrow default).")
+        # None = untested, True/False = cached result of the first fragment_scan_options
+        # attempt, so an old datasets version logs the fallback once, not every rebuild.
+        self._fragment_scan_supported: bool | None = None
         # This loader is deliberately an HTTP Range reader. Set the transport before
         # importing/constructing HfFileSystem below; huggingface_hub snapshots these
         # environment flags at import time.
@@ -1478,6 +1493,31 @@ class ParquetStreamingLatentCacheDataset(IterableDataset[LatentRecord]):
             raise FileNotFoundError(f"No parquet shards found for: {self.paths}")
         return files
 
+    def _fragment_scan_options(self):
+        """ParquetFragmentScanOptions for background range prefetch + larger range reads,
+        or None when disabled/unsupported (pyarrow too old to expose CacheOptions)."""
+        if not self.prefetch_ranges and self.range_size_mib == 0:
+            return None
+        if self._fragment_scan_supported is False:
+            return None
+        try:
+            import pyarrow as pa
+            import pyarrow.dataset as pa_ds
+
+            cache_kwargs: dict[str, Any] = {"prefetch_limit": 1 if self.prefetch_ranges else 0}
+            if self.range_size_mib > 0:
+                cache_kwargs["range_size_limit"] = self.range_size_mib << 20
+            return pa_ds.ParquetFragmentScanOptions(cache_options=pa.CacheOptions(**cache_kwargs))
+        except (ImportError, AttributeError, TypeError) as exc:
+            if self._fragment_scan_supported is None:
+                print(
+                    f"[parquet-wds] range prefetch unavailable in this pyarrow "
+                    f"({type(exc).__name__}: {exc}); streaming with defaults",
+                    flush=True,
+                )
+            self._fragment_scan_supported = False
+            return None
+
     def _make_stream(self, epoch: int, *, shuffle_buffer: int):
         import datasets
         from datasets import load_dataset
@@ -1485,14 +1525,34 @@ class ParquetStreamingLatentCacheDataset(IterableDataset[LatentRecord]):
         # datasets' streaming read-retry knobs (the actual retry path for streaming=True).
         datasets.config.STREAMING_READ_MAX_RETRIES = self.download_max_retries
         datasets.config.STREAMING_READ_RETRY_INTERVAL = 5
-        ds = load_dataset(
-            "parquet",
+        kwargs: dict[str, Any] = dict(
             data_files={"train": self._list_files()},
             split="train",
             streaming=True,
             token=self._token(),
             batch_size=max(1, int(self.read_batch_size)),
         )
+        scan_options = self._fragment_scan_options()
+        if scan_options is not None:
+            try:
+                ds = load_dataset("parquet", fragment_scan_options=scan_options, **kwargs)
+                self._fragment_scan_supported = True
+            except (TypeError, ValueError) as exc:
+                # Older datasets reject unknown builder-config keys (ValueError names the
+                # bad key). Anything else — auth, missing files — re-raises untouched.
+                if "fragment_scan_options" not in str(exc):
+                    raise
+                if self._fragment_scan_supported is None:
+                    print(
+                        f"[parquet-wds] this datasets version doesn't accept "
+                        f"fragment_scan_options ({exc}); streaming with defaults. "
+                        "pip install -U datasets huggingface_hub for range prefetch.",
+                        flush=True,
+                    )
+                self._fragment_scan_supported = False
+                ds = load_dataset("parquet", **kwargs)
+        else:
+            ds = load_dataset("parquet", **kwargs)
         if shuffle_buffer > 0:
             ds = ds.shuffle(seed=self.seed + epoch, buffer_size=shuffle_buffer)
         return ds
@@ -1537,7 +1597,9 @@ class ParquetStreamingLatentCacheDataset(IterableDataset[LatentRecord]):
             f"[parquet-wds worker {worker_id}/{num_workers}] "
             f"shuffle_buffer={worker_shuffle_buffer} (global={self.shuffle_buffer}) "
             f"read_batch_size={self.read_batch_size} "
-            f"trim_every={self.memory_trim_every} xet=disabled",
+            f"trim_every={self.memory_trim_every} xet=disabled "
+            f"prefetch={'on' if self.prefetch_ranges else 'off'} "
+            f"range_mib={self.range_size_mib or 'default'}",
             flush=True,
         )
         import time
