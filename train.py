@@ -665,6 +665,7 @@ class SamplePreviewCallback(Callback):
         self.dtype = dtype
         self.hf_token = hf_token
         self._enabled = False
+        self._last_preview_step = -1
         self._prompts: list[str] = []
         self._text_embeddings: torch.Tensor | None = None
         self._attention_masks: torch.Tensor | None = None
@@ -707,8 +708,13 @@ class SamplePreviewCallback(Callback):
         if not self._enabled:
             return
         step = trainer.global_step
-        if step == 0 or step % self.every_n_steps != 0:
+        # on_train_batch_end fires once per MICRO-batch, but global_step advances
+        # only every accumulate_grad_batches steps -- so at an interval boundary the
+        # step-modulo is true for all A micro-batches of the window. Dedup so the
+        # preview runs exactly once per optimizer step.
+        if step == 0 or step % self.every_n_steps != 0 or step == self._last_preview_step:
             return
+        self._last_preview_step = step
         try:
             self._run_preview(trainer, pl_module, step)
         except Exception as exc:  # noqa: BLE001 - a preview must never kill training
