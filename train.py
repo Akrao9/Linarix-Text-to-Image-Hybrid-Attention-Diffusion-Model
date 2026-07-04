@@ -573,40 +573,33 @@ class EMACallback(Callback):
             self.ema = {k: v.float() for k, v in checkpoint["ema"].items()}
 
 
-class BatchUnitProgressBar(TQDMProgressBar):
-    """Fixes a unit mismatch in Lightning's default progress bar under
-    --accumulate > 1 with our streaming (IterableDataset, no __len__) caches.
+class StepUnitProgressBar(TQDMProgressBar):
+    """Progress bar in OPTIMIZER-STEP units: global_step / max_steps.
 
-    Lightning's `total_train_batches` is `min(num_training_batches, max_steps -
-    global_step)`. Our datasets report `num_training_batches = inf`, so this always
-    resolves to `max_steps - global_step` -- REMAINING OPTIMIZER STEPS -- while
-    `on_train_batch_end`'s numerator counts raw micro-batches. With
-    accumulate_grad_batches=A those two agree only when A=1; otherwise the bar reads
-    e.g. "15600/100000" when the real remaining-batches count is ~5x that, because
-    every A micro-batches only advance global_step (the denominator) by 1. Multiply
-    the mislabeled total back into batch units so numerator and denominator agree;
-    only applies to the infinite-dataloader case, so a future finite dataset (where
-    num_training_batches is the real constraint) falls back to the default.
+    Lightning's default bar counts micro-batches, and for our infinite streaming
+    caches it derives the total from max_steps -- which is in optimizer steps, a
+    unit mismatch under --accumulate > 1 (upstream fix: Lightning PR #21802). Rather
+    than reconciling both sides to batch units, display the run in the units every
+    other knob here already uses (warmup, anneals, save cadence, max-steps): the
+    numerator is global_step, the denominator max_steps, and it/s means optimizer
+    steps/s. global_step is restored across ckpt resume, so a resumed session shows
+    absolute progress (e.g. 40000/100000); `initial` is anchored at session start so
+    tqdm's rate/ETA reflect only this session's throughput, not the pre-resume jump.
     """
 
     @property
     def total_train_batches(self) -> int | float:
-        total = super().total_train_batches
-        if self.trainer.num_training_batches == float("inf") and total != float("inf"):
-            return total * self.trainer.accumulate_grad_batches
-        return total
+        if self.trainer.max_steps is not None and self.trainer.max_steps > 0:
+            return self.trainer.max_steps
+        return super().total_train_batches
 
     def on_train_epoch_start(self, trainer, *args) -> None:
         super().on_train_epoch_start(trainer, *args)
-        # Second half of the unit fix, for RESUMED runs: the denominator above is
-        # REMAINING batches from here, but Lightning restores the absolute batch
-        # counter across ckpt resume, so without an offset the numerator measures
-        # "batches since epoch 0 started" and overshoots past 100% late in the last
-        # session. Anchor the numerator to the same window as the denominator.
-        self._batch_offset = trainer.fit_loop.epoch_loop.batch_progress.current.completed
+        self.train_progress_bar.initial = trainer.global_step
+        self.train_progress_bar.n = trainer.global_step
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:
-        n = batch_idx + 1 - getattr(self, "_batch_offset", 0)
+        n = trainer.global_step
         if self._should_update(n, self.train_progress_bar.total):
             self.train_progress_bar.n = n
             self.train_progress_bar.refresh()
@@ -1417,7 +1410,7 @@ def main() -> None:
         LearningRateMonitor(logging_interval="step"),
         # In Colab/non-TTY output tqdm reprints a line every refresh, so throttle the
         # progress bar to the same cadence as metric logging instead of every step.
-        BatchUnitProgressBar(refresh_rate=max(1, args.log_every_steps)),
+        StepUnitProgressBar(refresh_rate=max(1, args.log_every_steps)),
     ]
     ema_cb = None
     if args.ema_decay > 0.0:
