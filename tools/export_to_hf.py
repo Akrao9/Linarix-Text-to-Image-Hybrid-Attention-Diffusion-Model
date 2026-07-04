@@ -191,7 +191,10 @@ def main() -> None:
     parser.add_argument("--latent-mean", type=float, default=0.0)
     parser.add_argument("--latent-std", type=float, default=1.0)
     parser.add_argument("--stork-dir", default=None, help="Dir holding STORKScheduler.py + STORK_constants/.")
-    parser.add_argument("--save-dtype", default="keep", choices=["keep", "bf16", "fp32"])
+    # bf16 by default: it's the inference dtype (the pipeline loads with
+    # torch_dtype=bfloat16), so fp32 storage only doubles the download for no
+    # precision the runtime ever uses. Pass --save-dtype keep/fp32 to override.
+    parser.add_argument("--save-dtype", default="bf16", choices=["keep", "bf16", "fp32"])
     parser.add_argument("--push", action="store_true", help="Upload to --repo-id (off by default).")
     parser.add_argument("--private", action="store_true", help="Create the repo private (with --push).")
     parser.add_argument("--hf-token", default=None)
