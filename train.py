@@ -43,13 +43,14 @@ generating prompt caption_original@1.0, five real subsets 0.1 each sampling the
       --cache-wds "hf://datasets/jasperai/monet/v1.2.0/synthetic/*/*/*.parquet,hf://datasets/jasperai/monet/v1.2.0/cc12m/*/*.parquet,hf://datasets/jasperai/monet/v1.2.0/megalith10m/*/*.parquet,hf://datasets/jasperai/monet/v1.2.0/laion/*/*.parquet,hf://datasets/jasperai/monet/v1.2.0/coyo/*/*.parquet,hf://datasets/jasperai/monet/v1.2.0/commoncatalog-cc-by/*/*.parquet" \
       --monet-weights "0.5,0.1,0.1,0.1,0.1,0.1" \
       --monet-caption-probs "0,0,0,0,1;.25,.25,.25,.25,0;.25,.25,.25,.25,0;.25,.25,.25,.25,0;.25,.25,.25,.25,0;.25,.25,.25,.25,0" \
-      --checkpoint-dir /ckpt_local --checkpoint-upload-remote ./local \
+      --checkpoint-dir /ckpt_local \
+      --checkpoint-upload-remote hf://buckets/akrao9/Boomerv6-ckpt \
       ... (per-GPU --batch-size; global batch = batch_size * devices)
 
 Checkpoints save to --checkpoint-dir (local NVMe) synchronously, then a rank-0
-background thread copies them into --checkpoint-upload-remote — e.g. an HF
-bucket mounted with `hf-mount start bucket akrao9/Boomerv6-ckpt ./local` — and
-prunes local disk to the newest --checkpoint-local-retain once uploaded.
+background thread uploads them to --checkpoint-upload-remote — an HF storage
+bucket via the hf CLI (`hf sync`), an rclone remote, or a mounted directory —
+and prunes local disk to the newest --checkpoint-local-retain once uploaded.
 """
 
 from __future__ import annotations
@@ -1032,12 +1033,15 @@ class CheckpointUploadCallback(Callback):
     pause the step. Local pruning only deletes checkpoints that have already uploaded, so
     a slow upload never loses a checkpoint.
 
-    ``remote`` may be either an rclone remote (e.g. ``gdrive:Boomer/ckpts``) or a
-    directory path such as a mounted Drive folder or an hf-mount'ed HF bucket
-    (``hf-mount start bucket akrao9/Boomerv6-ckpt ./local`` then
-    ``--checkpoint-upload-remote ./local``); directories are copied via tmp-file +
-    rename so a reader never sees a partial file (with a direct-copy fallback for
-    FUSE mounts that reject rename).
+    ``remote`` forms:
+      * ``hf://buckets/<owner>/<bucket>`` — an HF storage bucket, uploaded with the
+        ``hf`` CLI (``hf sync``). Each checkpoint is staged alone (hardlink) into a
+        temp dir and synced, so one call never re-uploads or deletes earlier ones.
+      * an rclone remote (``gdrive:Boomer/ckpts``).
+      * a directory path such as a mounted Drive folder or an hf-mount'ed bucket
+        (``hf-mount start bucket akrao9/Boomerv6-ckpt ./local`` then ``./local``);
+        copied via tmp-file + rename so a reader never sees a partial file (with a
+        direct-copy fallback for FUSE mounts that reject rename).
     """
 
     def __init__(
@@ -1049,6 +1053,7 @@ class CheckpointUploadCallback(Callback):
         keep_uploaded: int = 0,
         rclone_bin: str = "rclone",
         chunk_size: str = "128M",
+        hf_bin: str = "hf",
     ) -> None:
         self.checkpoint_dir = Path(checkpoint_dir)
         self.remote = remote
@@ -1056,9 +1061,12 @@ class CheckpointUploadCallback(Callback):
         self.keep_uploaded = int(keep_uploaded)  # 0 = keep all uploaded
         self.rclone_bin = rclone_bin
         self.chunk_size = chunk_size
-        # rclone remotes look like "name:path"; an absolute/relative dir does not.
-        self.use_rclone = ":" in remote and not os.path.isabs(remote)
-        if not self.use_rclone:
+        self.hf_bin = hf_bin
+        # hf:// = HF bucket via the hf CLI; rclone remotes look like "name:path";
+        # anything else is a plain directory (mount).
+        self.use_hf = remote.startswith("hf://")
+        self.use_rclone = not self.use_hf and ":" in remote and not os.path.isabs(remote)
+        if not self.use_hf and not self.use_rclone:
             remote_dir = Path(remote).resolve()
             local_dir = self.checkpoint_dir.resolve()
             if remote_dir == local_dir or local_dir.is_relative_to(remote_dir):
@@ -1080,7 +1088,15 @@ class CheckpointUploadCallback(Callback):
     def on_fit_start(self, trainer, pl_module) -> None:
         if trainer.global_rank != 0 or self._worker is not None:
             return  # rank 0 only; single worker
-        if self.use_rclone:
+        if self.use_hf:
+            if shutil.which(self.hf_bin) is None:
+                # Fail at fit start, not at the first save 2000 steps in.
+                raise RuntimeError(
+                    f"[ckpt-upload] '{self.hf_bin}' CLI not found for {self.remote}; "
+                    "install it first: curl -LsSf https://hf.co/cli/install.sh | bash"
+                )
+            print(f"[ckpt-upload] hf sync -> {self.remote}", flush=True)
+        elif self.use_rclone:
             print(f"[ckpt-upload] rclone -> {self.remote}", flush=True)
         else:
             os.makedirs(self.remote, exist_ok=True)
@@ -1109,7 +1125,27 @@ class CheckpointUploadCallback(Callback):
     def _upload_one(self, local: Path) -> None:
         if not local.exists():
             return
-        if self.use_rclone:
+        if self.use_hf:
+            import tempfile
+
+            # Stage the ONE finished checkpoint alone (hardlink: same fs, no copy
+            # cost) and sync that dir, so `hf sync` never walks in-progress files in
+            # checkpoint_dir and one upload can't touch previously uploaded ckpts.
+            with tempfile.TemporaryDirectory(dir=str(local.parent)) as stage:
+                link = Path(stage) / local.name
+                try:
+                    os.link(str(local), str(link))
+                except OSError:  # cross-device / fs without hardlinks
+                    shutil.copyfile(str(local), str(link))
+                proc = subprocess.run(
+                    [self.hf_bin, "sync", stage, self.remote],
+                    capture_output=True, text=True,
+                )
+                if proc.returncode != 0:
+                    raise RuntimeError(
+                        f"hf sync exited {proc.returncode}: {proc.stderr.strip()[-500:]}"
+                    )
+        elif self.use_rclone:
             dest = f"{self.remote.rstrip('/')}/{local.name}"
             cmd = [self.rclone_bin, "copyto", str(local), dest,
                    "--drive-chunk-size", self.chunk_size, "--no-traverse"]
@@ -1153,6 +1189,17 @@ class CheckpointUploadCallback(Callback):
                     pass
 
     def _prune_remote(self) -> None:
+        if self.use_hf:
+            # No known bucket-side delete verb in the hf CLI yet; keep every
+            # uploaded checkpoint in the bucket (announce once).
+            if not getattr(self, "_hf_prune_warned", False):
+                self._hf_prune_warned = True
+                print(
+                    f"[ckpt-upload] --checkpoint-keep-uploaded is not supported for "
+                    f"hf:// buckets; keeping all uploads in {self.remote}",
+                    flush=True,
+                )
+            return
         if self.use_rclone:
             out = subprocess.run([self.rclone_bin, "lsf", self.remote],
                                  capture_output=True, text=True)
@@ -1583,12 +1630,15 @@ def build_parser() -> argparse.ArgumentParser:
     # Async checkpoint upload: save locally, copy to Drive/rclone in the background,
     # keep only the newest N local checkpoints (older ones deleted after they upload).
     p.add_argument("--checkpoint-upload-remote", default=None,
-                   help="Background upload destination: an rclone remote "
-                        "(e.g. 'gdrive:Boomer/ckpts') OR a directory such as a mounted "
-                        "Drive folder or an hf-mount'ed HF bucket (e.g. 'hf-mount start "
-                        "bucket akrao9/Boomerv6-ckpt ./local' then pass './local'). "
-                        "Checkpoints always save to --checkpoint-dir (fast local disk) "
-                        "first and copy over asynchronously. Off if unset.")
+                   help="Background upload destination: an HF bucket "
+                        "('hf://buckets/akrao9/Boomerv6-ckpt', uploaded via the hf CLI), "
+                        "an rclone remote ('gdrive:Boomer/ckpts'), OR a directory such as "
+                        "a mounted Drive folder / hf-mount'ed bucket. Checkpoints always "
+                        "save to --checkpoint-dir (fast local disk) first and copy over "
+                        "asynchronously. Off if unset.")
+    p.add_argument("--checkpoint-hf-bin", default="hf",
+                   help="hf CLI executable for hf://buckets/... upload remotes "
+                        "(install: curl -LsSf https://hf.co/cli/install.sh | bash).")
     p.add_argument("--checkpoint-local-retain", type=int, default=2,
                    help="Keep this many newest checkpoints on local disk; older uploaded ones are deleted.")
     p.add_argument("--checkpoint-keep-uploaded", type=int, default=0,
@@ -1904,6 +1954,7 @@ def main() -> None:
             keep_uploaded=args.checkpoint_keep_uploaded,
             rclone_bin=args.checkpoint_rclone_bin,
             chunk_size=args.checkpoint_upload_chunk_size,
+            hf_bin=args.checkpoint_hf_bin,
         )
         callbacks.append(upload_cb)
 
