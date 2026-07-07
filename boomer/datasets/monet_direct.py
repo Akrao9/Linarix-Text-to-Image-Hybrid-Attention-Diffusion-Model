@@ -16,24 +16,42 @@ record, with ``text_embedding`` left EMPTY. Text is encoded on-GPU during
 training by the resident frozen Qwen encoder (train.py ``--monet-direct``), so
 the Qwen-caching pipeline is skipped entirely.
 
+Why a per-file reader instead of ``datasets.load_dataset``: monet is a foreign,
+heterogeneous corpus. ``load_dataset("parquet", data_files=[...])`` infers ONE
+feature schema from the first shard and hard-casts every later shard to it — but
+monet's shards genuinely disagree (e.g. ~9 of 713 cc12m shards store the VAE
+latent column as ``string`` rather than ``list<double>``), so that cast raises
+``Couldn't cast array of type string to List(...)`` the moment a mismatched shard
+is streamed. So this loader reads each shard independently with pyarrow over an
+HF range stream — every shard keeps its own schema, and a shard whose latent
+column isn't a list (unusable) is skipped rather than crashing the run. This
+mirrors how ``tools/cache_monet_parquet_to_boomer_wds.py`` stays robust.
+
 Column pushdown: monet rows also carry thumbnails, CLIP/SSCD embeddings and
-hashes — dead weight several times the size of what we use. The wanted columns
-are resolved once against the first matched file of each glob (schemas differ
-slightly per subset, e.g. commoncatalog has no ``caption_original``) and their
-intersection is pushed down to the Arrow scanner, so those bytes are never
-requested.
+hashes — dead weight several times the size of what we use. ``iter_batches`` is
+given only the columns present in THAT shard's schema, so those bytes are never
+requested (true per-file Parquet projection, not a cross-file intersection).
 """
 
 from __future__ import annotations
 
+import os
+import random
+import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator
 
 import numpy as np
 import torch
+from torch.utils.data import get_worker_info
 
 from boomer.datasets.latent_shards import LatentRecord
-from boomer.datasets.wds_latents import ParquetStreamingLatentCacheDataset
+from boomer.datasets.wds_latents import (
+    ParquetStreamingLatentCacheDataset,
+    _is_transient_stream_error,
+    release_parquet_worker_memory,
+    split_shuffle_buffer_for_worker,
+)
 
 MONET_LATENT_KEY = "embedding_vae-dc-sana1p5-1p6b-1024px-tiling-128-resolution-512x512"
 MONET_CAPTION_KEYS = (
@@ -174,77 +192,22 @@ class MonetDirectStreamingDataset(ParquetStreamingLatentCacheDataset):
             self.caption_keys = tuple(
                 key.strip() for key in self.caption_keys.split(",") if key.strip()
             )
-        self._columns: list[str] | None = None
+        self._fs: Any = None  # lazily-built HfFileSystem, reused across shards
         super().__post_init__()
 
     def _load_manifest(self):
         return None  # monet is a foreign dataset; there is no Boomer cache manifest
 
-    def _dataset_columns(self) -> list[str] | None:
-        """Resolve the pushdown column list ONCE against the first matched file of
-        each glob (footer read only), intersecting availability across globs so a
-        subset missing an optional caption column can't crash the shared stream."""
-        if self._columns is not None:
-            return self._columns
-        import pyarrow.parquet as pq
-
-        available: set[str] | None = None
-        fs = None
-        for raw in self._globs:
-            first = self._first_file_for_glob(raw)
-            if first.startswith("hf://"):
-                if fs is None:
-                    from huggingface_hub import HfFileSystem
-
-                    fs = HfFileSystem(token=self.hf_token)
-                with fs.open(first.removeprefix("hf://"), "rb") as handle:
-                    names = set(pq.read_schema(handle).names)
-            else:
-                names = set(pq.read_schema(first).names)
-            available = names if available is None else (available & names)
-        assert available is not None  # _first_file_for_glob raises on empty globs
-
-        if self.latent_key not in available:
-            raise RuntimeError(
-                f"[monet-direct] latent column {self.latent_key!r} not present in every "
-                f"glob's schema; have {sorted(available)}"
-            )
-        captions = [key for key in self.caption_keys if key in available]
-        if not captions:
-            raise RuntimeError(
-                f"[monet-direct] none of the caption columns {list(self.caption_keys)} "
-                f"are present in every glob's schema; have {sorted(available)}"
-            )
-        columns = [self.latent_key, *captions]
+    def _wanted_columns(self, available: set[str]) -> list[str]:
+        """Per-shard Parquet projection: the columns we consume that THIS shard has.
+        Missing optional captions/dino are simply not requested (schemas vary by
+        subset), so a shard is never rejected for lacking an optional column."""
+        columns = [self.latent_key]
+        columns.extend(key for key in self.caption_keys if key in available)
         if self.dino_key is not None and self.dino_key in available:
             columns.append(self.dino_key)
         columns.extend(c for c in _META_COLUMNS if c in available)
-        self._columns = list(dict.fromkeys(columns))
-        print(
-            f"[monet-direct] column pushdown: {len(self._columns)} of "
-            f"{len(available)} columns (captions: {captions})",
-            flush=True,
-        )
-        return self._columns
-
-    def _first_file_for_glob(self, raw: str) -> str:
-        import glob as _glob
-
-        if raw.startswith("hf://"):
-            from huggingface_hub import HfFileSystem
-
-            fs = HfFileSystem(token=self.hf_token)
-            matched = sorted(fs.glob(raw))
-            if matched:
-                first = matched[0]
-                return first if first.startswith("hf://") else f"hf://{first}"
-        elif any(ch in raw for ch in "*?[]"):
-            matched = sorted(_glob.glob(raw))
-            if matched:
-                return matched[0]
-        else:
-            return raw
-        raise FileNotFoundError(f"[monet-direct] no parquet files match {raw!r}")
+        return list(dict.fromkeys(columns))
 
     def _row_to_record(self, row: dict[str, Any]) -> LatentRecord | None:
         return monet_row_to_record(
@@ -256,6 +219,138 @@ class MonetDirectStreamingDataset(ParquetStreamingLatentCacheDataset):
             max_nsfw=self.max_nsfw,
             max_watermark=self.max_watermark,
         )
+
+    # -- per-file pyarrow streaming ----------------------------------------- #
+    def _hf_filesystem(self):
+        if self._fs is None:
+            from huggingface_hub import HfFileSystem
+
+            self._fs = HfFileSystem(token=self.hf_token)
+        return self._fs
+
+    def _open_parquet(self, path: str) -> tuple[Any, Any]:
+        """Open one shard as (ParquetFile, closeable-handle-or-None). hf:// paths open
+        an fsspec range stream (HTTP Range reads, xet disabled); locals open directly."""
+        import pyarrow.parquet as pq
+
+        if path.startswith("hf://"):
+            handle = self._hf_filesystem().open(path.removeprefix("hf://"), "rb")
+            return pq.ParquetFile(handle), handle
+        return pq.ParquetFile(path), None
+
+    def _iter_shard(self, path: str) -> Iterator[LatentRecord | None]:
+        """Yield decoded records (or None for filtered rows) from one shard. Shards
+        whose latent column is missing or not a list type — the handful of monet
+        shards that store embeddings as strings — are skipped with a warning."""
+        pf, handle = self._open_parquet(path)
+        try:
+            schema = pf.schema_arrow
+            available = set(schema.names)
+            if self.latent_key not in available:
+                print(f"[monet-direct] skip {path}: no {self.latent_key} column", flush=True)
+                return
+            latent_type = str(schema.field(self.latent_key).type)
+            if "list" not in latent_type:
+                # e.g. ~9/713 cc12m shards store the VAE latent as `string`; unusable.
+                print(f"[monet-direct] skip {path}: latent column is {latent_type}, not a list",
+                      flush=True)
+                return
+            want = self._wanted_columns(available)
+            for batch in pf.iter_batches(columns=want, batch_size=max(1, int(self.read_batch_size))):
+                cols = {c: batch.column(c).to_pylist() for c in batch.schema.names}
+                for i in range(batch.num_rows):
+                    yield self._row_to_record({c: cols[c][i] for c in cols})
+        finally:
+            if handle is not None:
+                handle.close()
+
+    def __iter__(self) -> Iterator[LatentRecord]:
+        worker = get_worker_info()
+        num_workers = worker.num_workers if worker is not None else 1
+        worker_id = worker.id if worker is not None else 0
+
+        # Range reads, not Xet whole-file reconstruction (bounds per-worker RSS).
+        os.environ["HF_HUB_DISABLE_XET"] = "1"
+        os.environ["HF_XET_HIGH_PERFORMANCE"] = "0"
+
+        files = self._list_files()
+        my_files = files[worker_id::num_workers] if num_workers > 1 else list(files)
+        if not my_files:  # more workers than shards: let this worker read them all
+            my_files = list(files)
+        buffer_cap = split_shuffle_buffer_for_worker(self.shuffle_buffer, num_workers)
+        print(
+            f"[monet-direct worker {worker_id}/{num_workers}] {len(my_files)} shard(s) "
+            f"shuffle_buffer={buffer_cap} (global={self.shuffle_buffer}) "
+            f"read_batch_size={self.read_batch_size} trim_every={self.memory_trim_every}",
+            flush=True,
+        )
+
+        buffer: list[LatentRecord] = []
+        epoch = 0
+        reconnects = 0
+        rows = 0
+        while True:  # IterableDataset: loop epochs forever; Trainer stops at max_steps
+            order = list(my_files)
+            random.Random(self.seed + worker_id + epoch).shuffle(order)
+            yielded = 0
+            for path in order:
+                try:
+                    shard = self._iter_shard(path)
+                    while True:
+                        try:
+                            record = next(shard)
+                        except StopIteration:
+                            break
+                        reconnects = 0  # a successful read clears the failure budget
+                        if record is None:
+                            continue
+                        rows += 1
+                        # Streaming reservoir shuffle: once the buffer is full, emit a
+                        # random resident and replace it with the incoming record.
+                        if buffer_cap > 0:
+                            if len(buffer) < buffer_cap:
+                                buffer.append(record)
+                            else:
+                                j = random.randrange(len(buffer))
+                                out, buffer[j] = buffer[j], record
+                                yielded += 1
+                                yield out
+                        else:
+                            yielded += 1
+                            yield record
+                        if self.memory_trim_every > 0 and rows % self.memory_trim_every == 0:
+                            release_parquet_worker_memory()
+                except Exception as exc:  # noqa: BLE001 - classify transient vs fatal
+                    if not _is_transient_stream_error(exc):
+                        raise
+                    reconnects += 1
+                    if reconnects > self.stream_reconnect_max_retries:
+                        raise RuntimeError(
+                            f"[monet-direct] {reconnects} consecutive transient errors "
+                            f"streaming {self.paths}; giving up. Last: {exc!r}"
+                        ) from exc
+                    delay = min(self.stream_reconnect_backoff * 2.0 ** (reconnects - 1), 60.0)
+                    print(
+                        f"[monet-direct worker {worker_id}] transient error on {path} "
+                        f"({type(exc).__name__}: {exc}); skipping shard "
+                        f"(retry {reconnects}/{self.stream_reconnect_max_retries}) after {delay:.0f}s",
+                        flush=True,
+                    )
+                    time.sleep(delay)
+                    continue
+            # Drain the shuffle buffer at epoch end so its rows aren't starved forever.
+            random.shuffle(buffer)
+            for record in buffer:
+                yielded += 1
+                yield record
+            buffer.clear()
+            if yielded == 0:
+                raise RuntimeError(
+                    f"[monet-direct] streamed 0 usable rows for {self.paths} across "
+                    f"{len(my_files)} shard(s) ({rows} rows read; all filtered or "
+                    "string-latent shards?) — refusing to spin an empty epoch loop."
+                )
+            epoch += 1
 
 
 __all__ = [

@@ -154,6 +154,56 @@ def test_training_step_encodes_captions_on_the_fly() -> None:
     assert module.model.caption_embedder.y_proj[0].weight.grad is not None
 
 
+def _write_monet_parquet(path, n: int, *, latent_as_string: bool = False) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    if latent_as_string:  # the ~9/713 cc12m shards that store the latent as a string
+        latent = pa.array(["corrupt"] * n, pa.string())
+    else:
+        latent = pa.array([[float(i)] * (32 * 16 * 16) for i in range(n)], pa.list_(pa.float64()))
+    table = pa.table({
+        MONET_LATENT_KEY: latent,
+        "caption_gemini-2.5-flash-lite": pa.array([f"cap {i}" for i in range(n)]),
+        "__key__": pa.array([f"k{i}" for i in range(n)]),
+        "source": pa.array(["cc12m"] * n),
+    })
+    pq.write_table(table, str(path))
+
+
+def test_per_file_reader_skips_string_latent_shard(tmp_path) -> None:
+    import itertools
+
+    from boomer.datasets.monet_direct import MonetDirectStreamingDataset
+
+    # A good shard (list latents) and a string-latent shard in the same glob: the
+    # string shard is what crashed the datasets path; here it must be skipped and the
+    # good rows stream through unaffected.
+    _write_monet_parquet(tmp_path / "aaa_good.parquet", 4, latent_as_string=False)
+    _write_monet_parquet(tmp_path / "zzz_bad.parquet", 3, latent_as_string=True)
+    ds = MonetDirectStreamingDataset(
+        paths=f"{tmp_path}/*.parquet", shuffle_buffer=0, dino_key=None,
+    )
+    recs = list(itertools.islice(iter(ds), 4))  # exactly one epoch of the good shard
+    assert len(recs) == 4
+    assert all(r.image_latent.shape == (32, 16, 16) for r in recs)
+    assert sorted(r.caption for r in recs) == ["cap 0", "cap 1", "cap 2", "cap 3"]
+
+
+def test_per_file_reader_shuffle_buffer(tmp_path) -> None:
+    import itertools
+
+    from boomer.datasets.monet_direct import MonetDirectStreamingDataset
+
+    _write_monet_parquet(tmp_path / "s.parquet", 16, latent_as_string=False)
+    ds = MonetDirectStreamingDataset(
+        paths=f"{tmp_path}/s.parquet", shuffle_buffer=8, dino_key=None, seed=0,
+    )
+    recs = list(itertools.islice(iter(ds), 16))
+    # Reservoir shuffle must neither drop nor duplicate within an epoch's worth of rows.
+    assert sorted(r.caption for r in recs) == sorted(f"cap {i}" for i in range(16))
+
+
 def test_monet_direct_cli_flags_parse() -> None:
     from train import build_parser
 
