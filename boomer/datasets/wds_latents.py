@@ -1458,13 +1458,23 @@ class ParquetStreamingLatentCacheDataset(IterableDataset[LatentRecord]):
             self._globs = [str(p) for p in self.paths]
         # Range reads honor this (cancellable requests path) — the core stall fix.
         os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", str(int(self.download_timeout)))
-        self.manifest = load_wds_cache_manifest(self.paths, hf_token=self.hf_token)
+        self.manifest = self._load_manifest()
         # Best-effort shard count for a startup log line (don't fail the run on a glob hiccup).
         try:
             n = len(self._list_files())
             print(f"[parquet-wds] streaming {n} parquet shard(s) for {self.paths}", flush=True)
         except Exception as exc:  # noqa: BLE001 - logging only
             print(f"[parquet-wds] shard pre-count skipped ({exc})", flush=True)
+
+    def _load_manifest(self) -> WdsCacheManifest | None:
+        """Boomer-cache manifest lookup. Subclasses streaming a foreign dataset (no
+        manifest exists) override this to skip the network probing entirely."""
+        return load_wds_cache_manifest(self.paths, hf_token=self.hf_token)
+
+    def _dataset_columns(self) -> list[str] | None:
+        """Optional Parquet column pushdown for load_dataset. None = read every column
+        (correct for Boomer's own caches, whose rows carry nothing extraneous)."""
+        return None
 
     def _token(self) -> str | None:
         if self.hf_token is True:
@@ -1532,6 +1542,9 @@ class ParquetStreamingLatentCacheDataset(IterableDataset[LatentRecord]):
             token=self._token(),
             batch_size=max(1, int(self.read_batch_size)),
         )
+        columns = self._dataset_columns()
+        if columns is not None:
+            kwargs["columns"] = columns
         scan_options = self._fragment_scan_options()
         if scan_options is not None:
             try:
@@ -1638,6 +1651,7 @@ class ParquetStreamingLatentCacheDataset(IterableDataset[LatentRecord]):
                 continue
             build_no += 1
             n = 0
+            yielded = 0
             completed = False
             stream_iter = iter(stream)
             while True:
@@ -1668,8 +1682,11 @@ class ParquetStreamingLatentCacheDataset(IterableDataset[LatentRecord]):
                     break  # leave inner loop -> rebuild a fresh stream + HTTP client
                 # A successful read clears the consecutive-failure budget.
                 reconnects = 0
-                yield self._row_to_record(row)
+                record = self._row_to_record(row)
                 n += 1
+                if record is not None:  # None = row dropped by a subclass filter
+                    yielded += 1
+                    yield record
                 if self.memory_trim_every > 0 and n % self.memory_trim_every == 0:
                     rss_before = _current_rss_mib()
                     arrow_before, arrow_after = release_parquet_worker_memory()
@@ -1688,10 +1705,11 @@ class ParquetStreamingLatentCacheDataset(IterableDataset[LatentRecord]):
                         )
             # Only a cleanly-completed pass can trip the empty-shard guard; a
             # reconnect-break just rebuilds without falsely flagging "empty".
-            if completed and n == 0:
+            if completed and yielded == 0:
                 raise RuntimeError(
-                    f"[parquet-wds] stream yielded 0 rows for {self.paths} "
-                    "(empty/unreadable shards?) — refusing to spin an empty epoch loop."
+                    f"[parquet-wds] stream yielded 0 usable rows for {self.paths} "
+                    f"({n} rows read; empty shards, or every row filtered out?) — "
+                    "refusing to spin an empty epoch loop."
                 )
 
 

@@ -22,6 +22,17 @@ Example (from scratch, 701M GDN-2 on the PD12M Qwen cache):
       --t-sampler plateau-logit-normal --flow-shift 1.5 --min-snr-gamma 5 \
       --ema-decay 0.9999 --max-steps 100000 \
       --checkpoint-dir /content/ckpt_stage0 --hf-token true
+
+Direct-monet mode (--monet-direct): no cache build. --cache-wds points at raw
+jasperai/monet parquet globs; the dataset's precomputed SANA f32c32 latents are
+used as-is and captions are encoded on-GPU every step by a resident frozen Qwen
+encoder (default Qwen/Qwen3.5-4B, hidden_states layer -2):
+
+    python3 train.py --monet-direct \
+      --cache-wds "hf://datasets/jasperai/monet/v1.2.0/cc12m/*/*.parquet,hf://datasets/jasperai/monet/v1.2.0/laion/*/*.parquet" \
+      --text-encoder-id Qwen/Qwen3.5-4B --text-encoder-layer -2 --text-encoder-max-length 300 \
+      --monet-min-aesthetic 4.5 --sample-prompts-file eval_prompts.txt \
+      ... (model/optim flags as usual; text dims are auto-set from the encoder)
 """
 
 from __future__ import annotations
@@ -63,10 +74,22 @@ except ImportError:  # pragma: no cover
     from pytorch_lightning.loggers import WandbLogger
 
 from boomer.datasets.latent_shards import collate_latent_records  # noqa: E402
+from boomer.datasets.monet_direct import (  # noqa: E402
+    MONET_CAPTION_KEYS,
+    MONET_DINO_KEY,
+    MONET_LATENT_KEY,
+    MonetDirectStreamingDataset,
+    collate_monet_records,
+)
 from boomer.datasets.wds_latents import (  # noqa: E402
     ParquetStreamingLatentCacheDataset,
     PrefetchingWdsLatentCacheDataset,
     StreamingWdsLatentCacheDataset,
+)
+from boomer.models.qwen_connector import (  # noqa: E402
+    QwenConnectorConfig,
+    QwenReferenceEncoder,
+    encode_qwen_text_fixed,
 )
 from boomer.models.boomer_fla_dit import BoomerFLADiTConfig  # noqa: E402
 from boomer.models.factory import create_model  # noqa: E402
@@ -125,13 +148,63 @@ def dispersive_loss(z: torch.Tensor, temperature: float, metric: str) -> torch.T
 # LightningModule
 # --------------------------------------------------------------------------- #
 class BoomerLit(pl.LightningModule):
-    def __init__(self, model_config: BoomerFLADiTConfig, **hp: Any) -> None:
+    def __init__(
+        self,
+        model_config: BoomerFLADiTConfig,
+        hf_token: str | bool | None = None,
+        **hp: Any,
+    ) -> None:
         super().__init__()
         self.save_hyperparameters({**hp, "model_config": model_config.__dict__})
         self.config = model_config
         self.model = create_model(model_config)
+        # Frozen on-the-fly text encoder (--monet-direct). Kept in a plain list so it is
+        # NOT a registered submodule: it must stay out of state_dict (checkpoints would
+        # grow by the full encoder), out of self.model.parameters() (optimizer + grad
+        # clip), and out of Lightning's device management (moved lazily on first use).
+        self._hf_token = hf_token
+        self._text_encoder_box: list[QwenReferenceEncoder] = []
         if hp.get("compile"):
             self.model = torch.compile(self.model, mode=hp.get("compile_mode", "default"))
+
+    def _resident_text_encoder(self) -> QwenReferenceEncoder:
+        if not self._text_encoder_box:
+            hp = self.hparams
+            cfg = QwenConnectorConfig(
+                qwen_model_id=hp.text_encoder_id,
+                readout_layer=hp.text_encoder_layer,
+                instruction=(
+                    QwenConnectorConfig.instruction if hp.text_encoder_instruction else None
+                ),
+                dtype="bf16",
+                max_text_tokens=hp.text_encoder_max_length,
+            )
+            encoder = QwenReferenceEncoder(cfg, hf_token=self._hf_token)
+            encoder.load()
+            print(
+                f"[text-encoder] {hp.text_encoder_id} resident (hidden={encoder.hidden_size}, "
+                f"layer={hp.text_encoder_layer}, max_length={hp.text_encoder_max_length})",
+                flush=True,
+            )
+            self._text_encoder_box.append(encoder)
+        encoder = self._text_encoder_box[0]
+        param = next(encoder.model.parameters())
+        if param.device != self.device:
+            encoder.to(self.device)
+        return encoder
+
+    def encode_captions(self, captions: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode raw captions with the resident frozen Qwen encoder.
+
+        Returns fixed-shape ``(text [B, L, D] fp32, mask [B, L])`` on self.device.
+        ``encode_qwen_text_fixed`` runs under inference_mode, so both outputs are
+        cloned to ordinary tensors before they enter the training graph (inference
+        tensors cannot be saved for backward).
+        """
+        hp = self.hparams
+        encoder = self._resident_text_encoder()
+        hidden, mask = encode_qwen_text_fixed(encoder, captions, hp.text_encoder_max_length)
+        return hidden.float().clone(), mask.clone()
 
     def on_save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
         # Keep inference self-describing even though Lightning's native state uses
@@ -147,8 +220,13 @@ class BoomerLit(pl.LightningModule):
         if hp.latent_mean != 0.0 or hp.latent_std != 1.0:
             x0 = (x0 - hp.latent_mean) / hp.latent_std
 
-        text = batch["text_embedding"]
-        mask = batch["attention_mask"]
+        text = batch.get("text_embedding")
+        if text is None:
+            # --monet-direct: the batch carries raw captions; encode them on-GPU with
+            # the resident frozen Qwen encoder (no cached text in the stream).
+            text, mask = self.encode_captions(batch["caption"])
+        else:
+            mask = batch["attention_mask"]
         text, mask = self.model.apply_condition_dropout(text, mask, hp.cond_dropout)
 
         noise = torch.randn_like(x0)
@@ -414,8 +492,22 @@ class BoomerData(pl.LightningDataModule):
         parquet_memory_trim_every: int = 4096,
         parquet_prefetch_ranges: bool = True,
         parquet_range_size_mib: int = 64,
+        monet_direct: bool = False,
+        monet_latent_key: str = MONET_LATENT_KEY,
+        monet_caption_keys: tuple[str, ...] = MONET_CAPTION_KEYS,
+        monet_dino_key: str | None = MONET_DINO_KEY,
+        monet_min_aesthetic: float | None = None,
+        monet_max_nsfw: float | None = None,
+        monet_max_watermark: float | None = None,
     ) -> None:
         super().__init__()
+        self.monet_direct = monet_direct
+        self.monet_latent_key = monet_latent_key
+        self.monet_caption_keys = monet_caption_keys
+        self.monet_dino_key = monet_dino_key
+        self.monet_min_aesthetic = monet_min_aesthetic
+        self.monet_max_nsfw = monet_max_nsfw
+        self.monet_max_watermark = monet_max_watermark
         self.cache_wds = cache_wds
         self.local_dir = local_dir
         self.prefetch_shards = prefetch_shards
@@ -451,6 +543,24 @@ class BoomerData(pl.LightningDataModule):
         return 0
 
     def _dataset(self, *, seed_salt: int = 0):
+        if self.monet_direct:
+            return MonetDirectStreamingDataset(
+                paths=self.cache_wds,
+                hf_token=self.hf_token,
+                shuffle_buffer=self.shuffle_buffer,
+                seed=self.seed + seed_salt,
+                download_max_retries=self.download_max_retries,
+                read_batch_size=self.parquet_read_batch_size,
+                memory_trim_every=self.parquet_memory_trim_every,
+                prefetch_ranges=self.parquet_prefetch_ranges,
+                range_size_mib=self.parquet_range_size_mib,
+                latent_key=self.monet_latent_key,
+                caption_keys=self.monet_caption_keys,
+                dino_key=self.monet_dino_key,
+                min_aesthetic=self.monet_min_aesthetic,
+                max_nsfw=self.monet_max_nsfw,
+                max_watermark=self.monet_max_watermark,
+            )
         return make_wds_dataset(
             cache_wds=self.cache_wds,
             local_dir=self.local_dir,
@@ -473,7 +583,7 @@ class BoomerData(pl.LightningDataModule):
         # The rolling remote TAR cache REQUIRES num_workers=0 (single-process shard
         # download). Parquet range-streaming and local globs use multiple workers
         # (datasets shards parquet files across workers automatically).
-        parquet = is_parquet_cache(self.cache_wds)
+        parquet = self.monet_direct or is_parquet_cache(self.cache_wds)
         if parquet:
             workers = self.num_workers
         elif is_remote_cache(self.cache_wds):
@@ -526,7 +636,7 @@ class BoomerData(pl.LightningDataModule):
             self._dataset(seed_salt=seed_salt),
             batch_size=self.batch_size,
             num_workers=workers,
-            collate_fn=collate_latent_records,
+            collate_fn=collate_monet_records if self.monet_direct else collate_latent_records,
             pin_memory=self.pin_memory,
             drop_last=True,
             persistent_workers=persistent and workers > 0,
@@ -647,9 +757,16 @@ class SamplePreviewCallback(Callback):
         scaling_factor: float,
         max_length: int,
         hf_token: str | bool | None,
+        encode_on_the_fly: bool = False,
+        prompts_file: str | None = None,
     ) -> None:
         self.every_n_steps = every_n_steps
         self.prompts_cache = prompts_cache
+        # --monet-direct: pre-encoded prompt caches were built with the OLD encoder
+        # (wrong dim/layer), so only prompt STRINGS are loaded and the resident
+        # training encoder embeds them lazily at the first preview.
+        self.encode_on_the_fly = encode_on_the_fly
+        self.prompts_file = prompts_file
         self.ema_callback = ema_callback
         self.use_ema = use_ema
         self.steps = steps
@@ -683,6 +800,26 @@ class SamplePreviewCallback(Callback):
             return
         if not isinstance(trainer.logger, WandbLogger):
             print("[sample-preview] no WandbLogger; previews disabled.", flush=True)
+            return
+        if self.encode_on_the_fly:
+            if self.prompts_file and Path(self.prompts_file).is_file():
+                lines = Path(self.prompts_file).read_text(encoding="utf-8").splitlines()
+                self._prompts = [line.strip() for line in lines if line.strip()]
+            elif Path(self.prompts_cache).is_file():
+                # Reuse only the prompt strings; the cached embeddings belong to the
+                # cache-era encoder and would be the wrong dim/representation.
+                payload = torch.load(self.prompts_cache, map_location="cpu", weights_only=False)
+                self._prompts = list(payload["prompts"])
+            if not self._prompts:
+                print(f"[sample-preview] no prompts found ({self.prompts_file or self.prompts_cache}); "
+                      "previews disabled. Pass --sample-prompts-file with one prompt per line.",
+                      flush=True)
+                return
+            self._enabled = True
+            print(f"[sample-preview] {len(self._prompts)} prompts (encoded on the fly by the "
+                  f"resident text encoder), every {self.every_n_steps} steps "
+                  f"({'EMA' if self.use_ema else 'live'} weights, {self.sampler}, {self.steps} steps).",
+                  flush=True)
             return
         path = Path(self.prompts_cache)
         if not path.is_file():
@@ -725,6 +862,13 @@ class SamplePreviewCallback(Callback):
 
     def _run_preview(self, trainer, pl_module, step: int) -> None:
         import wandb
+
+        if self.encode_on_the_fly and self._text_embeddings is None:
+            # One-time: the encoder is frozen and the prompts fixed, so encode once
+            # and keep the embeddings on CPU (sliced back to GPU per prompt below).
+            emb, mask = pl_module.encode_captions(self._prompts)
+            self._text_embeddings = emb.cpu()
+            self._attention_masks = mask.cpu()
 
         device = str(pl_module.device)
         device_type = "cuda" if "cuda" in device else "cpu"
@@ -996,6 +1140,20 @@ def peek_record(args: argparse.Namespace, hf_token: str | bool | None) -> Any:
     return next(iter(ds))
 
 
+def text_encoder_hidden_size(model_id: str, hf_token: str | bool | None) -> int:
+    """Read the encoder's hidden size from its HF config (one small config.json fetch),
+    so --monet-direct can size the DiT's text_dim before the encoder itself loads."""
+    from transformers import AutoConfig
+
+    cfg = AutoConfig.from_pretrained(model_id, token=hf_token or None)
+    hidden = getattr(cfg, "hidden_size", None)
+    if not hidden:
+        hidden = getattr(getattr(cfg, "text_config", None), "hidden_size", None)
+    if not hidden:
+        raise RuntimeError(f"Could not read hidden_size from {model_id}'s config")
+    return int(hidden)
+
+
 def build_config(args: argparse.Namespace, record: Any) -> BoomerFLADiTConfig:
     # With --skip-peek, record is None and dims come from the explicit flags (no shard
     # download at startup). Otherwise dims are read from one peeked cache record.
@@ -1108,6 +1266,33 @@ def build_parser() -> argparse.ArgumentParser:
                         "fewer requests but ~2x this buffered per worker with prefetch on; "
                         "0 keeps the pyarrow default.")
     p.add_argument("--hf-token", default=None, help="HF token, or 'true' for the logged-in token.")
+
+    # Direct jasperai/monet streaming (no cache build): --cache-wds points at raw monet
+    # parquet globs (e.g. hf://datasets/jasperai/monet/v1.2.0/cc12m/*/*.parquet), the
+    # precomputed SANA f32c32 latents are used as-is, and captions are encoded on-GPU
+    # every step by a resident frozen Qwen encoder (see --text-encoder-*).
+    p.add_argument("--monet-direct", action=bo, default=False,
+                   help="Stream jasperai/monet parquet shards directly: latents from the "
+                        "dataset, text encoded on the fly (skips the caching pipeline).")
+    p.add_argument("--monet-latent-key", default=MONET_LATENT_KEY)
+    p.add_argument("--monet-caption-keys", default=",".join(MONET_CAPTION_KEYS),
+                   help="comma-ordered caption-column priority; first non-empty per row wins.")
+    p.add_argument("--monet-dino", action=bo, default=True,
+                   help="carry monet's DINOv2 embedding into batches (REPA target).")
+    p.add_argument("--monet-min-aesthetic", type=float, default=None)
+    p.add_argument("--monet-max-nsfw", type=float, default=None)
+    p.add_argument("--monet-max-watermark", type=float, default=None)
+    # On-the-fly text encoder (used only with --monet-direct).
+    p.add_argument("--text-encoder-id", default="Qwen/Qwen3.5-4B")
+    p.add_argument("--text-encoder-layer", type=int, default=-2,
+                   help="hidden_states readout layer (-2 = second-to-last, raw/un-normed; "
+                        "layers above it are dropped so they are never computed).")
+    p.add_argument("--text-encoder-max-length", type=int, default=300,
+                   help="fixed token length for on-the-fly encoding; becomes text_seq_len.")
+    p.add_argument("--text-encoder-instruction", action=bo, default=True,
+                   help="prepend the standard conditioning instruction before each caption "
+                        "(matches the cache pipeline's default).")
+
     p.add_argument("--latent-mean", type=float, default=0.0)
     p.add_argument("--latent-std", type=float, default=1.0)
     # Skip the startup dim-peek (which downloads one full shard) and use explicit dims.
@@ -1295,6 +1480,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Sample the eval prompts every N optimizer steps and log to W&B. 0 disables.")
     p.add_argument("--sample-prompts-cache", default="prompts_cond.pt",
                    help="Path to the .pt produced by tools/encode_prompts.py (embeddings + masks).")
+    p.add_argument("--sample-prompts-file", default=None,
+                   help="--monet-direct: plain-text prompt list (one per line) for previews, "
+                        "encoded by the resident text encoder. Falls back to the prompt "
+                        "STRINGS inside --sample-prompts-cache when unset.")
     p.add_argument("--sample-weights", choices=["ema", "live"], default="ema",
                    help="Which weights the preview samples: EMA shadow (default) or live training weights.")
     p.add_argument("--sample-steps", type=int, default=32, help="Inference steps per preview image.")
@@ -1335,6 +1524,19 @@ def main() -> None:
 
     hf_token = hf_token_value(args.hf_token)
 
+    if args.monet_direct:
+        # Dims are fully determined without touching a shard: monet's 512px f32c32
+        # latents are (32,16,16) (the --latent-* defaults), text_seq_len is the fixed
+        # encode length, and text_dim comes from the encoder's config.json.
+        args.skip_peek = True
+        args.text_seq_len = args.text_encoder_max_length
+        args.text_dim = text_encoder_hidden_size(args.text_encoder_id, hf_token)
+        print(
+            f"[monet-direct] on-the-fly text: {args.text_encoder_id} "
+            f"(layer {args.text_encoder_layer}) -> text=({args.text_seq_len},{args.text_dim})",
+            flush=True,
+        )
+
     if args.skip_peek:
         print(f"Skipping dim peek; using explicit dims "
               f"(latent {args.latent_channels}x{args.latent_size}, "
@@ -1353,6 +1555,12 @@ def main() -> None:
 
     module = BoomerLit(
         config,
+        hf_token=hf_token,
+        monet_direct=args.monet_direct,
+        text_encoder_id=args.text_encoder_id,
+        text_encoder_layer=args.text_encoder_layer,
+        text_encoder_max_length=args.text_encoder_max_length,
+        text_encoder_instruction=args.text_encoder_instruction,
         lr=args.lr,
         weight_decay=args.weight_decay,
         beta1=args.beta1,
@@ -1418,6 +1626,15 @@ def main() -> None:
         parquet_memory_trim_every=args.parquet_memory_trim_every,
         parquet_prefetch_ranges=args.parquet_prefetch_ranges,
         parquet_range_size_mib=args.parquet_range_size_mib,
+        monet_direct=args.monet_direct,
+        monet_latent_key=args.monet_latent_key,
+        monet_caption_keys=tuple(
+            key.strip() for key in args.monet_caption_keys.split(",") if key.strip()
+        ),
+        monet_dino_key=MONET_DINO_KEY if args.monet_dino else None,
+        monet_min_aesthetic=args.monet_min_aesthetic,
+        monet_max_nsfw=args.monet_max_nsfw,
+        monet_max_watermark=args.monet_max_watermark,
     )
 
     callbacks: list[Callback] = [
@@ -1458,6 +1675,8 @@ def main() -> None:
             scaling_factor=args.sample_scaling_factor,
             max_length=args.text_seq_len,
             hf_token=hf_token,
+            encode_on_the_fly=args.monet_direct,
+            prompts_file=args.sample_prompts_file,
         ))
     # Appended AFTER ModelCheckpoint so a checkpoint written this step already exists on
     # disk when this callback's hook runs and enqueues it for async upload.
