@@ -43,7 +43,13 @@ generating prompt caption_original@1.0, five real subsets 0.1 each sampling the
       --cache-wds "hf://datasets/jasperai/monet/v1.2.0/synthetic/*/*/*.parquet,hf://datasets/jasperai/monet/v1.2.0/cc12m/*/*.parquet,hf://datasets/jasperai/monet/v1.2.0/megalith10m/*/*.parquet,hf://datasets/jasperai/monet/v1.2.0/laion/*/*.parquet,hf://datasets/jasperai/monet/v1.2.0/coyo/*/*.parquet,hf://datasets/jasperai/monet/v1.2.0/commoncatalog-cc-by/*/*.parquet" \
       --monet-weights "0.5,0.1,0.1,0.1,0.1,0.1" \
       --monet-caption-probs "0,0,0,0,1;.25,.25,.25,.25,0;.25,.25,.25,.25,0;.25,.25,.25,.25,0;.25,.25,.25,.25,0;.25,.25,.25,.25,0" \
+      --checkpoint-dir /ckpt_local --checkpoint-upload-remote ./local \
       ... (per-GPU --batch-size; global batch = batch_size * devices)
+
+Checkpoints save to --checkpoint-dir (local NVMe) synchronously, then a rank-0
+background thread copies them into --checkpoint-upload-remote — e.g. an HF
+bucket mounted with `hf-mount start bucket akrao9/Boomerv6-ckpt ./local` — and
+prunes local disk to the newest --checkpoint-local-retain once uploaded.
 """
 
 from __future__ import annotations
@@ -1026,10 +1032,12 @@ class CheckpointUploadCallback(Callback):
     pause the step. Local pruning only deletes checkpoints that have already uploaded, so
     a slow upload never loses a checkpoint.
 
-    ``remote`` may be either an rclone remote (e.g. ``gdrive:Boomer/ckpts``) or an
-    absolute directory path such as a mounted Drive folder
-    (``/content/drive/MyDrive/Boomer/ckpts``); the latter is copied via tmp-file +
-    atomic rename so a reader never sees a partial file.
+    ``remote`` may be either an rclone remote (e.g. ``gdrive:Boomer/ckpts``) or a
+    directory path such as a mounted Drive folder or an hf-mount'ed HF bucket
+    (``hf-mount start bucket akrao9/Boomerv6-ckpt ./local`` then
+    ``--checkpoint-upload-remote ./local``); directories are copied via tmp-file +
+    rename so a reader never sees a partial file (with a direct-copy fallback for
+    FUSE mounts that reject rename).
     """
 
     def __init__(
@@ -1050,6 +1058,17 @@ class CheckpointUploadCallback(Callback):
         self.chunk_size = chunk_size
         # rclone remotes look like "name:path"; an absolute/relative dir does not.
         self.use_rclone = ":" in remote and not os.path.isabs(remote)
+        if not self.use_rclone:
+            remote_dir = Path(remote).resolve()
+            local_dir = self.checkpoint_dir.resolve()
+            if remote_dir == local_dir or local_dir.is_relative_to(remote_dir):
+                raise ValueError(
+                    "--checkpoint-upload-remote must be a DIFFERENT directory from "
+                    "--checkpoint-dir: checkpoints save to fast local disk first, then "
+                    "the background thread copies them to the remote/mount. Saving "
+                    "straight into a network mount would block every training step "
+                    "on network I/O."
+                )
         self._q: queue.Queue = queue.Queue()
         self._uploaded: set[str] = set()       # filenames confirmed on the remote
         self._enqueued: set[str] = set()        # filenames already handed to the worker
@@ -1098,8 +1117,18 @@ class CheckpointUploadCallback(Callback):
         else:
             dest = Path(self.remote) / local.name
             tmp = Path(self.remote) / (local.name + ".uploading")
-            shutil.copy2(str(local), str(tmp))  # copy to tmp...
-            os.replace(str(tmp), str(dest))     # ...then atomic swap into place
+            try:
+                # copyfile, not copy2: FUSE-backed mounts (hf-mount buckets, some
+                # Drive mounts) often reject the chmod/utime metadata step.
+                shutil.copyfile(str(local), str(tmp))  # copy to tmp...
+                os.replace(str(tmp), str(dest))        # ...then atomic swap into place
+            except OSError as exc:
+                # Mounts without rename support: fall back to a direct copy to the
+                # final name (non-atomic, but the upload still lands).
+                print(f"[ckpt-upload] tmp+rename failed on {self.remote} ({exc}); "
+                      f"copying {local.name} directly", flush=True)
+                tmp.unlink(missing_ok=True)
+                shutil.copyfile(str(local), str(dest))
         print(f"[ckpt-upload] uploaded {local.name}", flush=True)
 
     # ---- pruning ---------------------------------------------------------- #
@@ -1555,8 +1584,11 @@ def build_parser() -> argparse.ArgumentParser:
     # keep only the newest N local checkpoints (older ones deleted after they upload).
     p.add_argument("--checkpoint-upload-remote", default=None,
                    help="Background upload destination: an rclone remote "
-                        "(e.g. 'gdrive:Boomer/ckpts') OR an absolute dir such as a mounted "
-                        "Drive folder ('/content/drive/MyDrive/Boomer/ckpts'). Off if unset.")
+                        "(e.g. 'gdrive:Boomer/ckpts') OR a directory such as a mounted "
+                        "Drive folder or an hf-mount'ed HF bucket (e.g. 'hf-mount start "
+                        "bucket akrao9/Boomerv6-ckpt ./local' then pass './local'). "
+                        "Checkpoints always save to --checkpoint-dir (fast local disk) "
+                        "first and copy over asynchronously. Off if unset.")
     p.add_argument("--checkpoint-local-retain", type=int, default=2,
                    help="Keep this many newest checkpoints on local disk; older uploaded ones are deleted.")
     p.add_argument("--checkpoint-keep-uploaded", type=int, default=0,
