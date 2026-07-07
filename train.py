@@ -1040,6 +1040,9 @@ def build_config(args: argparse.Namespace, record: Any) -> BoomerFLADiTConfig:
         parallel_block=args.parallel_block,
         dual_stream_depth=args.dual_stream_depth,
         multimodal_coord_ids=args.multimodal_coord_ids,
+        joint_refresh_attention=args.joint_refresh_attention,
+        sandwich_rmsnorm=args.sandwich_rmsnorm,
+        rope_ntk_factor=args.rope_ntk_factor,
         use_abs_pos_embed=args.abs_pos_embed,
         patch_size=args.patch_size,
         extra_input_channels=args.extra_input_channels,
@@ -1160,6 +1163,18 @@ def build_parser() -> argparse.ArgumentParser:
                    help="FLUX/SD3-style parallel residual branches inside blocks.")
     p.add_argument("--dual-stream-depth", type=int, default=0)
     p.add_argument("--multimodal-coord-ids", action=bo, default=False)
+    p.add_argument("--joint-refresh-attn", dest="joint_refresh_attention", action=bo, default=False,
+                   help="v6: every --image-attn-every-th post-prefix block becomes a joint refresh "
+                        "block — one MMDiT-style attention over [text; image] replaces the "
+                        "image-only full attention + that block's cross-attn, and text is updated "
+                        "through its own out-proj + FFN (SD3-style renegotiation).")
+    p.add_argument("--sandwich-rmsnorm", action=bo, default=False,
+                   help="v6: Lumina-Next sandwich norm — RMSNorm each sublayer output before the "
+                        "residual add (the residual stream itself is never normalized).")
+    p.add_argument("--rope-ntk-factor", type=float, default=1.0,
+                   help="v6: NTK-aware RoPE rescale for image-spatial axes only (text positions "
+                        "keep base frequencies). 1.0 for 512px pretrain; ~2.0 for the 1024px "
+                        "fine-tune where the token grid doubles.")
     p.add_argument("--abs-pos-embed", action=bo, default=True)
     p.add_argument("--y-norm", action=bo, default=True)
     p.add_argument("--y-norm-scale-factor", type=float, default=0.01, help="Sana uses 0.01.")

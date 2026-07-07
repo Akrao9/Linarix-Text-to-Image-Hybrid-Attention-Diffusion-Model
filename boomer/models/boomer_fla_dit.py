@@ -76,6 +76,21 @@ class BoomerFLADiTConfig:
     parallel_block: bool = False
     dual_stream_depth: int = 0
     multimodal_coord_ids: bool = False
+    # v6: every image_attention_every-th post-prefix block becomes a joint refresh block —
+    # the image-only full attention and the separate text cross-attention are replaced by
+    # one MMDiT-style attention over [text; image] whose text half is written back through
+    # a text FFN, so text re-negotiates against the evolving image state (SD3-style)
+    # instead of staying a static memory bank after the dual-stream prefix. A candidate
+    # slot whose text update no later block would read (typically the final block) keeps
+    # the classic image-attention block instead of carrying dead text-update weights.
+    joint_refresh_attention: bool = False
+    # v6: Lumina-Next sandwich norm — RMS-normalize each sublayer's output BEFORE the
+    # residual add (x = x + gate * norm(sublayer(pre_norm(x)))). The residual stream is
+    # never normalized after addition.
+    sandwich_rmsnorm: bool = False
+    # v6: NTK-aware RoPE rescaling for the image-spatial axes only (never text positions).
+    # 1.0 for 512px pretrain; ~2.0 for the 1024px fine-tune where the token grid doubles.
+    rope_ntk_factor: float = 1.0
     use_abs_pos_embed: bool = True
     patch_size: int = 1
     gradient_checkpointing: bool = False
@@ -119,6 +134,33 @@ def maybe_add_sibling_flash_attention_repo() -> None:
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return x * (1.0 + scale) + shift
+
+
+def ntk_scaled_theta(theta: float, ntk_factor: float, rotary_dim: int) -> float:
+    """NTK-aware RoPE base rescale: theta' = theta * s^(d/(d-2)) for scale factor s.
+
+    Preserves high-frequency (local-offset) behavior learned at the pretrain grid while
+    stretching the low-frequency axes to cover the larger fine-tune grid.
+    """
+    if ntk_factor == 1.0:
+        return theta
+    if ntk_factor <= 0.0:
+        raise ValueError(f"rope_ntk_factor must be positive, got {ntk_factor}")
+    if rotary_dim <= 2:
+        return theta * ntk_factor
+    return theta * ntk_factor ** (rotary_dim / (rotary_dim - 2))
+
+
+def make_sandwich_norm(config: BoomerFLADiTConfig) -> nn.Module:
+    """Sandwich RMSNorm for one sublayer output; Identity when disabled.
+
+    Applied INSIDE the adaLN gate (x = x + gate * sandwich(sublayer_out)): RMSNorm is
+    scale-invariant, so norming after the gate would cancel the near-zero gate magnitude
+    and defeat the adaLN-Zero init.
+    """
+    if not config.sandwich_rmsnorm:
+        return nn.Identity()
+    return AttentionRMSNorm(config.hidden_dim, scale_factor=1.0, eps=1e-6)
 
 
 def _hilbert_d2xy(n: int, d: int) -> tuple[int, int]:
@@ -239,7 +281,15 @@ class TokenMLP(nn.Module):
 class MultimodalCoordinateRoPE(nn.Module):
     """FLUX-style coordinate-ID RoPE for joint text/image attention."""
 
-    def __init__(self, head_dim: int, *, image_size: int, text_seq_len: int, theta: float = 10000.0) -> None:
+    def __init__(
+        self,
+        head_dim: int,
+        *,
+        image_size: int,
+        text_seq_len: int,
+        theta: float = 10000.0,
+        ntk_factor: float = 1.0,
+    ) -> None:
         super().__init__()
         if head_dim < 6 or head_dim % 2 != 0:
             raise ValueError(f"head_dim={head_dim} must be even and at least 6 for multimodal RoPE")
@@ -257,10 +307,18 @@ class MultimodalCoordinateRoPE(nn.Module):
         self.head_dim = head_dim
         self.image_size = image_size
         self.text_seq_len = text_seq_len
+        self.ntk_factor = ntk_factor
 
         for index, dim in enumerate(self.axes_dim):
             inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
             self.register_buffer(f"inv_freq_{index}", inv_freq, persistent=False)
+            if index > 0:
+                # NTK-rescaled tables for the row/col (image-spatial) axes. Text tokens
+                # share these axes for their 1D positions, so the scaled tables are
+                # selected per token by type id in _axis_apply — text keeps base freqs.
+                ntk_theta = ntk_scaled_theta(theta, ntk_factor, dim)
+                inv_freq_ntk = 1.0 / (ntk_theta ** (torch.arange(0, dim, 2).float() / dim))
+                self.register_buffer(f"inv_freq_ntk_{index}", inv_freq_ntk, persistent=False)
 
     @staticmethod
     def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -282,9 +340,19 @@ class MultimodalCoordinateRoPE(nn.Module):
         ids = torch.stack([token_type, positions, zeros], dim=-1)
         return ids.unsqueeze(0).expand(batch_size, -1, -1)
 
-    def _axis_apply(self, x: torch.Tensor, axis_ids: torch.Tensor, axis_index: int) -> torch.Tensor:
+    def _axis_apply(
+        self,
+        x: torch.Tensor,
+        axis_ids: torch.Tensor,
+        axis_index: int,
+        image_token_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         inv_freq = getattr(self, f"inv_freq_{axis_index}")
         angles = axis_ids.float().unsqueeze(-1) * inv_freq.to(device=x.device).view(1, 1, -1)
+        if image_token_mask is not None and axis_index > 0:
+            inv_freq_ntk = getattr(self, f"inv_freq_ntk_{axis_index}")
+            angles_ntk = axis_ids.float().unsqueeze(-1) * inv_freq_ntk.to(device=x.device).view(1, 1, -1)
+            angles = torch.where(image_token_mask.unsqueeze(-1), angles_ntk, angles)
         cos = torch.cat([angles.cos(), angles.cos()], dim=-1).unsqueeze(2).to(dtype=x.dtype)
         sin = torch.cat([angles.sin(), angles.sin()], dim=-1).unsqueeze(2).to(dtype=x.dtype)
         return x * cos + self._rotate_half(x) * sin
@@ -299,13 +367,15 @@ class MultimodalCoordinateRoPE(nn.Module):
             raise ValueError(f"expected head_dim={self.head_dim}, got q={q.shape[-1]} k={k.shape[-1]}")
         if ids.shape[:2] != q.shape[:2] or ids.shape[-1] != len(self.axes_dim):
             raise ValueError(f"expected ids shape (B, T, {len(self.axes_dim)}), got {tuple(ids.shape)}")
+        # token_type 1 = image (see image_ids/text_ids): only image tokens get NTK freqs.
+        image_token_mask = (ids[..., 0] == 1) if self.ntk_factor != 1.0 else None
         q_chunks = q.split(self.axes_dim, dim=-1)
         k_chunks = k.split(self.axes_dim, dim=-1)
         q_out = []
         k_out = []
         for index, (q_axis, k_axis) in enumerate(zip(q_chunks, k_chunks, strict=True)):
-            q_out.append(self._axis_apply(q_axis, ids[..., index], index))
-            k_out.append(self._axis_apply(k_axis, ids[..., index], index))
+            q_out.append(self._axis_apply(q_axis, ids[..., index], index, image_token_mask))
+            k_out.append(self._axis_apply(k_axis, ids[..., index], index, image_token_mask))
         return torch.cat(q_out, dim=-1), torch.cat(k_out, dim=-1)
 
 
@@ -316,7 +386,9 @@ class RoPE2D(nn.Module):
     Each half uses standard 1D RoPE with shared cos/sin tables per axis.
     """
 
-    def __init__(self, head_dim: int, grid_size: int, *, theta: float = 10000.0) -> None:
+    def __init__(
+        self, head_dim: int, grid_size: int, *, theta: float = 10000.0, ntk_factor: float = 1.0
+    ) -> None:
         super().__init__()
         if head_dim % 4 != 0:
             raise ValueError(
@@ -331,6 +403,8 @@ class RoPE2D(nn.Module):
         self.grid_size = grid_size
         self.half_dim = head_dim // 2
 
+        # Both axes are image-spatial, so the NTK rescale applies to the whole table.
+        theta = ntk_scaled_theta(theta, ntk_factor, self.half_dim)
         freqs = 1.0 / (theta ** (torch.arange(0, self.half_dim, 2).float() / self.half_dim))
         token_idx = torch.arange(grid_size * grid_size)
         h_idx = token_idx // grid_size
@@ -392,6 +466,7 @@ class FullImageSelfAttention(nn.Module):
         grid_size: int | None = None,
         rope: bool = False,
         rope_theta: float = 10000.0,
+        rope_ntk_factor: float = 1.0,
     ) -> None:
         super().__init__()
         if hidden_dim % num_heads != 0:
@@ -411,7 +486,7 @@ class FullImageSelfAttention(nn.Module):
         nn.init.zeros_(self.out_proj.weight)
         nn.init.zeros_(self.out_proj.bias)
         self.rope = (
-            RoPE2D(self.head_dim, grid_size, theta=rope_theta)
+            RoPE2D(self.head_dim, grid_size, theta=rope_theta, ntk_factor=rope_ntk_factor)
             if rope and grid_size is not None
             else None
         )
@@ -825,8 +900,10 @@ class BoomerFLABlock(nn.Module):
                 grid_size=config.latent_size // config.patch_size,
                 rope=config.image_attention_rope,
                 rope_theta=config.image_rope_theta,
+                rope_ntk_factor=config.rope_ntk_factor,
             )
             self.image_attn_scale_shift_table = nn.Parameter(torch.zeros(3, hidden_dim))
+            self.sandwich_image_attn = make_sandwich_norm(config)
         self.use_cross_attention = (layer_idx + 1) % config.cross_attention_every == 0
         if not self.use_cross_attention:
             self.cross_attn = None
@@ -851,6 +928,9 @@ class BoomerFLABlock(nn.Module):
         self.norm3 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
         self.mlp = GLUMBConv(hidden_dim, config.mlp_ratio)
         self.scale_shift_table = nn.Parameter(torch.zeros(9, hidden_dim))
+        self.sandwich_mixer = make_sandwich_norm(config)
+        self.sandwich_mlp = make_sandwich_norm(config)
+        self.sandwich_cross = make_sandwich_norm(config) if self.use_cross_attention else nn.Identity()
 
     def _cross_attention(
         self,
@@ -926,77 +1006,67 @@ class BoomerFLABlock(nn.Module):
         if self.parallel_block:
             base = x
             branches = [
-                gate_msa * self._mixer(modulate(self.norm1(base), shift_msa, scale_msa), mixer_perm, mixer_perm_inv),
-                gate_mlp * self.mlp(modulate(self.norm2(base), shift_mlp, scale_mlp), height=height, width=width),
+                gate_msa
+                * self.sandwich_mixer(
+                    self._mixer(modulate(self.norm1(base), shift_msa, scale_msa), mixer_perm, mixer_perm_inv)
+                ),
+                gate_mlp
+                * self.sandwich_mlp(
+                    self.mlp(modulate(self.norm2(base), shift_mlp, scale_mlp), height=height, width=width)
+                ),
             ]
             if self.use_cross_attention:
                 branches.append(
                     gate_cross
-                    * self._cross_attention(
-                        modulate(self.norm3(base), shift_cross, scale_cross),
-                        text_tokens,
-                        text_key_padding_mask,
-                        text_attn_bias,
+                    * self.sandwich_cross(
+                        self._cross_attention(
+                            modulate(self.norm3(base), shift_cross, scale_cross),
+                            text_tokens,
+                            text_key_padding_mask,
+                            text_attn_bias,
+                        )
                     )
                 )
             if self.use_image_attention:
                 branches.append(
-                    gate_img * self.image_attn(modulate(self.image_attn_norm(base), shift_img, scale_img))
+                    gate_img
+                    * self.sandwich_image_attn(
+                        self.image_attn(modulate(self.image_attn_norm(base), shift_img, scale_img))
+                    )
                 )
             return base + sum(branches)
 
-        x = x + gate_msa * self._mixer(modulate(self.norm1(x), shift_msa, scale_msa), mixer_perm, mixer_perm_inv)
+        x = x + gate_msa * self.sandwich_mixer(
+            self._mixer(modulate(self.norm1(x), shift_msa, scale_msa), mixer_perm, mixer_perm_inv)
+        )
         if self.use_image_attention:
-            x = x + gate_img * self.image_attn(modulate(self.image_attn_norm(x), shift_img, scale_img))
-        if self.use_cross_attention:
-            x = x + gate_cross * self._cross_attention(
-                modulate(self.norm3(x), shift_cross, scale_cross),
-                text_tokens,
-                text_key_padding_mask,
-                text_attn_bias,
+            x = x + gate_img * self.sandwich_image_attn(
+                self.image_attn(modulate(self.image_attn_norm(x), shift_img, scale_img))
             )
-        x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp), height=height, width=width)
+        if self.use_cross_attention:
+            x = x + gate_cross * self.sandwich_cross(
+                self._cross_attention(
+                    modulate(self.norm3(x), shift_cross, scale_cross),
+                    text_tokens,
+                    text_key_padding_mask,
+                    text_attn_bias,
+                )
+            )
+        x = x + gate_mlp * self.sandwich_mlp(
+            self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp), height=height, width=width)
+        )
         return x
 
 
-class BoomerFLADualStreamBlock(nn.Module):
-    """FLUX-style early block with one joint text+image attention operation."""
+class JointTextImageAttentionMixin:
+    """MMDiT-style joint attention over [text; image] with per-modality QKV/projections.
 
-    updates_text = True
-
-    def __init__(self, config: BoomerFLADiTConfig, *, layer_idx: int) -> None:
-        super().__init__()
-        hidden_dim = config.hidden_dim
-        if hidden_dim % config.num_heads != 0:
-            raise ValueError(f"hidden_dim={hidden_dim} must be divisible by num_heads={config.num_heads}")
-        self.num_heads = config.num_heads
-        self.head_dim = hidden_dim // config.num_heads
-        self.hidden_dim = hidden_dim
-        self.parallel_block = config.parallel_block
-
-        self.image_mod = (
-            None if config.shared_adaln else nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
-        )
-        self.image_norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
-        self.image_qkv = nn.Linear(hidden_dim, hidden_dim * 3)
-        self.image_q_norm = AttentionRMSNorm(self.head_dim, scale_factor=1.0, eps=1e-6)
-        self.image_k_norm = AttentionRMSNorm(self.head_dim, scale_factor=1.0, eps=1e-6)
-        self.image_out_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.image_norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
-        self.image_mlp = GLUMBConv(hidden_dim, config.mlp_ratio)
-        self.image_scale_shift_table = nn.Parameter(torch.zeros(6, hidden_dim))
-
-        self.text_mod = (
-            None if config.shared_adaln else nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
-        )
-        self.text_norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
-        self.text_qkv = nn.Linear(hidden_dim, hidden_dim * 3)
-        self.text_q_norm = AttentionRMSNorm(self.head_dim, scale_factor=1.0, eps=1e-6)
-        self.text_k_norm = AttentionRMSNorm(self.head_dim, scale_factor=1.0, eps=1e-6)
-        self.text_out_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.text_norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
-        self.text_mlp = TokenMLP(hidden_dim, config.mlp_ratio)
-        self.text_scale_shift_table = nn.Parameter(torch.zeros(6, hidden_dim))
+    Host classes provide: num_heads, head_dim, image_qkv/text_qkv, image_q_norm/
+    image_k_norm/text_q_norm/text_k_norm, image_out_proj/text_out_proj. Padded text
+    tokens are masked out as keys, so they can never contribute to real tokens (their
+    own query outputs are garbage but land only in padded slots, which every
+    downstream consumer masks again).
+    """
 
     def _qkv(
         self,
@@ -1062,6 +1132,51 @@ class BoomerFLADualStreamBlock(nn.Module):
         text_out, image_out = out.split([text_tokens.shape[1], image_tokens.shape[1]], dim=1)
         return self.image_out_proj(image_out), self.text_out_proj(text_out)
 
+
+class BoomerFLADualStreamBlock(JointTextImageAttentionMixin, nn.Module):
+    """FLUX-style early block with one joint text+image attention operation."""
+
+    updates_text = True
+
+    def __init__(self, config: BoomerFLADiTConfig, *, layer_idx: int) -> None:
+        super().__init__()
+        hidden_dim = config.hidden_dim
+        if hidden_dim % config.num_heads != 0:
+            raise ValueError(f"hidden_dim={hidden_dim} must be divisible by num_heads={config.num_heads}")
+        self.num_heads = config.num_heads
+        self.head_dim = hidden_dim // config.num_heads
+        self.hidden_dim = hidden_dim
+        self.parallel_block = config.parallel_block
+
+        self.image_mod = (
+            None if config.shared_adaln else nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
+        )
+        self.image_norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
+        self.image_qkv = nn.Linear(hidden_dim, hidden_dim * 3)
+        self.image_q_norm = AttentionRMSNorm(self.head_dim, scale_factor=1.0, eps=1e-6)
+        self.image_k_norm = AttentionRMSNorm(self.head_dim, scale_factor=1.0, eps=1e-6)
+        self.image_out_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.image_norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
+        self.image_mlp = GLUMBConv(hidden_dim, config.mlp_ratio)
+        self.image_scale_shift_table = nn.Parameter(torch.zeros(6, hidden_dim))
+
+        self.text_mod = (
+            None if config.shared_adaln else nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
+        )
+        self.text_norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
+        self.text_qkv = nn.Linear(hidden_dim, hidden_dim * 3)
+        self.text_q_norm = AttentionRMSNorm(self.head_dim, scale_factor=1.0, eps=1e-6)
+        self.text_k_norm = AttentionRMSNorm(self.head_dim, scale_factor=1.0, eps=1e-6)
+        self.text_out_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.text_norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
+        self.text_mlp = TokenMLP(hidden_dim, config.mlp_ratio)
+        self.text_scale_shift_table = nn.Parameter(torch.zeros(6, hidden_dim))
+
+        self.image_sandwich_attn = make_sandwich_norm(config)
+        self.image_sandwich_mlp = make_sandwich_norm(config)
+        self.text_sandwich_attn = make_sandwich_norm(config)
+        self.text_sandwich_mlp = make_sandwich_norm(config)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1106,26 +1221,215 @@ class BoomerFLADualStreamBlock(nn.Module):
             image_coord_ids,
             text_coord_ids,
         )
+        image_attn = self.image_sandwich_attn(image_attn)
+        text_attn = self.text_sandwich_attn(text_attn)
         if self.parallel_block:
-            x = image_base + image_gate_attn * image_attn + image_gate_mlp * self.image_mlp(
-                modulate(self.image_norm2(image_base), image_shift_mlp, image_scale_mlp),
-                height=height,
-                width=width,
+            x = image_base + image_gate_attn * image_attn + image_gate_mlp * self.image_sandwich_mlp(
+                self.image_mlp(
+                    modulate(self.image_norm2(image_base), image_shift_mlp, image_scale_mlp),
+                    height=height,
+                    width=width,
+                )
             )
-            text_tokens = text_base + text_gate_attn * text_attn + text_gate_mlp * self.text_mlp(
-                modulate(self.text_norm2(text_base), text_shift_mlp, text_scale_mlp)
+            text_tokens = text_base + text_gate_attn * text_attn + text_gate_mlp * self.text_sandwich_mlp(
+                self.text_mlp(modulate(self.text_norm2(text_base), text_shift_mlp, text_scale_mlp))
             )
             return x, text_tokens
 
         x = image_base + image_gate_attn * image_attn
         text_tokens = text_base + text_gate_attn * text_attn
-        x = x + image_gate_mlp * self.image_mlp(
-            modulate(self.image_norm2(x), image_shift_mlp, image_scale_mlp),
-            height=height,
-            width=width,
+        x = x + image_gate_mlp * self.image_sandwich_mlp(
+            self.image_mlp(
+                modulate(self.image_norm2(x), image_shift_mlp, image_scale_mlp),
+                height=height,
+                width=width,
+            )
         )
-        text_tokens = text_tokens + text_gate_mlp * self.text_mlp(
-            modulate(self.text_norm2(text_tokens), text_shift_mlp, text_scale_mlp)
+        text_tokens = text_tokens + text_gate_mlp * self.text_sandwich_mlp(
+            self.text_mlp(modulate(self.text_norm2(text_tokens), text_shift_mlp, text_scale_mlp))
+        )
+        return x, text_tokens
+
+
+class BoomerFLAJointRefreshBlock(JointTextImageAttentionMixin, nn.Module):
+    """v6 joint refresh block: GDN2 spine + one MMDiT-style [text; image] attention.
+
+    Takes the slots the full-image-attention BoomerFLABlocks occupied (every
+    image_attention_every-th post-prefix block). The FLA mixer and GLUMBConv stay the
+    image-token spine, but the image-only attention and the separate text cross-attn
+    are replaced by joint attention whose text half is written back through its own
+    out-projection and FFN — so text re-negotiates against the evolving image state
+    at every refresh instead of staying frozen after the dual-stream prefix.
+
+    Modulation reuses the single-stream 9-way layout (the cross rows now modulate the
+    joint attention), so shared-adaLN blocks consume the same shared_mod projection as
+    BoomerFLABlock; the text side reuses the dual-stream 6-way text layout.
+    """
+
+    updates_text = True
+    joint_refresh = True
+
+    def __init__(self, config: BoomerFLADiTConfig, *, layer_idx: int) -> None:
+        super().__init__()
+        hidden_dim = config.hidden_dim
+        if hidden_dim % config.num_heads != 0:
+            raise ValueError(f"hidden_dim={hidden_dim} must be divisible by num_heads={config.num_heads}")
+        self.num_heads = config.num_heads
+        self.head_dim = hidden_dim // config.num_heads
+        self.hidden_dim = hidden_dim
+        self.parallel_block = config.parallel_block
+
+        self.norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
+        if config.mixer_type in {"torch", "fallback"}:
+            self.self_attn = TorchSelfAttention(hidden_dim, config.num_heads)
+        else:
+            self.self_attn = FLASelfMixer(config, layer_idx=layer_idx)
+        self.norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
+        self.mlp = GLUMBConv(hidden_dim, config.mlp_ratio)
+
+        self.joint_norm = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
+        self.image_qkv = nn.Linear(hidden_dim, hidden_dim * 3)
+        self.image_q_norm = AttentionRMSNorm(self.head_dim, scale_factor=1.0, eps=1e-6)
+        self.image_k_norm = AttentionRMSNorm(self.head_dim, scale_factor=1.0, eps=1e-6)
+        self.image_out_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.text_norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
+        self.text_qkv = nn.Linear(hidden_dim, hidden_dim * 3)
+        self.text_q_norm = AttentionRMSNorm(self.head_dim, scale_factor=1.0, eps=1e-6)
+        self.text_k_norm = AttentionRMSNorm(self.head_dim, scale_factor=1.0, eps=1e-6)
+        self.text_out_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.text_norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
+        self.text_mlp = TokenMLP(hidden_dim, config.mlp_ratio)
+        # adaLN-Zero style out projections (same convention as FullImageSelfAttention /
+        # SanaMultiHeadCrossAttention): the joint attention starts as a no-op on both
+        # streams, which also makes a warm-start from a pre-v6 checkpoint behaviorally
+        # identical at load.
+        nn.init.zeros_(self.image_out_proj.weight)
+        nn.init.zeros_(self.image_out_proj.bias)
+        nn.init.zeros_(self.text_out_proj.weight)
+        nn.init.zeros_(self.text_out_proj.bias)
+
+        self.mod = None if config.shared_adaln else nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 9))
+        self.text_mod = (
+            None if config.shared_adaln else nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
+        )
+        self.scale_shift_table = nn.Parameter(torch.zeros(9, hidden_dim))
+        self.text_scale_shift_table = nn.Parameter(torch.zeros(6, hidden_dim))
+
+        self.sandwich_mixer = make_sandwich_norm(config)
+        self.sandwich_joint = make_sandwich_norm(config)
+        self.sandwich_mlp = make_sandwich_norm(config)
+        self.text_sandwich_attn = make_sandwich_norm(config)
+        self.text_sandwich_mlp = make_sandwich_norm(config)
+
+    def _mixer(
+        self,
+        x: torch.Tensor,
+        mixer_perm: torch.Tensor | None,
+        mixer_perm_inv: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if mixer_perm is None:
+            return self.self_attn(x)
+        # Hilbert order in, raster order out, same as BoomerFLABlock.
+        return self.self_attn(x.index_select(1, mixer_perm)).index_select(1, mixer_perm_inv)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        text_tokens: torch.Tensor,
+        t_emb: torch.Tensor,
+        text_key_padding_mask: torch.Tensor,
+        text_attn_bias: torch.Tensor | None,
+        *,
+        height: int,
+        width: int,
+        coord_rope: MultimodalCoordinateRoPE | None = None,
+        image_coord_ids: torch.Tensor | None = None,
+        text_coord_ids: torch.Tensor | None = None,
+        t_mod: torch.Tensor | None = None,
+        text_t_mod: torch.Tensor | None = None,
+        mixer_perm: torch.Tensor | None = None,
+        mixer_perm_inv: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del text_attn_bias
+        if self.mod is not None:
+            timestep_mod = self.mod(t_emb)
+            text_timestep_mod = self.text_mod(t_emb)
+        elif t_mod is None or text_t_mod is None:
+            raise ValueError("shared_adaln joint refresh blocks need precomputed t_mod/text_t_mod")
+        else:
+            timestep_mod = t_mod
+            text_timestep_mod = text_t_mod
+        (
+            shift_msa,
+            scale_msa,
+            gate_msa,
+            shift_joint,
+            scale_joint,
+            gate_joint,
+            shift_mlp,
+            scale_mlp,
+            gate_mlp,
+        ) = (self.scale_shift_table[None] + timestep_mod.reshape(x.shape[0], 9, -1)).chunk(9, dim=1)
+        (
+            text_shift_attn,
+            text_scale_attn,
+            text_gate_attn,
+            text_shift_mlp,
+            text_scale_mlp,
+            text_gate_mlp,
+        ) = (self.text_scale_shift_table[None] + text_timestep_mod.reshape(text_tokens.shape[0], 6, -1)).chunk(
+            6, dim=1
+        )
+
+        if self.parallel_block:
+            image_base = x
+            text_base = text_tokens
+            image_attn, text_attn = self._joint_attention(
+                modulate(self.joint_norm(image_base), shift_joint, scale_joint),
+                modulate(self.text_norm1(text_base), text_shift_attn, text_scale_attn),
+                text_key_padding_mask,
+                coord_rope,
+                image_coord_ids,
+                text_coord_ids,
+            )
+            x = image_base + (
+                gate_msa
+                * self.sandwich_mixer(
+                    self._mixer(modulate(self.norm1(image_base), shift_msa, scale_msa), mixer_perm, mixer_perm_inv)
+                )
+                + gate_joint * self.sandwich_joint(image_attn)
+                + gate_mlp
+                * self.sandwich_mlp(
+                    self.mlp(modulate(self.norm2(image_base), shift_mlp, scale_mlp), height=height, width=width)
+                )
+            )
+            text_tokens = text_base + (
+                text_gate_attn * self.text_sandwich_attn(text_attn)
+                + text_gate_mlp
+                * self.text_sandwich_mlp(
+                    self.text_mlp(modulate(self.text_norm2(text_base), text_shift_mlp, text_scale_mlp))
+                )
+            )
+            return x, text_tokens
+
+        x = x + gate_msa * self.sandwich_mixer(
+            self._mixer(modulate(self.norm1(x), shift_msa, scale_msa), mixer_perm, mixer_perm_inv)
+        )
+        image_attn, text_attn = self._joint_attention(
+            modulate(self.joint_norm(x), shift_joint, scale_joint),
+            modulate(self.text_norm1(text_tokens), text_shift_attn, text_scale_attn),
+            text_key_padding_mask,
+            coord_rope,
+            image_coord_ids,
+            text_coord_ids,
+        )
+        x = x + gate_joint * self.sandwich_joint(image_attn)
+        text_tokens = text_tokens + text_gate_attn * self.text_sandwich_attn(text_attn)
+        x = x + gate_mlp * self.sandwich_mlp(
+            self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp), height=height, width=width)
+        )
+        text_tokens = text_tokens + text_gate_mlp * self.text_sandwich_mlp(
+            self.text_mlp(modulate(self.text_norm2(text_tokens), text_shift_mlp, text_scale_mlp))
         )
         return x, text_tokens
 
@@ -1147,6 +1451,10 @@ class BoomerFLADiT(nn.Module):
             raise ValueError(f"dual_stream_depth={config.dual_stream_depth} exceeds depth={config.depth}")
         if config.cross_attention_every < 1:
             raise ValueError(f"cross_attention_every must be >= 1, got {config.cross_attention_every}")
+        if config.joint_refresh_attention and config.image_attention_every <= 0:
+            raise ValueError("joint_refresh_attention reuses the image_attention_every cadence; set it > 0")
+        if config.rope_ntk_factor <= 0.0:
+            raise ValueError(f"rope_ntk_factor must be positive, got {config.rope_ntk_factor}")
         self.config = config
         hidden_dim = config.hidden_dim
         self.patch_size = config.patch_size
@@ -1174,17 +1482,38 @@ class BoomerFLADiT(nn.Module):
         self.shared_image_attn_mod = None
         self.shared_dual_image_mod = None
         self.shared_dual_text_mod = None
+        # Joint refresh slot selection: a refresh block's text write-back is useful only
+        # if some LATER block reads text again (another refresh block, or a cross-attn
+        # block). The final candidate usually has no such reader, so its slot keeps the
+        # classic image-attention block instead of carrying dead text-update weights.
+        refresh_indices: set[int] = set()
+        if config.joint_refresh_attention:
+            reader_after = False
+            for i in reversed(range(config.dual_stream_depth, config.depth)):
+                if (i + 1) % config.image_attention_every == 0 and reader_after:
+                    refresh_indices.add(i)
+                    reads_text = True
+                else:
+                    # A plain (or demoted) block reads text iff it cross-attends.
+                    reads_text = (i + 1) % config.cross_attention_every == 0
+                reader_after = reader_after or reads_text
+        self._joint_refresh_indices = refresh_indices
+
         if config.shared_adaln:
+            # Joint refresh blocks consume the same 9-way shared_mod as BoomerFLABlock
+            # (their cross rows modulate the joint attention) and the same 6-way text
+            # projection as the dual-stream prefix.
             if config.dual_stream_depth < config.depth:
                 self.shared_mod = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 9))
             has_image_attn = config.image_attention_every > 0 and any(
-                (i + 1) % config.image_attention_every == 0
+                (i + 1) % config.image_attention_every == 0 and i not in refresh_indices
                 for i in range(config.dual_stream_depth, config.depth)
             )
             if has_image_attn:
                 self.shared_image_attn_mod = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 3))
             if config.dual_stream_depth > 0:
                 self.shared_dual_image_mod = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
+            if config.dual_stream_depth > 0 or refresh_indices:
                 self.shared_dual_text_mod = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
         # Hilbert mixer-order permutations, cached per (height, width, device); index
         # tensors only, never serialized.
@@ -1199,20 +1528,20 @@ class BoomerFLADiT(nn.Module):
                 image_size=self.token_grid_size,
                 text_seq_len=config.text_seq_len,
                 theta=config.image_rope_theta,
+                ntk_factor=config.rope_ntk_factor,
             )
             if config.multimodal_coord_ids
             else None
         )
-        self.blocks = nn.ModuleList(
-            [
-                (
-                    BoomerFLADualStreamBlock(config, layer_idx=i)
-                    if i < config.dual_stream_depth
-                    else BoomerFLABlock(config, layer_idx=i)
-                )
-                for i in range(config.depth)
-            ]
-        )
+
+        def make_block(i: int) -> nn.Module:
+            if i < config.dual_stream_depth:
+                return BoomerFLADualStreamBlock(config, layer_idx=i)
+            if i in refresh_indices:
+                return BoomerFLAJointRefreshBlock(config, layer_idx=i)
+            return BoomerFLABlock(config, layer_idx=i)
+
+        self.blocks = nn.ModuleList([make_block(i) for i in range(config.depth)])
         self.final_norm = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
         self.final_t_block = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 2))
         self.out_proj = nn.Linear(hidden_dim, config.latent_channels * config.patch_size * config.patch_size)
@@ -1247,6 +1576,14 @@ class BoomerFLADiT(nn.Module):
                     nn.init.zeros_(block.text_mod[1].weight)
                     nn.init.zeros_(block.text_mod[1].bias)
                 nn.init.normal_(block.image_scale_shift_table, std=0.02)
+                nn.init.normal_(block.text_scale_shift_table, std=0.02)
+            elif isinstance(block, BoomerFLAJointRefreshBlock):
+                if block.mod is not None:
+                    nn.init.zeros_(block.mod[1].weight)
+                    nn.init.zeros_(block.mod[1].bias)
+                    nn.init.zeros_(block.text_mod[1].weight)
+                    nn.init.zeros_(block.text_mod[1].bias)
+                nn.init.normal_(block.scale_shift_table, std=0.02)
                 nn.init.normal_(block.text_scale_shift_table, std=0.02)
             else:
                 if block.mod is not None:
@@ -1431,7 +1768,35 @@ class BoomerFLADiT(nn.Module):
         repa_feat: torch.Tensor | None = None
         dispersive_feat: torch.Tensor | None = None
         for layer_idx, block in enumerate(self.blocks):
-            if getattr(block, "updates_text", False):
+            if getattr(block, "joint_refresh", False):
+                # Joint refresh block: returns (x, text_tokens); needs both the mixer
+                # permutation (GDN2 spine) and the joint-attention coord/text inputs.
+                _h, _w = token_height, token_width
+                _cr, _ii, _ti = self.coord_embedder, image_coord_ids, text_coord_ids
+                if use_ckpt:
+                    def _refresh_fn(x, tt, te, mk, bi, tm, ttm,
+                                    _blk=block, h=_h, w=_w, cr=_cr, ii=_ii, ti=_ti,
+                                    mp=mixer_perm, mpi=mixer_perm_inv):
+                        return _blk(x, tt, te, mk, bi,
+                                    height=h, width=w, coord_rope=cr,
+                                    image_coord_ids=ii, text_coord_ids=ti,
+                                    t_mod=tm, text_t_mod=ttm,
+                                    mixer_perm=mp, mixer_perm_inv=mpi)
+                    x, text_tokens = _ckpt(_refresh_fn, x, text_tokens, t_emb,
+                                           text_key_padding_mask, text_attn_bias,
+                                           t_mod, dual_text_t_mod,
+                                           use_reentrant=False,
+                                           preserve_rng_state=False)
+                else:
+                    x, text_tokens = block(
+                        x, text_tokens, t_emb, text_key_padding_mask, text_attn_bias,
+                        height=token_height, width=token_width,
+                        coord_rope=self.coord_embedder,
+                        image_coord_ids=image_coord_ids, text_coord_ids=text_coord_ids,
+                        t_mod=t_mod, text_t_mod=dual_text_t_mod,
+                        mixer_perm=mixer_perm, mixer_perm_inv=mixer_perm_inv,
+                    )
+            elif getattr(block, "updates_text", False):
                 # Dual-stream block: returns (x, text_tokens).
                 # Non-tensor args (height, width, coord_rope, coord IDs) captured via closure;
                 # shared-adaLN mods are passed as tensor args so checkpointing tracks them.
