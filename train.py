@@ -1502,7 +1502,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "PixArt-Sigma-style thinning; pilot-ablate before a long run.")
     p.add_argument("--shared-adaln", action=bo, default=False,
                    help="PixArt-alpha adaLN-single: one shared timestep-modulation projection for "
-                        "all blocks (per-block scale_shift_table keeps layer variation). Saves ~27% "
+                        "all blocks (per-block scale_shift_table keeps layer variation). Saves ~27%% "
                         "params at the deployed size.")
     p.add_argument("--fourier-timestep", dest="fourier_timestep_embed", action=bo, default=False,
                    help="DiT-style sinusoidal timestep features before the timestep MLP instead of "
