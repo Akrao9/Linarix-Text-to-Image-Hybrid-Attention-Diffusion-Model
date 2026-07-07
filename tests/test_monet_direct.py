@@ -146,7 +146,11 @@ def test_training_step_encodes_captions_on_the_fly() -> None:
         "caption": ["a cat", "a dog"],
         "dino_embedding": None,
     }
-    loss = module.training_step(batch, 0)
+    # encode_captions keeps the Qwen hidden states bf16 (no fp32 upcast); in training
+    # the Lightning bf16-mixed autocast (or FSDP2's bf16 compute policy) reconciles
+    # them with the fp32 master weights, so mirror that here.
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        loss = module.training_step(batch, 0)
     assert loss.ndim == 0 and torch.isfinite(loss)
     # encode_qwen_text_fixed runs under inference_mode; the clone escape must leave
     # ordinary tensors, or backward() raises "Inference tensors cannot be saved...".
@@ -154,7 +158,9 @@ def test_training_step_encodes_captions_on_the_fly() -> None:
     assert module.model.caption_embedder.y_proj[0].weight.grad is not None
 
 
-def _write_monet_parquet(path, n: int, *, latent_as_string: bool = False) -> None:
+def _write_monet_parquet(
+    path, n: int, *, latent_as_string: bool = False, start: int = 0, prefix: str = "cap"
+) -> None:
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -164,8 +170,8 @@ def _write_monet_parquet(path, n: int, *, latent_as_string: bool = False) -> Non
         latent = pa.array([[float(i)] * (32 * 16 * 16) for i in range(n)], pa.list_(pa.float64()))
     table = pa.table({
         MONET_LATENT_KEY: latent,
-        "caption_gemini-2.5-flash-lite": pa.array([f"cap {i}" for i in range(n)]),
-        "__key__": pa.array([f"k{i}" for i in range(n)]),
+        "caption_gemini-2.5-flash-lite": pa.array([f"{prefix} {start + i}" for i in range(n)]),
+        "__key__": pa.array([f"k{start + i}" for i in range(n)]),
         "source": pa.array(["cc12m"] * n),
     })
     pq.write_table(table, str(path))
@@ -204,18 +210,118 @@ def test_per_file_reader_shuffle_buffer(tmp_path) -> None:
     assert sorted(r.caption for r in recs) == sorted(f"cap {i}" for i in range(16))
 
 
+def test_caption_probs_sampling() -> None:
+    import collections
+
+    import random as random_module
+
+    # 3:1 weights between the two available captions; the zero-weight and absent keys
+    # must never win. One rng seeds the whole sequence, so this is deterministic.
+    keys = MONET_CAPTION_KEYS
+    probs = (0.75, 0.0, 0.0, 0.25, 0.5)  # florence absent in _row(); original present
+    row = _row(**{"caption_florence-2-large": None})
+    rng = random_module.Random(0)
+    counts: collections.Counter[str] = collections.Counter()
+    for _ in range(400):
+        record = monet_row_to_record(row, caption_probs=probs, rng=rng)
+        counts[record.metadata["caption_key"]] += 1
+    assert set(counts) == {"caption_gemini-2.5-flash-lite", "caption_original"}
+    # Renormalized over the available pool: gemini 0.75/1.25 = 60%, original 40%.
+    assert 0.5 < counts["caption_gemini-2.5-flash-lite"] / 400 < 0.7
+
+    # All positive-weight captions empty => the row is dropped, even though a
+    # zero-weight caption exists.
+    only_zero_weight = _row(**{"caption_gemini-2.5-flash-lite": None})
+    assert monet_row_to_record(
+        only_zero_weight, caption_probs=(0.0, 0.0, 0.0, 0.0, 1.0), rng=rng,
+    ).caption == "an original caption"
+    assert monet_row_to_record(
+        only_zero_weight, caption_probs=(1.0, 1.0, 1.0, 1.0, 0.0), rng=rng,
+    ) is None
+    assert len(keys) == len(probs)
+
+
+def test_caption_probs_validation(tmp_path) -> None:
+    from boomer.datasets.monet_direct import MonetDirectStreamingDataset
+
+    _write_monet_parquet(tmp_path / "s.parquet", 2)
+    try:
+        MonetDirectStreamingDataset(paths=f"{tmp_path}/s.parquet", caption_probs="0.5,0.5")
+    except ValueError as exc:
+        assert "align 1:1" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for a misaligned caption_probs length")
+    try:
+        MonetDirectStreamingDataset(
+            paths=f"{tmp_path}/s.parquet", caption_probs="1,0,0,0,0;0,0,0,0,1",
+        )
+    except ValueError as exc:
+        assert "glob_weights" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for per-glob probs without glob_weights")
+
+
+def test_rank_worker_shard_split(tmp_path) -> None:
+    import itertools
+
+    from boomer.datasets.monet_direct import MonetDirectStreamingDataset
+
+    # 8 shards x 2 rows with globally unique captions. Two "ranks" (world_size=2, one
+    # worker each) must read disjoint shard slices whose union is the full corpus.
+    for i in range(8):
+        _write_monet_parquet(tmp_path / f"{i}.parquet", 2, start=2 * i)
+    seen: list[list[str]] = []
+    for rank in range(2):
+        ds = MonetDirectStreamingDataset(
+            paths=f"{tmp_path}/*.parquet", shuffle_buffer=0, dino_key=None,
+            rank=rank, world_size=2, seed=0,
+        )
+        recs = list(itertools.islice(iter(ds), 8))  # one epoch of this rank's slice
+        seen.append(sorted(r.caption for r in recs))
+    assert not set(seen[0]) & set(seen[1])
+    assert sorted(seen[0] + seen[1]) == sorted(f"cap {i}" for i in range(16))
+
+
+def test_weighted_glob_interleave(tmp_path) -> None:
+    import itertools
+
+    from boomer.datasets.monet_direct import MonetDirectStreamingDataset
+
+    # Two subsets with distinct caption prefixes, mixed 3:1. Each glob loops its own
+    # shards forever, so the emitted stream's prefix ratio must track the weights.
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    _write_monet_parquet(tmp_path / "a" / "s.parquet", 4, prefix="alpha")
+    _write_monet_parquet(tmp_path / "b" / "s.parquet", 4, prefix="beta")
+    ds = MonetDirectStreamingDataset(
+        paths=f"{tmp_path}/a/*.parquet,{tmp_path}/b/*.parquet",
+        glob_weights="0.75,0.25", shuffle_buffer=0, dino_key=None, seed=0,
+    )
+    recs = list(itertools.islice(iter(ds), 600))
+    alpha = sum(r.caption.startswith("alpha") for r in recs)
+    assert 0.65 < alpha / 600 < 0.85  # ~0.75 +- sampling noise at n=600
+    assert 0 < 600 - alpha  # both subsets present
+
+
 def test_monet_direct_cli_flags_parse() -> None:
     from train import build_parser
 
     args = build_parser().parse_args([
         "--cache-wds", "hf://datasets/jasperai/monet/v1.2.0/cc12m/*/*.parquet",
         "--monet-direct", "--monet-min-aesthetic", "4.5",
+        "--monet-weights", "0.5,0.5",
+        "--monet-caption-probs", "0,0,0,0,1;.25,.25,.25,.25,0",
         "--text-encoder-id", "Qwen/Qwen3.5-4B",
         "--text-encoder-layer", "-2",
         "--text-encoder-max-length", "256",
+        "--fsdp2", "--devices", "8",
     ])
     assert args.monet_direct is True
     assert args.text_encoder_layer == -2
     assert args.monet_min_aesthetic == 4.5
     assert args.monet_dino is True
     assert MONET_CAPTION_KEYS[0] in args.monet_caption_keys
+    assert args.monet_weights == "0.5,0.5"
+    assert ";" in args.monet_caption_probs
+    assert args.fsdp2 is True and args.devices == 8 and args.num_nodes == 1
+    assert args.fsdp2_distributed_checkpoint is False

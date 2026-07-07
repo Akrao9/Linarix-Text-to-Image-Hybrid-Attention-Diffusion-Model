@@ -33,6 +33,17 @@ encoder (default Qwen/Qwen3.5-4B, hidden_states layer -2):
       --text-encoder-id Qwen/Qwen3.5-4B --text-encoder-layer -2 --text-encoder-max-length 300 \
       --monet-min-aesthetic 4.5 --sample-prompts-file eval_prompts.txt \
       ... (model/optim flags as usual; text dims are auto-set from the encoder)
+
+Multi-GPU (8x H200, single node) with FSDP2 sharding, subset mixing and per-
+subset caption sampling (nano_mix.yaml template: synthetic 0.5 with its true
+generating prompt caption_original@1.0, five real subsets 0.1 each sampling the
+4 captioners uniformly and skipping the noisy alt-text caption_original):
+
+    python3 train.py --monet-direct --fsdp2 --devices 8 \
+      --cache-wds "hf://datasets/jasperai/monet/v1.2.0/synthetic/*/*/*.parquet,hf://datasets/jasperai/monet/v1.2.0/cc12m/*/*.parquet,hf://datasets/jasperai/monet/v1.2.0/megalith10m/*/*.parquet,hf://datasets/jasperai/monet/v1.2.0/laion/*/*.parquet,hf://datasets/jasperai/monet/v1.2.0/coyo/*/*.parquet,hf://datasets/jasperai/monet/v1.2.0/commoncatalog-cc-by/*/*.parquet" \
+      --monet-weights "0.5,0.1,0.1,0.1,0.1,0.1" \
+      --monet-caption-probs "0,0,0,0,1;.25,.25,.25,.25,0;.25,.25,.25,.25,0;.25,.25,.25,.25,0;.25,.25,.25,.25,0;.25,.25,.25,.25,0" \
+      ... (per-GPU --batch-size; global batch = batch_size * devices)
 """
 
 from __future__ import annotations
@@ -196,15 +207,56 @@ class BoomerLit(pl.LightningModule):
     def encode_captions(self, captions: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
         """Encode raw captions with the resident frozen Qwen encoder.
 
-        Returns fixed-shape ``(text [B, L, D] fp32, mask [B, L])`` on self.device.
-        ``encode_qwen_text_fixed`` runs under inference_mode, so both outputs are
-        cloned to ordinary tensors before they enter the training graph (inference
-        tensors cannot be saved for backward).
+        Returns fixed-shape ``(text [B, L, D] bf16, mask [B, L])`` on self.device.
+        The hidden states stay bf16 (the encoder's compute dtype): upcasting to fp32
+        would double the [B, L, 2560] conditioning activations for nothing — the
+        denoiser consumes them under bf16 autocast (or FSDP2's bf16 compute policy)
+        either way. ``encode_qwen_text_fixed`` runs under inference_mode, so both
+        outputs are cloned to ordinary tensors before they enter the training graph
+        (inference tensors cannot be saved for backward).
         """
         hp = self.hparams
         encoder = self._resident_text_encoder()
         hidden, mask = encode_qwen_text_fixed(encoder, captions, hp.text_encoder_max_length)
-        return hidden.float().clone(), mask.clone()
+        return hidden.clone(), mask.clone()
+
+    def configure_model(self) -> None:
+        """--fsdp2 (Lightning ModelParallelStrategy): shard every DiT block, then the
+        root module, over the data-parallel mesh with FSDP2's ``fully_shard``.
+
+        Sharded master parameters stay fp32; ``MixedPrecisionPolicy`` gathers/computes
+        forward+backward in bf16 and all-reduces gradients in fp32, so Trainer
+        precision must be 32-true (main() enforces it — Lightning-side autocast would
+        be redundant and bf16-true would destroy the fp32 masters). The frozen Qwen
+        encoder is untouched: it lives outside the module tree (``_text_encoder_box``)
+        and every rank keeps its own full bf16 replica. This hook runs for every
+        strategy, so it is a no-op when there is no device mesh (single GPU / DDP).
+        """
+        if self.device_mesh is None:
+            return
+        try:  # public path (torch >= 2.6), composable fallback (2.4/2.5)
+            from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+            from torch.distributed.tensor import DTensor
+        except ImportError:  # pragma: no cover - depends on the torch version
+            from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
+            from torch.distributed._tensor import DTensor
+
+        model = getattr(self.model, "_orig_mod", self.model)
+        if any(isinstance(p, DTensor) for p in model.parameters()):
+            return  # already sharded (the hook may be invoked more than once)
+        mesh = self.device_mesh["data_parallel"]
+        policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+        # Per-block sharding: each block's params all-gather just-in-time for its
+        # forward/backward and reshard after, overlapping comms with compute. The
+        # root shard picks up everything outside the blocks (embedders, final layer).
+        for block in model.blocks:
+            fully_shard(block, mesh=mesh, mp_policy=policy)
+        fully_shard(model, mesh=mesh, mp_policy=policy)
+        print(
+            f"[fsdp2] sharded {len(model.blocks)} blocks + root over "
+            f"{mesh.size()}-way data-parallel mesh (bf16 compute, fp32 reduce/master)",
+            flush=True,
+        )
 
     def on_save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
         # Keep inference self-describing even though Lightning's native state uses
@@ -386,6 +438,11 @@ class BoomerLit(pl.LightningModule):
             # clip_grad_norm_ returns the total norm BEFORE clipping -- log it so you can
             # see grad-norm spikes and how often clipping is active (norm > clip_val).
             total_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), float(gradient_clip_val))
+            if hasattr(total_norm, "full_tensor"):
+                # FSDP2: grads are DTensors, so the clip's total norm is a DTensor too
+                # (the clip itself is correct — torch reduces the partial norms across
+                # the mesh); materialize it for logging.
+                total_norm = total_norm.full_tensor()
             self.log("train/grad_norm", total_norm, on_step=True, on_epoch=False, prog_bar=True)
 
     def transfer_batch_to_device(self, batch, device, dataloader_idx):
@@ -495,6 +552,8 @@ class BoomerData(pl.LightningDataModule):
         monet_direct: bool = False,
         monet_latent_key: str = MONET_LATENT_KEY,
         monet_caption_keys: tuple[str, ...] = MONET_CAPTION_KEYS,
+        monet_caption_probs: Any = None,  # CSV / ';'-grouped str, tuple, or None
+        monet_weights: tuple[float, ...] | None = None,
         monet_dino_key: str | None = MONET_DINO_KEY,
         monet_min_aesthetic: float | None = None,
         monet_max_nsfw: float | None = None,
@@ -504,6 +563,8 @@ class BoomerData(pl.LightningDataModule):
         self.monet_direct = monet_direct
         self.monet_latent_key = monet_latent_key
         self.monet_caption_keys = monet_caption_keys
+        self.monet_caption_probs = monet_caption_probs
+        self.monet_weights = monet_weights
         self.monet_dino_key = monet_dino_key
         self.monet_min_aesthetic = monet_min_aesthetic
         self.monet_max_nsfw = monet_max_nsfw
@@ -542,8 +603,20 @@ class BoomerData(pl.LightningDataModule):
             pass  # not attached to a trainer (direct/offline use)
         return 0
 
+    def _trainer_rank_world(self) -> tuple[int | None, int | None]:
+        """The Trainer's DDP rank/world, resolved HERE (main process, trainer attached)
+        and passed to the dataset explicitly — spawned DataLoader workers have no
+        initialized process group to ask."""
+        try:
+            if self.trainer is not None:
+                return int(self.trainer.global_rank), int(self.trainer.world_size)
+        except RuntimeError:
+            pass  # not attached to a trainer (direct/offline use)
+        return None, None
+
     def _dataset(self, *, seed_salt: int = 0):
         if self.monet_direct:
+            rank, world = self._trainer_rank_world()
             return MonetDirectStreamingDataset(
                 paths=self.cache_wds,
                 hf_token=self.hf_token,
@@ -556,10 +629,14 @@ class BoomerData(pl.LightningDataModule):
                 range_size_mib=self.parquet_range_size_mib,
                 latent_key=self.monet_latent_key,
                 caption_keys=self.monet_caption_keys,
+                caption_probs=self.monet_caption_probs,
+                glob_weights=self.monet_weights,
                 dino_key=self.monet_dino_key,
                 min_aesthetic=self.monet_min_aesthetic,
                 max_nsfw=self.monet_max_nsfw,
                 max_watermark=self.monet_max_watermark,
+                rank=rank,
+                world_size=world,
             )
         return make_wds_dataset(
             cache_wds=self.cache_wds,
@@ -1276,7 +1353,20 @@ def build_parser() -> argparse.ArgumentParser:
                         "dataset, text encoded on the fly (skips the caching pipeline).")
     p.add_argument("--monet-latent-key", default=MONET_LATENT_KEY)
     p.add_argument("--monet-caption-keys", default=",".join(MONET_CAPTION_KEYS),
-                   help="comma-ordered caption-column priority; first non-empty per row wins.")
+                   help="comma-ordered caption-column priority; first non-empty per row wins "
+                        "(unless --monet-caption-probs samples among them instead).")
+    p.add_argument("--monet-caption-probs", default=None,
+                   help="Caption sampling weights aligned 1:1 with --monet-caption-keys: each "
+                        "row picks ONE caption at random among its non-empty columns with "
+                        "these relative probabilities (nano-t2i captioners_probabilities); "
+                        "zero-weight keys are never used. With --monet-weights, ';'-separated "
+                        "groups give each subset glob its own policy (nano_mix style; an "
+                        "empty group = priority order). Unset = strict priority order.")
+    p.add_argument("--monet-weights", default=None,
+                   help="CSV weights aligned 1:1 with the comma-separated globs in --cache-wds: "
+                        "each batch row is drawn from glob i with probability w_i/sum(w) "
+                        "(row-level stream interleave; nano_mix.yaml-style subset proportions). "
+                        "Unset = all globs merged into one stream.")
     p.add_argument("--monet-dino", action=bo, default=True,
                    help="carry monet's DINOv2 embedding into batches (REPA target).")
     p.add_argument("--monet-min-aesthetic", type=float, default=None)
@@ -1443,6 +1533,21 @@ def build_parser() -> argparse.ArgumentParser:
                    help="If set, overrides --precision (bf16->bf16-mixed, fp16->16-mixed, fp32->32-true).")
     p.add_argument("--device", default="cuda",
                    help="'cuda' (gpu accelerator) or 'cpu'. Lightning manages device placement.")
+    p.add_argument("--devices", type=int, default=1, help="GPUs per node.")
+    p.add_argument("--num-nodes", type=int, default=1)
+    p.add_argument("--fsdp2", action=bo, default=False,
+                   help="Shard the DiT with FSDP2 (fully_shard per block) via Lightning's "
+                        "ModelParallelStrategy — pure data parallel (tensor_parallel_size=1, "
+                        "data_parallel_size=devices*num_nodes; never 'auto', which would go "
+                        "tensor-parallel on a single node). Forces precision 32-true: bf16 "
+                        "compute + fp32 grad reduce come from the FSDP2 MixedPrecisionPolicy "
+                        "with fp32 sharded master weights. Disables EMA and in-training "
+                        "sample previews (neither is FSDP2-safe yet); --compile unsupported.")
+    p.add_argument("--fsdp2-distributed-checkpoint", action=bo, default=False,
+                   help="Save sharded (DCP directory) checkpoints instead of consolidating "
+                        "full weights into a single rank-0 .ckpt file. Keep OFF so resume/"
+                        "export/upload tooling keeps working; the consolidated save is cheap "
+                        "at Boomer's scale.")
     p.add_argument("--checkpoint-dir", default="/content/ckpt_stage0",
                    help="Local directory for checkpoints (always written here first).")
     p.add_argument("--save-every-steps", "--save-every", dest="save_every_steps", type=int, default=2000)
@@ -1519,6 +1624,78 @@ def main() -> None:
             "Use only one per-timestep loss weighting: --timestep-weight "
             "(Sana sqrt(1+sigma^2)/sigma) OR --min-snr-gamma, not both."
         )
+    # Fail CSV-alignment errors at launch, not minutes later inside a spawned
+    # DataLoader worker (the dataset re-validates, but this is the friendly path).
+    def _csv_len(csv: str) -> int:
+        return len([v for v in csv.split(",") if v.strip()])
+
+    if args.monet_caption_probs:
+        groups = args.monet_caption_probs.split(";")
+        if len(groups) > 1:  # per-glob ';' groups pair with the mix globs
+            if not args.monet_weights:
+                raise SystemExit(
+                    "per-glob --monet-caption-probs (';' groups) require --monet-weights."
+                )
+            if len(groups) != _csv_len(args.cache_wds):
+                raise SystemExit(
+                    f"--monet-caption-probs has {len(groups)} ';' groups for "
+                    f"{_csv_len(args.cache_wds)} globs in --cache-wds; they must align 1:1."
+                )
+        for group in groups:
+            if group.strip() and _csv_len(group) != _csv_len(args.monet_caption_keys):
+                raise SystemExit(
+                    f"--monet-caption-probs group '{group}' has {_csv_len(group)} weights "
+                    f"for {_csv_len(args.monet_caption_keys)} --monet-caption-keys; "
+                    "they must align 1:1."
+                )
+    if args.monet_weights and _csv_len(args.monet_weights) != _csv_len(args.cache_wds):
+        raise SystemExit(
+            f"--monet-weights has {_csv_len(args.monet_weights)} weights for "
+            f"{_csv_len(args.cache_wds)} globs in --cache-wds; they must align 1:1."
+        )
+
+    # Multi-GPU strategy. --fsdp2 = ModelParallelStrategy (FSDP2 via configure_model's
+    # fully_shard); otherwise plain DDP when more than one device is requested.
+    total_devices = args.devices * args.num_nodes
+    strategy: Any = "auto"
+    if args.fsdp2:
+        if total_devices < 2:
+            raise SystemExit("--fsdp2 needs at least 2 GPUs (set --devices / --num-nodes).")
+        if args.compile:
+            raise SystemExit(
+                "--compile with --fsdp2 is not wired up (compile must be applied per block "
+                "AFTER fully_shard); drop one of the two."
+            )
+        if args.fsdp2_distributed_checkpoint and args.checkpoint_upload_remote:
+            raise SystemExit(
+                "--checkpoint-upload-remote copies single .ckpt FILES; distributed (DCP "
+                "directory) checkpoints can't be uploaded by it. Drop one of the two."
+            )
+        from lightning.pytorch.strategies import ModelParallelStrategy
+
+        strategy = ModelParallelStrategy(
+            data_parallel_size=total_devices,  # explicit: 'auto' on one node means
+            tensor_parallel_size=1,            # TENSOR parallel across local GPUs
+            save_distributed_checkpoint=args.fsdp2_distributed_checkpoint,
+        )
+        if (args.dtype or args.precision) not in ("fp32", "32-true"):
+            print(
+                "[fsdp2] precision -> 32-true (bf16 compute + fp32 grad reduce come from "
+                "the FSDP2 MixedPrecisionPolicy; fp32 sharded master weights)",
+                flush=True,
+            )
+        args.precision, args.dtype = "32-true", None
+        if args.ema_decay > 0.0:
+            print("[fsdp2] EMA disabled: the EMA callback shadows full state_dicts and "
+                  "is not DTensor-safe.", flush=True)
+            args.ema_decay = 0.0
+        if args.sample_every_steps > 0:
+            print("[fsdp2] in-training sample previews disabled: rank-0-only sampling "
+                  "would deadlock FSDP2's collective all-gathers.", flush=True)
+            args.sample_every_steps = 0
+    elif total_devices > 1:
+        strategy = "ddp"
+
     pl.seed_everything(args.seed, workers=True)
     torch.set_float32_matmul_precision("high")
 
@@ -1557,6 +1734,7 @@ def main() -> None:
         config,
         hf_token=hf_token,
         monet_direct=args.monet_direct,
+        fsdp2=args.fsdp2,
         text_encoder_id=args.text_encoder_id,
         text_encoder_layer=args.text_encoder_layer,
         text_encoder_max_length=args.text_encoder_max_length,
@@ -1630,6 +1808,11 @@ def main() -> None:
         monet_latent_key=args.monet_latent_key,
         monet_caption_keys=tuple(
             key.strip() for key in args.monet_caption_keys.split(",") if key.strip()
+        ),
+        monet_caption_probs=args.monet_caption_probs,  # dataset parses CSV/';' groups
+        monet_weights=(
+            tuple(float(v) for v in args.monet_weights.split(",") if v.strip())
+            if args.monet_weights else None
         ),
         monet_dino_key=MONET_DINO_KEY if args.monet_dino else None,
         monet_min_aesthetic=args.monet_min_aesthetic,
@@ -1716,7 +1899,9 @@ def main() -> None:
 
     trainer = pl.Trainer(
         accelerator="cpu" if args.device == "cpu" else "gpu",
-        devices=1,
+        devices=args.devices,
+        num_nodes=args.num_nodes,
+        strategy=strategy,
         precision=precision,
         max_steps=args.max_steps,
         gradient_clip_val=args.grad_clip,
