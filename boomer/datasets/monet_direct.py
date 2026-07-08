@@ -53,6 +53,7 @@ from dataclasses import dataclass
 from typing import Any, Iterator
 
 import numpy as np
+import pyarrow as pa
 import torch
 from torch.utils.data import get_worker_info
 
@@ -170,11 +171,22 @@ def monet_row_to_record(
     if dino_key is not None:
         raw = row.get(dino_key)
         if raw is not None:
-            dino = torch.from_numpy(np.asarray(raw, dtype=np.float32))
+            try:
+                dino = torch.from_numpy(np.asarray(raw, dtype=np.float32))
+            except (ValueError, TypeError):
+                dino = None  # ragged/corrupt embedding: keep the row, drop the dino
 
     key = row.get("__key__") or row.get("id") or ""
+    try:
+        image_latent = flat_to_latent(latent)
+    except (ValueError, TypeError) as exc:
+        # A corrupt row (truncated/ragged latent list) is dropped like every other
+        # unusable-row case instead of crashing the run: monet shards are known to
+        # be heterogeneous, and one bad row must not abort a multi-day stream.
+        print(f"[monet-direct] drop corrupt row {key!r}: {exc}", flush=True)
+        return None
     return LatentRecord(
-        image_latent=flat_to_latent(latent),
+        image_latent=image_latent,
         text_embedding=_EMPTY,
         attention_mask=_EMPTY,
         caption=str(caption),
@@ -237,6 +249,10 @@ class MonetDirectStreamingDataset(ParquetStreamingLatentCacheDataset):
     world_size: int | None = None
 
     def __post_init__(self) -> None:
+        # Resolved once in the main process (the parent pre-count populates it) and
+        # inherited by workers through pickling, so N workers × M globs concurrent
+        # HfFileSystem.glob listings at startup collapse to one.
+        self._glob_files_cache: dict[str, list[str]] = {}
         if isinstance(self.caption_keys, str):  # tolerate a single CSV string
             self.caption_keys = tuple(
                 key.strip() for key in self.caption_keys.split(",") if key.strip()
@@ -303,6 +319,9 @@ class MonetDirectStreamingDataset(ParquetStreamingLatentCacheDataset):
                     f"caption_probs has {len(self._per_glob_caption_probs)} ';' groups "
                     f"for {len(self._globs)} globs in paths; they must align 1:1"
                 )
+        # The pre-count above may have built a filesystem while populating the glob
+        # cache; drop it so each worker still opens its own client for range reads.
+        self._fs = None
 
     def _load_manifest(self):
         return None  # monet is a foreign dataset; there is no Boomer cache manifest
@@ -368,7 +387,17 @@ class MonetDirectStreamingDataset(ParquetStreamingLatentCacheDataset):
                 return
             want = self._wanted_columns(available)
             for batch in pf.iter_batches(columns=want, batch_size=max(1, int(self.read_batch_size))):
-                cols = {c: batch.column(c).to_pylist() for c in batch.schema.names}
+                cols = {}
+                for c in batch.schema.names:
+                    col = batch.column(c)
+                    t = col.type
+                    if pa.types.is_list(t) or pa.types.is_large_list(t) or pa.types.is_fixed_size_list(t):
+                        # to_numpy keeps each row as a numpy array view — to_pylist
+                        # would box the 8192-float latent (+1536-float dino) into
+                        # Python objects per row, dominating loader CPU.
+                        cols[c] = col.to_numpy(zero_copy_only=False)
+                    else:
+                        cols[c] = col.to_pylist()
                 for i in range(batch.num_rows):
                     yield self._row_to_record({c: cols[c][i] for c in cols})
         finally:
@@ -390,18 +419,37 @@ class MonetDirectStreamingDataset(ParquetStreamingLatentCacheDataset):
             pass
         return int(os.environ.get("RANK", "0")), int(os.environ.get("WORLD_SIZE", "1"))
 
-    def _list_glob_files(self, raw: str) -> list[str]:
-        """One glob's shard list (the parent's ``_list_files`` flattens ALL globs into
-        one list; the weighted mix needs them separately)."""
+    def _resolve_glob(self, raw: str) -> list[str]:
+        """One glob's shard list, memoized in ``_glob_files_cache`` (may be empty)."""
+        cached = self._glob_files_cache.get(raw)
+        if cached is not None:
+            return cached
         if raw.startswith("hf://"):
             matched = sorted(self._hf_filesystem().glob(raw))
+            # HfFileSystem.glob drops the scheme; restore it.
             files = [m if m.startswith("hf://") else f"hf://{m}" for m in matched]
         elif any(ch in raw for ch in "*?[]"):
             files = sorted(glob_module.glob(raw))
         else:
             files = [raw]
+        self._glob_files_cache[raw] = files
+        return files
+
+    def _list_glob_files(self, raw: str) -> list[str]:
+        """One glob's shard list (the weighted mix needs each glob separately)."""
+        files = self._resolve_glob(raw)
         if not files:
             raise FileNotFoundError(f"No parquet shards found for mix glob: {raw}")
+        return files
+
+    def _list_files(self) -> list[str]:
+        """All globs flattened (single-stream mode). Overrides the parent so both
+        paths share one cached resolver instead of re-listing per worker."""
+        files: list[str] = []
+        for raw in self._globs:
+            files.extend(self._resolve_glob(raw))
+        if not files:
+            raise FileNotFoundError(f"No parquet shards found for: {self.paths}")
         return files
 
     @staticmethod
@@ -433,6 +481,7 @@ class MonetDirectStreamingDataset(ParquetStreamingLatentCacheDataset):
             order = list(files)
             random.Random(self.seed + seed_offset + epoch).shuffle(order)
             yielded = 0
+            transient_skips = 0
             for path in order:
                 try:
                     shard = self._iter_shard(path)
@@ -453,6 +502,11 @@ class MonetDirectStreamingDataset(ParquetStreamingLatentCacheDataset):
                     if not _is_transient_stream_error(exc):
                         raise
                     reconnects += 1
+                    transient_skips += 1
+                    # The cached HfFileSystem may hold a dead HTTP client (the classic
+                    # "client has been closed" mode); drop it so the next shard open
+                    # builds a fresh filesystem instead of failing identically forever.
+                    self._fs = None
                     if reconnects > self.stream_reconnect_max_retries:
                         raise RuntimeError(
                             f"[monet-direct] {reconnects} consecutive transient errors "
@@ -468,6 +522,18 @@ class MonetDirectStreamingDataset(ParquetStreamingLatentCacheDataset):
                     time.sleep(delay)
                     continue
             if yielded == 0:
+                if transient_skips > 0:
+                    # Every shard in this pass failed transiently (network outage):
+                    # that is a connectivity problem, not an empty corpus — retry the
+                    # pass under the reconnect budget instead of a fatal "empty epoch".
+                    print(
+                        f"[monet-direct] pass over {tag} yielded 0 rows with "
+                        f"{transient_skips} transient shard skip(s); retrying pass "
+                        f"(reconnect budget {reconnects}/{self.stream_reconnect_max_retries})",
+                        flush=True,
+                    )
+                    epoch += 1
+                    continue
                 raise RuntimeError(
                     f"[monet-direct] streamed 0 usable rows for {tag} across "
                     f"{len(files)} shard(s) ({rows} rows read; all filtered or "

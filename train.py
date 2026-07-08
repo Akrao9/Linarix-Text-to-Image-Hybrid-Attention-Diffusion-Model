@@ -59,6 +59,7 @@ import argparse
 import math
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -109,7 +110,10 @@ from boomer.models.qwen_connector import (  # noqa: E402
     QwenReferenceEncoder,
     encode_qwen_text_fixed,
 )
-from boomer.models.boomer_fla_dit import BoomerFLADiTConfig  # noqa: E402
+from boomer.models.boomer_fla_dit import (  # noqa: E402
+    BoomerFLADiTConfig,
+    migrate_glumbconv_state_dict,
+)
 from boomer.models.factory import create_model  # noqa: E402
 from boomer.sana_flow import (  # noqa: E402
     flow_min_snr_loss_weight,
@@ -217,15 +221,23 @@ class BoomerLit(pl.LightningModule):
         Returns fixed-shape ``(text [B, L, D] bf16, mask [B, L])`` on self.device.
         The hidden states stay bf16 (the encoder's compute dtype): upcasting to fp32
         would double the [B, L, 2560] conditioning activations for nothing — the
-        denoiser consumes them under bf16 autocast (or FSDP2's bf16 compute policy)
-        either way. ``encode_qwen_text_fixed`` runs under inference_mode, so both
-        outputs are cloned to ordinary tensors before they enter the training graph
-        (inference tensors cannot be saved for backward).
+        denoiser consumes them under bf16 autocast (or FSDP2's bf16 compute policy).
+        ``encode_qwen_text_fixed`` runs under no_grad (not inference_mode), so the
+        outputs enter the training graph directly with no per-step clone.
         """
         hp = self.hparams
         encoder = self._resident_text_encoder()
         hidden, mask = encode_qwen_text_fixed(encoder, captions, hp.text_encoder_max_length)
-        return hidden.clone(), mask.clone()
+        if (
+            not torch.is_autocast_enabled(hidden.device.type)
+            and self.device_mesh is None
+            and hidden.dtype != self.model.caption_embedder.y_proj[0].weight.dtype
+        ):
+            # 32-true precision without FSDP2: no autocast and no MixedPrecisionPolicy
+            # will reconcile bf16 text with the fp32 caption embedder — upcast here
+            # rather than crash on the dtype mismatch.
+            hidden = hidden.to(self.model.caption_embedder.y_proj[0].weight.dtype)
+        return hidden, mask
 
     def configure_model(self) -> None:
         """--fsdp2 (Lightning ModelParallelStrategy): shard every DiT block, then the
@@ -272,6 +284,36 @@ class BoomerLit(pl.LightningModule):
         checkpoint["train_args"] = {
             key: value for key, value in dict(self.hparams).items() if key != "model_config"
         }
+
+    def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        # Adam moments saved by the legacy Conv2d GLUMBConv are 4D (O, I, 1, 1); the
+        # migrated Linear params are 2D. Optimizer.load_state_dict casts dtype/device
+        # but never reshapes, so realign same-numel moment tensors to the current
+        # param shapes before Lightning restores the optimizer — otherwise the first
+        # step after a full resume of a pre-refactor checkpoint broadcast-errors.
+        params = list(self.model.parameters())
+        realigned = 0
+        for opt_state in checkpoint.get("optimizer_states") or []:
+            flat = [i for g in opt_state.get("param_groups") or [] for i in g.get("params", [])]
+            if len(flat) != len(params):
+                continue  # param set changed; let Lightning surface the real error
+            idx_to_param = dict(zip(flat, params))
+            for idx, entry in (opt_state.get("state") or {}).items():
+                param = idx_to_param.get(idx)
+                if param is None:
+                    continue
+                for key, value in entry.items():
+                    if (
+                        torch.is_tensor(value)
+                        and value.ndim > 0
+                        and value.shape != param.shape
+                        and value.numel() == param.numel()
+                    ):
+                        entry[key] = value.reshape(param.shape)
+                        realigned += 1
+        if realigned:
+            print(f"[resume] reshaped {realigned} optimizer moment tensors to migrated "
+                  "param shapes (legacy GLUMBConv checkpoint)", flush=True)
 
     def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         hp = self.hparams
@@ -764,7 +806,15 @@ class EMACallback(Callback):
 
     def on_load_checkpoint(self, trainer, pl_module, checkpoint) -> None:
         if "ema" in checkpoint:
-            self.ema = {k: v.float() for k, v in checkpoint["ema"].items()}
+            ema = {k: v.float() for k, v in checkpoint["ema"].items()}
+            # The module-level GLUMBConv migration only covers Module.load_state_dict;
+            # the EMA shadow is a raw dict and must be migrated explicitly or the first
+            # update after resuming a pre-refactor checkpoint KeyErrors.
+            n = migrate_glumbconv_state_dict(ema)
+            if n:
+                print(f"[ema] migrated {n} legacy GLUMBConv entr{'y' if n == 1 else 'ies'}",
+                      flush=True)
+            self.ema = ema
 
 
 class StepUnitProgressBar(TQDMProgressBar):
@@ -1118,7 +1168,11 @@ class CheckpointUploadCallback(Callback):
                 if self.keep_uploaded > 0:
                     self._prune_remote()
             except Exception as exc:  # never let an upload error kill the worker
-                print(f"[ckpt-upload] FAILED {Path(path).name}: {exc}", flush=True)
+                # Drop it from _enqueued so the next _scan_and_enqueue re-queues the
+                # (still-local) checkpoint instead of leaving it stranded until fit end.
+                with self._lock:
+                    self._enqueued.discard(Path(path).name)
+                print(f"[ckpt-upload] FAILED {Path(path).name} (will retry): {exc}", flush=True)
             finally:
                 self._q.task_done()
 
@@ -1159,20 +1213,37 @@ class CheckpointUploadCallback(Callback):
                 shutil.copyfile(str(local), str(tmp))  # copy to tmp...
                 os.replace(str(tmp), str(dest))        # ...then atomic swap into place
             except OSError as exc:
-                # Mounts without rename support: fall back to a direct copy to the
-                # final name (non-atomic, but the upload still lands).
+                # Mounts without rename support: copy straight to the final name. This
+                # is non-atomic, so if the copy is interrupted, delete the partial file
+                # rather than leave a truncated boomer-step=N.ckpt that the resume
+                # scanner would pick and fail to load; the retry re-uploads it.
                 print(f"[ckpt-upload] tmp+rename failed on {self.remote} ({exc}); "
                       f"copying {local.name} directly", flush=True)
                 tmp.unlink(missing_ok=True)
-                shutil.copyfile(str(local), str(dest))
+                try:
+                    shutil.copyfile(str(local), str(dest))
+                except BaseException:
+                    Path(dest).unlink(missing_ok=True)
+                    raise
         print(f"[ckpt-upload] uploaded {local.name}", flush=True)
 
     # ---- pruning ---------------------------------------------------------- #
+    @staticmethod
+    def _step_key(name: str) -> tuple[int, str]:
+        """Retention order = training-step order parsed from 'boomer-step=N.ckpt'.
+
+        mtime is unreliable (uploads finish out of order; copies reset it) and a
+        lexicographic name sort misorders unpadded steps (10000 < 5000), either of
+        which makes retention delete the NEWEST checkpoint. Unparseable names sort
+        first (pruned before any step checkpoint)."""
+        m = re.search(r"step=(\d+)", name)
+        return (int(m.group(1)) if m else -1, name)
+
     def _local_step_ckpts(self) -> list[Path]:
         # All step checkpoints except the rolling 'last.ckpt' (which is overwritten).
         return sorted(
             (p for p in self.checkpoint_dir.glob("*.ckpt") if p.name != "last.ckpt"),
-            key=lambda p: p.stat().st_mtime,
+            key=lambda p: self._step_key(p.name),
         )
 
     def _prune_local(self) -> None:
@@ -1203,14 +1274,17 @@ class CheckpointUploadCallback(Callback):
         if self.use_rclone:
             out = subprocess.run([self.rclone_bin, "lsf", self.remote],
                                  capture_output=True, text=True)
-            names = sorted(n for n in out.stdout.split() if n.endswith(".ckpt") and n != "last.ckpt")
+            names = sorted(
+                (n for n in out.stdout.split() if n.endswith(".ckpt") and n != "last.ckpt"),
+                key=self._step_key,
+            )
             for n in names[: max(0, len(names) - self.keep_uploaded)]:
                 subprocess.run([self.rclone_bin, "deletefile", f"{self.remote.rstrip('/')}/{n}"],
                                capture_output=True)
         else:
             files = sorted(
                 (p for p in Path(self.remote).glob("*.ckpt") if p.name != "last.ckpt"),
-                key=lambda p: p.stat().st_mtime,
+                key=lambda p: self._step_key(p.name),
             )
             for p in files[: max(0, len(files) - self.keep_uploaded)]:
                 try:
@@ -1900,7 +1974,14 @@ def main() -> None:
             tuple(float(v) for v in args.monet_weights.split(",") if v.strip())
             if args.monet_weights else None
         ),
-        monet_dino_key=MONET_DINO_KEY if args.monet_dino else None,
+        # Only fetch the 1536-d DINO column when REPA actually consumes it: otherwise
+        # it is streamed, decoded, collated, and H2D-copied every step just to be
+        # discarded by training_step.
+        monet_dino_key=(
+            MONET_DINO_KEY
+            if args.monet_dino and args.repa_dim > 0 and args.repa_weight > 0
+            else None
+        ),
         monet_min_aesthetic=args.monet_min_aesthetic,
         monet_max_nsfw=args.monet_max_nsfw,
         monet_max_watermark=args.monet_max_watermark,

@@ -50,6 +50,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from boomer.checkpoint_utils import load_checkpoint, select_model_state  # noqa: E402
+from boomer.models.boomer_fla_dit import migrate_glumbconv_state_dict  # noqa: E402
 from boomer.models.qwen_connector import DEFAULT_INSTRUCTION  # noqa: E402
 from modeling_boomer_fla import BoomerFLADiT, BoomerFLADiTConfig  # noqa: E402
 
@@ -98,6 +99,13 @@ def _build_config(train_cfg: dict) -> dict:
         config[field.name] = train_cfg.get(field.name, field.default)
     # The standalone has no FA2 path; SDPA is numerically identical and dependency-free.
     config["image_attention_backend"] = "sdpa"
+    # Inference-only overrides: the exported weights have the inpaint-reserved
+    # channels folded off x_embedder and repa_proj stripped, and checkpointing is a
+    # training concern — the modeling config now carries these fields, so they must
+    # not leak through from the training config.
+    config["extra_input_channels"] = 0
+    config["repa_dim"] = 0
+    config["gradient_checkpointing"] = False
     return config
 
 
@@ -215,6 +223,12 @@ def main() -> None:
 
     state = _strip_prefixes(state)
     state = {k: v for k, v in state.items() if not k.startswith("repa_proj.")}
+    # Migrate legacy GLUMBConv Conv2d-1x1 keys BEFORE save: load_state_dict works on
+    # an internal copy, so relying on the module hook would publish safetensors with
+    # the old key names (loadable only through the migration shim).
+    n_migrated = migrate_glumbconv_state_dict(state)
+    if n_migrated:
+        print(f"[migrate] renamed {n_migrated} legacy GLUMBConv tensors to the Linear layout")
 
     latent_channels = int(train_cfg.get("latent_channels", 32))
     extra = int(train_cfg.get("extra_input_channels", 0))

@@ -275,7 +275,10 @@ class QwenReferenceEncoder(nn.Module):
             inputs = proc(texts, **input_kwargs)
         return inputs
 
-    @torch.inference_mode()
+    # no_grad rather than inference_mode: the outputs feed straight into the training
+    # graph as constants (train.py encode_captions); inference-mode tensors would
+    # force a full [B, L, D] clone there every step.
+    @torch.no_grad()
     def forward(
         self, prompts: Sequence[str], images: Sequence[Any] | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -314,7 +317,7 @@ class QwenReferenceEncoder(nn.Module):
         return hidden_states, pad_mask
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def encode_qwen_text_fixed(
     encoder: QwenReferenceEncoder,
     captions: Sequence[str],

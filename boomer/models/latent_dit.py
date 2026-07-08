@@ -65,6 +65,12 @@ class CaptionEmbedder(nn.Module):
         token_num: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         text = self.null_text_embedding
+        # Under FSDP2 the root shard turns this parameter into a DTensor, and this
+        # method runs OUTSIDE the root forward (condition dropout happens before the
+        # model call), so no unshard hook fires. Materialize the full tensor —
+        # full_tensor() is differentiable, so the learned null caption still trains.
+        if hasattr(text, "full_tensor"):
+            text = text.full_tensor()
         if token_num is not None and token_num != text.shape[1]:
             if token_num < text.shape[1]:
                 text = text[:, :token_num]

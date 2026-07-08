@@ -229,6 +229,39 @@ class ConvLayer(nn.Module):
         return self.act(self.conv(x))
 
 
+_GLUMB_LEGACY_KEY_MAP = (
+    ("inverted_conv.conv.weight", "inverted_fc.0.weight"),
+    ("inverted_conv.conv.bias", "inverted_fc.0.bias"),
+    ("point_conv.conv.weight", "point_fc.weight"),
+)
+
+
+def migrate_glumbconv_state_dict(state_dict: dict, prefix: str = "") -> int:
+    """Rename legacy Conv2d-1x1 GLUMBConv keys to the Linear layout, in place.
+
+    Handles raw state dicts that never pass through ``Module.load_state_dict``
+    (EMA shadows, export tooling, optimizer-adjacent dumps). Weights saved as
+    ``(O, I, 1, 1)`` are reshaped to ``(O, I)``. Returns the number of migrated
+    entries; 0 for post-refactor dicts (idempotent).
+    """
+    migrated = 0
+    for key in list(state_dict.keys()):
+        if not key.startswith(prefix):
+            continue
+        for old_suffix, new_suffix in _GLUMB_LEGACY_KEY_MAP:
+            if not key.endswith(old_suffix):
+                continue
+            tensor = state_dict.pop(key)
+            if old_suffix.endswith(".weight") and tensor.ndim == 4:
+                tensor = tensor.reshape(tensor.shape[0], tensor.shape[1])
+            new_key = key[: -len(old_suffix)] + new_suffix
+            if new_key not in state_dict:
+                state_dict[new_key] = tensor
+            migrated += 1
+            break
+    return migrated
+
+
 class GLUMBConv(nn.Module):
     """Sana GLUMBConv FFN: 1x1 expand, depthwise spatial conv, GLU, 1x1 project."""
 
@@ -256,20 +289,7 @@ class GLUMBConv(nn.Module):
         error_msgs,
     ) -> None:
         # Migrate checkpoints saved with the legacy Conv2d 1x1 layers.
-        for old_suffix, new_suffix in (
-            ("inverted_conv.conv.weight", "inverted_fc.0.weight"),
-            ("inverted_conv.conv.bias", "inverted_fc.0.bias"),
-            ("point_conv.conv.weight", "point_fc.weight"),
-        ):
-            old_key = prefix + old_suffix
-            new_key = prefix + new_suffix
-            if old_key not in state_dict:
-                continue
-            tensor = state_dict.pop(old_key)
-            if old_suffix.endswith(".weight"):
-                tensor = tensor.reshape(tensor.shape[0], tensor.shape[1])
-            if new_key not in state_dict:
-                state_dict[new_key] = tensor
+        migrate_glumbconv_state_dict(state_dict, prefix=prefix)
         super()._load_from_state_dict(
             state_dict,
             prefix,
@@ -382,21 +402,28 @@ class MultimodalCoordinateRoPE(nn.Module):
         ids = torch.stack([token_type, positions, zeros], dim=-1)
         return ids.unsqueeze(0).expand(batch_size, -1, -1)
 
-    def _axis_apply(
+    def _axis_cos_sin(
         self,
-        x: torch.Tensor,
         axis_ids: torch.Tensor,
         axis_index: int,
-        image_token_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        inv_freq = getattr(self, f"inv_freq_{axis_index}")
-        angles = axis_ids.float().unsqueeze(-1) * inv_freq.to(device=x.device).view(1, 1, -1)
+        image_token_mask: torch.Tensor | None,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """cos/sin tables for one axis — independent of q/k, so built once and reused
+        for both. NTK selection is on the small inv_freq vector (not two full angle
+        tensors + a where), one pass per axis rather than per q and per k."""
+        inv_freq = getattr(self, f"inv_freq_{axis_index}").to(device=device).view(1, 1, -1)
         if image_token_mask is not None and axis_index > 0:
-            inv_freq_ntk = getattr(self, f"inv_freq_ntk_{axis_index}")
-            angles_ntk = axis_ids.float().unsqueeze(-1) * inv_freq_ntk.to(device=x.device).view(1, 1, -1)
-            angles = torch.where(image_token_mask.unsqueeze(-1), angles_ntk, angles)
-        cos = torch.cat([angles.cos(), angles.cos()], dim=-1).unsqueeze(2).to(dtype=x.dtype)
-        sin = torch.cat([angles.sin(), angles.sin()], dim=-1).unsqueeze(2).to(dtype=x.dtype)
+            inv_freq_ntk = getattr(self, f"inv_freq_ntk_{axis_index}").to(device=device).view(1, 1, -1)
+            inv_freq = torch.where(image_token_mask.unsqueeze(-1), inv_freq_ntk, inv_freq)
+        angles = axis_ids.float().unsqueeze(-1) * inv_freq
+        cos = torch.cat([angles.cos(), angles.cos()], dim=-1).unsqueeze(2).to(dtype=dtype)
+        sin = torch.cat([angles.sin(), angles.sin()], dim=-1).unsqueeze(2).to(dtype=dtype)
+        return cos, sin
+
+    def _apply_cos_sin(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         return x * cos + self._rotate_half(x) * sin
 
     def apply(
@@ -416,8 +443,11 @@ class MultimodalCoordinateRoPE(nn.Module):
         q_out = []
         k_out = []
         for index, (q_axis, k_axis) in enumerate(zip(q_chunks, k_chunks, strict=True)):
-            q_out.append(self._axis_apply(q_axis, ids[..., index], index, image_token_mask))
-            k_out.append(self._axis_apply(k_axis, ids[..., index], index, image_token_mask))
+            cos, sin = self._axis_cos_sin(
+                ids[..., index], index, image_token_mask, dtype=q.dtype, device=q.device
+            )
+            q_out.append(self._apply_cos_sin(q_axis, cos, sin))
+            k_out.append(self._apply_cos_sin(k_axis, cos, sin))
         return torch.cat(q_out, dim=-1), torch.cat(k_out, dim=-1)
 
 
@@ -1652,6 +1682,26 @@ class BoomerFLADiT(nn.Module):
         nn.init.zeros_(self.final_t_block[1].bias)
         nn.init.zeros_(self.out_proj.weight)
         nn.init.zeros_(self.out_proj.bias)
+
+        # Sandwich RMSNorm is degenerate around an exactly-zero sublayer output: the
+        # norm's Jacobian at 0 is rsqrt(eps) (~1000x gradient amplification into the
+        # zero-init projection) and the first optimizer step snaps the normalized
+        # branch from 0 straight to gate-scale unit RMS instead of ramping. With the
+        # sandwich on, the no-op start is carried by the near-zero adaLN gates alone,
+        # and the sandwich-wrapped output projections get a small normal init. The
+        # model's zero-output-at-init property is unaffected (the head stays zero).
+        if self.config.sandwich_rmsnorm:
+            for block in self.blocks:
+                for module in block.modules():
+                    if isinstance(module, GLUMBConv):
+                        nn.init.normal_(module.point_fc.weight, std=0.02)
+                    elif isinstance(module, FullImageSelfAttention):
+                        nn.init.normal_(module.out_proj.weight, std=0.02)
+                    elif isinstance(module, SanaMultiHeadCrossAttention):
+                        nn.init.normal_(module.proj.weight, std=0.02)
+                if isinstance(block, BoomerFLAJointRefreshBlock):
+                    nn.init.normal_(block.image_out_proj.weight, std=0.02)
+                    nn.init.normal_(block.text_out_proj.weight, std=0.02)
 
         # Zero the reserved-input-channel slice so they contribute nothing until a future
         # inpainting fine-tune learns them (base channels keep their default init).
