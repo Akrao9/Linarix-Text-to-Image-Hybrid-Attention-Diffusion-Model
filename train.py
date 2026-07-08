@@ -1776,7 +1776,11 @@ def main() -> None:
                   "would deadlock FSDP2's collective all-gathers.", flush=True)
             args.sample_every_steps = 0
     elif total_devices > 1:
-        strategy = "ddp"
+        from lightning.pytorch.strategies import DDPStrategy
+
+        # static_graph=True silences AccumulateGrad stream-mismatch warnings that show up
+        # with gradient checkpointing + DDP (the graph topology is fixed per step).
+        strategy = DDPStrategy(static_graph=True)
 
     pl.seed_everything(args.seed, workers=True)
     torch.set_float32_matmul_precision("high")

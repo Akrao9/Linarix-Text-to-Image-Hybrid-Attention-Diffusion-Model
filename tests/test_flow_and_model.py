@@ -354,7 +354,7 @@ def test_boomer_fla_adaln_gaussian_initialization_keeps_output_head_zero() -> No
         assert block.scale_shift_table.shape[0] == 9
         assert block.scale_shift_table.std().item() > 0.0
         assert isinstance(block.norm3, torch.nn.LayerNorm)
-        assert torch.all(block.mlp.point_conv.conv.weight == 0)
+        assert torch.all(block.mlp.point_fc.weight == 0)
         if block.use_image_attention:
             assert torch.all(block.image_attn_mod[1].weight == 0)
             assert torch.all(block.image_attn_mod[1].bias == 0)

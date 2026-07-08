@@ -169,23 +169,65 @@ class GLUMBConv(nn.Module):
         super().__init__()
         inner_dim = int(hidden_dim * mlp_ratio)
         self.inner_dim = inner_dim
-        self.inverted_conv = ConvLayer(hidden_dim, inner_dim * 2, 1, bias=True, act="silu")
+        self.inner_channels = inner_dim * 2
+        # 1x1 pointwise ops are Linear on tokens: equivalent to Conv2d(1x1) but avoids
+        # NCHW reshape grads with non-standard strides that trip DDP bucket layout.
+        self.inverted_fc = nn.Sequential(nn.Linear(hidden_dim, inner_dim * 2), nn.SiLU())
         self.depth_conv = ConvLayer(inner_dim * 2, inner_dim * 2, 3, groups=inner_dim * 2, bias=True)
-        self.point_conv = ConvLayer(inner_dim, hidden_dim, 1, bias=False)
-        nn.init.zeros_(self.point_conv.conv.weight)
+        self.point_fc = nn.Linear(inner_dim, hidden_dim, bias=False)
+        nn.init.zeros_(self.point_fc.weight)
         self.glu_act = nn.SiLU()
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ) -> None:
+        # Migrate checkpoints saved with the legacy Conv2d 1x1 layers.
+        for old_suffix, new_suffix in (
+            ("inverted_conv.conv.weight", "inverted_fc.0.weight"),
+            ("inverted_conv.conv.bias", "inverted_fc.0.bias"),
+            ("point_conv.conv.weight", "point_fc.weight"),
+        ):
+            old_key = prefix + old_suffix
+            new_key = prefix + new_suffix
+            if old_key not in state_dict:
+                continue
+            tensor = state_dict.pop(old_key)
+            if old_suffix.endswith(".weight"):
+                tensor = tensor.reshape(tensor.shape[0], tensor.shape[1])
+            if new_key not in state_dict:
+                state_dict[new_key] = tensor
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def forward(self, x: torch.Tensor, *, height: int, width: int) -> torch.Tensor:
         batch, tokens, channels = x.shape
         if tokens != height * width:
             raise ValueError(f"Expected {height * width} image tokens, got {tokens}")
-        x = x.reshape(batch, height, width, channels).permute(0, 3, 1, 2).contiguous()
-        x = self.inverted_conv(x)
+        x = self.inverted_fc(x)
+        x = (
+            x.reshape(batch, height, width, self.inner_channels)
+            .permute(0, 3, 1, 2)
+            .contiguous()
+        )
         x = self.depth_conv(x)
         x, gate = x.chunk(2, dim=1)
         x = x * self.glu_act(gate)
-        x = self.point_conv(x)
-        return x.reshape(batch, channels, tokens).transpose(1, 2).contiguous()
+        x = x.permute(0, 2, 3, 1).reshape(batch, tokens, self.inner_dim).contiguous()
+        return self.point_fc(x)
 
 
 class TorchSelfAttention(nn.Module):
