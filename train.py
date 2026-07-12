@@ -537,6 +537,7 @@ def make_wds_dataset(
     parquet_memory_trim_every: int = 4096,
     parquet_prefetch_ranges: bool = True,
     parquet_range_size_mib: int = 64,
+    captions_only: bool = False,
 ):
     """Parquet caches range-stream via `datasets` (faster + stall-resilient); remote
     hf:// tar caches use the parallel download-ahead prefetch window (thread-pool into
@@ -552,6 +553,7 @@ def make_wds_dataset(
             memory_trim_every=parquet_memory_trim_every,
             prefetch_ranges=parquet_prefetch_ranges,
             range_size_mib=parquet_range_size_mib,
+            captions_only=captions_only,
         )
     if is_remote_cache(cache_wds):
         return PrefetchingWdsLatentCacheDataset(
@@ -565,12 +567,14 @@ def make_wds_dataset(
             decode_queue_size=decode_queue_size,
             download_max_retries=download_max_retries,
             max_consecutive_skips=max_consecutive_skips,
+            captions_only=captions_only,
         )
     return StreamingWdsLatentCacheDataset(
         paths=cache_wds,
         hf_token=hf_token,
         shardshuffle=shard_shuffle if shard_shuffle > 0 else True,
         shuffle_buffer=shuffle_buffer,
+        captions_only=captions_only,
     )
 
 
@@ -598,6 +602,7 @@ class BoomerData(pl.LightningDataModule):
         parquet_memory_trim_every: int = 4096,
         parquet_prefetch_ranges: bool = True,
         parquet_range_size_mib: int = 64,
+        captions_only: bool = False,
         monet_direct: bool = False,
         monet_latent_key: str = MONET_LATENT_KEY,
         monet_caption_keys: tuple[str, ...] = MONET_CAPTION_KEYS,
@@ -609,6 +614,7 @@ class BoomerData(pl.LightningDataModule):
         monet_max_watermark: float | None = None,
     ) -> None:
         super().__init__()
+        self.captions_only = captions_only
         self.monet_direct = monet_direct
         self.monet_latent_key = monet_latent_key
         self.monet_caption_keys = monet_caption_keys
@@ -703,6 +709,7 @@ class BoomerData(pl.LightningDataModule):
             parquet_memory_trim_every=self.parquet_memory_trim_every,
             parquet_prefetch_ranges=self.parquet_prefetch_ranges,
             parquet_range_size_mib=self.parquet_range_size_mib,
+            captions_only=self.captions_only,
         )
 
     def train_dataloader(self) -> DataLoader:
@@ -1363,6 +1370,9 @@ def peek_record(args: argparse.Namespace, hf_token: str | bool | None) -> Any:
         hf_token=hf_token,
         seed=args.seed,
         decode_queue_size=0,  # one record: decode inline, no producer thread
+        # Peek must mirror training decode: with --cache-captions-only the record's
+        # text_embedding is None and build_config takes text dims from the encoder.
+        captions_only=args.cache_captions_only,
     )
     return next(iter(ds))
 
@@ -1387,8 +1397,14 @@ def build_config(args: argparse.Namespace, record: Any) -> BoomerFLADiTConfig:
     if record is not None:
         latent_channels = int(record.image_latent.shape[0])
         latent_size = int(record.image_latent.shape[-1])
-        text_dim = int(record.text_embedding.shape[-1])
-        text_seq_len = int(record.text_embedding.shape[-2])
+        if record.text_embedding is not None:
+            text_dim = int(record.text_embedding.shape[-1])
+            text_seq_len = int(record.text_embedding.shape[-2])
+        else:
+            # --cache-captions-only: latent dims from the peeked record, text dims from
+            # the on-the-fly encoder (main() set these from its config.json).
+            text_dim = args.text_dim
+            text_seq_len = args.text_seq_len
     else:
         latent_channels = args.latent_channels
         latent_size = args.latent_size
@@ -1501,6 +1517,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--monet-direct", action=bo, default=False,
                    help="Stream jasperai/monet parquet shards directly: latents from the "
                         "dataset, text encoded on the fly (skips the caching pipeline).")
+    p.add_argument("--cache-captions-only", action=bo, default=False,
+                   help="Boomer WDS/parquet caches: IGNORE the cached text/text_mask "
+                        "columns (parquet never even downloads them) and encode the raw "
+                        "caption column on the fly with --text-encoder-*. For caches whose "
+                        "text was baked with a different encoder than the current model, "
+                        "e.g. boomer-finet2i-1024-parquet's 2048-d text vs v6's 1536-d.")
     p.add_argument("--monet-latent-key", default=MONET_LATENT_KEY)
     p.add_argument("--monet-caption-keys", default=",".join(MONET_CAPTION_KEYS),
                    help="comma-ordered caption-column priority; first non-empty per row wins "
@@ -1522,7 +1544,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--monet-min-aesthetic", type=float, default=None)
     p.add_argument("--monet-max-nsfw", type=float, default=None)
     p.add_argument("--monet-max-watermark", type=float, default=None)
-    # On-the-fly text encoder (used only with --monet-direct).
+    # On-the-fly text encoder (used with --monet-direct / --cache-captions-only).
     p.add_argument("--text-encoder-id", default="Qwen/Qwen3.5-4B")
     p.add_argument("--text-encoder-layer", type=int, default=-2,
                    help="hidden_states readout layer (-2 = second-to-last, raw/un-normed; "
@@ -1861,18 +1883,21 @@ def main() -> None:
 
     hf_token = hf_token_value(args.hf_token)
 
-    if args.monet_direct:
-        # Dims are fully determined without touching a shard: monet's 512px f32c32
-        # latents are (32,16,16) (the --latent-* defaults), text_seq_len is the fixed
-        # encode length, and text_dim comes from the encoder's config.json.
-        args.skip_peek = True
+    if args.monet_direct or args.cache_captions_only:
+        # On-the-fly text: text_seq_len is the fixed encode length and text_dim comes
+        # from the encoder's config.json. --monet-direct also skips the shard peek
+        # entirely (monet's 512px f32c32 latents are the --latent-* defaults);
+        # --cache-captions-only keeps the peek for LATENT dims (e.g. 1024px caches).
         args.text_seq_len = args.text_encoder_max_length
         args.text_dim = text_encoder_hidden_size(args.text_encoder_id, hf_token)
+        tag = "monet-direct" if args.monet_direct else "captions-only"
         print(
-            f"[monet-direct] on-the-fly text: {args.text_encoder_id} "
+            f"[{tag}] on-the-fly text: {args.text_encoder_id} "
             f"(layer {args.text_encoder_layer}) -> text=({args.text_seq_len},{args.text_dim})",
             flush=True,
         )
+    if args.monet_direct:
+        args.skip_peek = True
 
     if args.skip_peek:
         print(f"Skipping dim peek; using explicit dims "
@@ -1964,6 +1989,7 @@ def main() -> None:
         parquet_memory_trim_every=args.parquet_memory_trim_every,
         parquet_prefetch_ranges=args.parquet_prefetch_ranges,
         parquet_range_size_mib=args.parquet_range_size_mib,
+        captions_only=args.cache_captions_only,
         monet_direct=args.monet_direct,
         monet_latent_key=args.monet_latent_key,
         monet_caption_keys=tuple(
@@ -2025,7 +2051,7 @@ def main() -> None:
             scaling_factor=args.sample_scaling_factor,
             max_length=args.text_seq_len,
             hf_token=hf_token,
-            encode_on_the_fly=args.monet_direct,
+            encode_on_the_fly=args.monet_direct or args.cache_captions_only,
             prompts_file=args.sample_prompts_file,
         ))
     # Appended AFTER ModelCheckpoint so a checkpoint written this step already exists on

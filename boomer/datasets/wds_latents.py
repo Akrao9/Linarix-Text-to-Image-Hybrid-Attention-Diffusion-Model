@@ -797,20 +797,35 @@ def sample_to_record(
     sample: dict[str, Any],
     *,
     manifest: WdsCacheManifest | None = None,
+    captions_only: bool = False,
 ) -> LatentRecord:
-    lat_fmt, latents_value = _pick_sample_field(sample, "latents")
-    text_fmt, text_value = _pick_sample_field(sample, "text")
-    mask_fmt, mask_value = _pick_sample_field(sample, "text_mask")
+    """Decode one WDS-style sample dict into a LatentRecord.
 
-    if any(fmt == "bin" for fmt in (lat_fmt, text_fmt, mask_fmt)) and manifest is None:
+    ``captions_only=True`` skips the cached text/text_mask members entirely — they may
+    be absent (parquet column pushdown) or baked with a mismatched text encoder. The
+    record then carries only the raw caption; train.py encodes it on the fly (same
+    contract as --monet-direct batches).
+    """
+    lat_fmt, latents_value = _pick_sample_field(sample, "latents")
+    fmts = [lat_fmt]
+    if not captions_only:
+        text_fmt, text_value = _pick_sample_field(sample, "text")
+        mask_fmt, mask_value = _pick_sample_field(sample, "text_mask")
+        fmts += [text_fmt, mask_fmt]
+
+    if any(fmt == "bin" for fmt in fmts) and manifest is None:
         raise ValueError(
             "Sample uses raw .bin tensors but no manifest.json was loaded. "
             "Place manifest.json next to the shards or use .npy cache files."
         )
 
     image_latent = _latents_to_tensor(latents_value, lat_fmt, manifest=manifest)
-    text_embedding = _text_to_tensor(text_value, text_fmt, manifest=manifest)
-    attention_mask = _mask_to_tensor(mask_value, mask_fmt, manifest=manifest).to(torch.int16)
+    if captions_only:
+        text_embedding = None
+        attention_mask = None
+    else:
+        text_embedding = _text_to_tensor(text_value, text_fmt, manifest=manifest)
+        attention_mask = _mask_to_tensor(mask_value, mask_fmt, manifest=manifest).to(torch.int16)
 
     dino_embedding = None
     if "dino.npy" in sample or "dino.bin" in sample:
@@ -930,6 +945,9 @@ class StreamingWdsLatentCacheDataset(IterableDataset[LatentRecord]):
     hf_token: str | bool | None = None
     shardshuffle: bool | int = False
     shuffle_buffer: int = 0
+    # Skip the cached text/text_mask members; records carry raw captions only and
+    # train.py encodes them on the fly (--cache-captions-only).
+    captions_only: bool = False
 
     def __post_init__(self) -> None:
         self.urls = resolve_wds_urls(self.paths, hf_token=self.hf_token)
@@ -949,7 +967,9 @@ class StreamingWdsLatentCacheDataset(IterableDataset[LatentRecord]):
         if self.shuffle_buffer > 0:
             dataset = dataset.shuffle(self.shuffle_buffer)
         for sample in dataset:
-            yield sample_to_record(sample, manifest=self.manifest)
+            yield sample_to_record(
+                sample, manifest=self.manifest, captions_only=self.captions_only
+            )
 
 
 @dataclass
@@ -962,6 +982,8 @@ class RollingStreamingWdsLatentCacheDataset(IterableDataset[LatentRecord]):
     hf_token: str | bool | None = None
     shuffle_buffer: int = 1000
     seed: int | None = None
+    # Skip the cached text/text_mask members (--cache-captions-only).
+    captions_only: bool = False
 
     def __post_init__(self) -> None:
         if isinstance(self.paths, str):
@@ -1010,7 +1032,9 @@ class RollingStreamingWdsLatentCacheDataset(IterableDataset[LatentRecord]):
                 dataset = dataset.shuffle(self.shuffle_buffer)
 
             for sample in dataset:
-                yield sample_to_record(sample, manifest=self.manifest)
+                yield sample_to_record(
+                    sample, manifest=self.manifest, captions_only=self.captions_only
+                )
 
             self.cache.advance_after(shard_name)
 
@@ -1052,6 +1076,8 @@ class PrefetchingWdsLatentCacheDataset(IterableDataset[LatentRecord]):
     # reconstruction overlaps the GPU step (the consumer's CUDA call releases the GIL
     # while the GPU is busy). Set <= 0 to decode inline on the consumer thread.
     decode_queue_size: int = 512
+    # Skip the cached text/text_mask members (--cache-captions-only).
+    captions_only: bool = False
 
     def __post_init__(self) -> None:
         if isinstance(self.paths, str):
@@ -1269,7 +1295,9 @@ class PrefetchingWdsLatentCacheDataset(IterableDataset[LatentRecord]):
                     for sample in dataset:
                         if stop_event.is_set():
                             return
-                        yield sample_to_record(sample, manifest=self.manifest)
+                        yield sample_to_record(
+                            sample, manifest=self.manifest, captions_only=self.captions_only
+                        )
                     try:
                         os.remove(path)
                     except FileNotFoundError:
@@ -1434,6 +1462,11 @@ class ParquetStreamingLatentCacheDataset(IterableDataset[LatentRecord]):
     # auth, truly empty shards) still raises; the counter resets after any successful row.
     stream_reconnect_max_retries: int = 20
     stream_reconnect_backoff: float = 5.0
+    # Skip the cached text/text_mask columns (--cache-captions-only): they are not even
+    # downloaded (parquet column projection), which matters — e.g. the finet2i-1024
+    # cache's 320x2048 fp8 text column is ~10x the byte size of its 1024px latents.
+    # Records carry raw captions; train.py encodes them on the fly.
+    captions_only: bool = False
 
     def __post_init__(self) -> None:
         if self.shuffle_buffer < 0:
@@ -1447,6 +1480,9 @@ class ParquetStreamingLatentCacheDataset(IterableDataset[LatentRecord]):
         # None = untested, True/False = cached result of the first fragment_scan_options
         # attempt, so an old datasets version logs the fallback once, not every rebuild.
         self._fragment_scan_supported: bool | None = None
+        # Captions-only column projection, resolved from the first shard's schema on the
+        # first _make_stream (inside its transient-retry budget) and cached per worker.
+        self._captions_only_cols: list[str] | None = None
         # This loader is deliberately an HTTP Range reader. Set the transport before
         # importing/constructing HfFileSystem below; huggingface_hub snapshots these
         # environment flags at import time.
@@ -1523,6 +1559,31 @@ class ParquetStreamingLatentCacheDataset(IterableDataset[LatentRecord]):
             self._fragment_scan_supported = False
             return None
 
+    def _captions_only_columns(self, files: list[str]) -> list[str]:
+        """Parquet projection for captions-only mode: every column of the first shard's
+        schema except the cached text/text_mask (dominant bytes, wrong encoder). Schema
+        comes from one small footer range-read; cached after the first success."""
+        if self._captions_only_cols is None:
+            import pyarrow.parquet as pq
+
+            first = files[0]
+            if first.startswith("hf://"):
+                from huggingface_hub import HfFileSystem
+
+                with HfFileSystem(token=self.hf_token).open(first, "rb") as handle:
+                    names = pq.ParquetFile(handle).schema_arrow.names
+            else:
+                names = pq.read_schema(first).names
+            cols = [c for c in names if c not in ("text", "text_mask")]
+            if "latents" not in cols or "caption" not in cols:
+                raise RuntimeError(
+                    f"[parquet-wds] captions-only needs 'latents' and 'caption' columns; "
+                    f"{first} has {names}"
+                )
+            print(f"[parquet-wds] captions-only projection: {cols}", flush=True)
+            self._captions_only_cols = cols
+        return self._captions_only_cols
+
     def _make_stream(self, epoch: int, *, shuffle_buffer: int):
         import datasets
         from datasets import load_dataset
@@ -1530,13 +1591,16 @@ class ParquetStreamingLatentCacheDataset(IterableDataset[LatentRecord]):
         # datasets' streaming read-retry knobs (the actual retry path for streaming=True).
         datasets.config.STREAMING_READ_MAX_RETRIES = self.download_max_retries
         datasets.config.STREAMING_READ_RETRY_INTERVAL = 5
+        files = self._list_files()
         kwargs: dict[str, Any] = dict(
-            data_files={"train": self._list_files()},
+            data_files={"train": files},
             split="train",
             streaming=True,
             token=self._token(),
             batch_size=max(1, int(self.read_batch_size)),
         )
+        if self.captions_only:
+            kwargs["columns"] = self._captions_only_columns(files)
         scan_options = self._fragment_scan_options()
         if scan_options is not None:
             try:
@@ -1568,15 +1632,19 @@ class ParquetStreamingLatentCacheDataset(IterableDataset[LatentRecord]):
         sample: dict[str, Any] = {
             "__url__": "",
             "latents.npy": row["latents"],
-            "text.npy": row["text"],
-            "text_mask.npy": row["text_mask"],
             "caption.txt": row.get("caption", ""),
             "meta.json": row.get("meta", "{}"),
         }
+        if not self.captions_only:
+            # captions-only projection never fetched these columns
+            sample["text.npy"] = row["text"]
+            sample["text_mask.npy"] = row["text_mask"]
         dino = row.get("dino")
         if dino is not None:
             sample["dino.npy"] = dino
-        return sample_to_record(sample, manifest=self.manifest)
+        return sample_to_record(
+            sample, manifest=self.manifest, captions_only=self.captions_only
+        )
 
     def __iter__(self):
         worker = get_worker_info()

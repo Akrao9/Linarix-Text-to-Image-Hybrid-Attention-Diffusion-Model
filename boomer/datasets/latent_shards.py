@@ -21,8 +21,10 @@ EXCLUDED_DIR_NAMES = frozenset({"checkpoints", "checkpoint"})
 @dataclass(frozen=True)
 class LatentRecord:
     image_latent: torch.Tensor
-    text_embedding: torch.Tensor
-    attention_mask: torch.Tensor
+    # None in captions-only streaming (cache text baked with a mismatched encoder):
+    # the batch then carries raw captions and train.py encodes them on the fly.
+    text_embedding: torch.Tensor | None
+    attention_mask: torch.Tensor | None
     caption: str
     metadata: dict[str, Any]
     path: str
@@ -148,10 +150,16 @@ def collate_latent_records(records: list[LatentRecord]) -> dict[str, Any]:
     dino_batch = (
         torch.stack(dinos, dim=0) if dinos and all(d is not None for d in dinos) else None
     )
+    # Captions-only streaming yields records without cached text; the None batch entry
+    # routes training_step to encode_captions (same contract as --monet-direct batches).
+    texts = [record.text_embedding for record in records]
+    masks = [record.attention_mask for record in records]
+    text_batch = torch.stack(texts, dim=0) if texts and all(t is not None for t in texts) else None
+    mask_batch = torch.stack(masks, dim=0) if masks and all(m is not None for m in masks) else None
     return {
         "image_latent": torch.stack([record.image_latent for record in records], dim=0),
-        "text_embedding": torch.stack([record.text_embedding for record in records], dim=0),
-        "attention_mask": torch.stack([record.attention_mask for record in records], dim=0),
+        "text_embedding": text_batch,
+        "attention_mask": mask_batch,
         "caption": [record.caption for record in records],
         "metadata": [record.metadata for record in records],
         "path": [record.path for record in records],
