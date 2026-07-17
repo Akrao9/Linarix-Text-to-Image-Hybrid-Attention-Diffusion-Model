@@ -718,6 +718,7 @@ class BoomerData(pl.LightningDataModule):
         edit_tasks: tuple[str, ...] | None = None,
         edit_prompt_pick: str = "random",
         edit_min_short_side: int = 0,
+        edit_max_aspect_mismatch: float = 1.05,
     ) -> None:
         super().__init__()
         self.captions_only = captions_only
@@ -728,6 +729,7 @@ class BoomerData(pl.LightningDataModule):
         self.edit_tasks = edit_tasks
         self.edit_prompt_pick = edit_prompt_pick
         self.edit_min_short_side = edit_min_short_side
+        self.edit_max_aspect_mismatch = edit_max_aspect_mismatch
         self.monet_latent_key = monet_latent_key
         self.monet_caption_keys = monet_caption_keys
         self.monet_caption_probs = monet_caption_probs
@@ -799,6 +801,7 @@ class BoomerData(pl.LightningDataModule):
                 tasks=self.edit_tasks,
                 prompt_pick=self.edit_prompt_pick,
                 min_short_side=self.edit_min_short_side,
+                max_aspect_mismatch=self.edit_max_aspect_mismatch,
                 glob_weights=self.monet_weights,
                 rank=rank,
                 world_size=world,
@@ -1225,10 +1228,13 @@ class CondSamplePreviewCallback(Callback):
         masks synthesized once (seeded) and reused all run — so previews are
         comparable across steps: watch the kept region lock in early and the
         hole sharpen over training.
-      * edit mode: the first K source images + instructions; mask is all-ones
-        and the source is DC-AE-encoded at preview time.
-    Logs [conditioning | generated] pairs under "cond_samples". Same
-    never-kill-training / EMA-swap / parked-VAE discipline as SamplePreviewCallback.
+      * edit mode: the first K (source, ground-truth target) pixel pairs +
+        instructions; mask is all-ones and the source is DC-AE-encoded at
+        preview time.
+    Logs [conditioning | generated] pairs (fill) or [source | expected target |
+    generated] triplets (edit) under "cond_samples", so edit adherence is
+    readable against the ground truth. Same never-kill-training / EMA-swap /
+    parked-VAE discipline as SamplePreviewCallback.
     """
 
     def __init__(
@@ -1282,7 +1288,8 @@ class CondSamplePreviewCallback(Callback):
         self._prompts: list[str] = []
         self._latents: torch.Tensor | None = None  # fill: RAW cache-space (K,C,H,W)
         self._masks: torch.Tensor | None = None  # fill: fixed (K,1,H,W)
-        self._pixels: torch.Tensor | None = None  # edit: uint8 (K,3,R,R)
+        self._pixels: torch.Tensor | None = None  # edit: uint8 (K,3,R,R) sources
+        self._target_pixels: torch.Tensor | None = None  # edit: uint8 ground truth
         self._text: torch.Tensor | None = None
         self._text_mask: torch.Tensor | None = None
         self._vae = None
@@ -1320,6 +1327,7 @@ class CondSamplePreviewCallback(Callback):
                 self._text_mask = batch["attention_mask"][: self.count].detach().cpu()
         else:
             self._pixels = batch["source_pixels"][: self.count].detach().cpu()
+            self._target_pixels = batch["target_pixels"][: self.count].detach().cpu()
         coverage = ""
         if self._masks is not None:
             coverage = f", mask coverage {[round(float(m.mean()), 2) for m in self._masks]}"
@@ -1403,6 +1411,7 @@ class CondSamplePreviewCallback(Callback):
 
             images = []
             for i, prompt in enumerate(self._prompts):
+                target_pil = None
                 if visual_latents is not None:
                     shown = decode_image_latent(
                         self._vae, visual_latents[i : i + 1], self._cache_config
@@ -1412,6 +1421,9 @@ class CondSamplePreviewCallback(Callback):
                     from PIL import Image as _PILImage
 
                     cond_pil = _PILImage.fromarray(self._pixels[i].permute(1, 2, 0).numpy())
+                    target_pil = _PILImage.fromarray(
+                        self._target_pixels[i].permute(1, 2, 0).numpy()
+                    )
                 with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=self.dtype != "fp32"):
                     latent = sample_latent(
                         eager,
@@ -1433,9 +1445,14 @@ class CondSamplePreviewCallback(Callback):
                 latent = denormalize_latent(latent.float(), self.latent_mean, self.latent_std)
                 decoded = decode_image_latent(self._vae, latent, self._cache_config)
                 images.append(wandb.Image(cond_pil, caption=f"[{self.mode} input] {prompt}"))
+                if target_pil is not None:
+                    # edit mode: [source | expected target | generated] — adherence
+                    # is only readable against the ground-truth edit.
+                    images.append(wandb.Image(target_pil, caption=f"[expected] {prompt}"))
                 images.append(wandb.Image(tensor_to_image(decoded), caption=prompt))
             trainer.logger.experiment.log({"cond_samples": images, "trainer/global_step": step})
-            print(f"[cond-preview] logged {len(self._prompts)} conditioned pairs at step {step}.",
+            print(f"[cond-preview] logged {len(self._prompts)} conditioned "
+                  f"{'triplets' if self.mode == 'edit' else 'pairs'} at step {step}.",
                   flush=True)
         finally:
             if backup is not None:
@@ -1962,6 +1979,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--edit-min-short-side", type=int, default=0,
                    help="drop pairs whose short side is below this many pixels (0 = keep "
                         "all; OmniEdit's minimum is 768).")
+    p.add_argument("--edit-max-aspect-mismatch", type=float, default=1.05,
+                   help="max source/target aspect-ratio disparity before a pair is dropped "
+                        "instead of registered (target center-cropped to the source aspect). "
+                        "1.05 tolerates resize jitter only; widen past ~1.1 ONLY if a probe "
+                        "shows genuinely reconcilable wider mismatches.")
     p.add_argument("--edit-encode-chunk", type=int, default=8,
                    help="images per DC-AE encode chunk in training_step (bounds encode VRAM).")
     p.add_argument("--edit-vae-id", default=DEFAULT_VAE_ID,
@@ -2520,6 +2542,7 @@ def main() -> None:
         ),
         edit_prompt_pick=args.edit_prompt_pick,
         edit_min_short_side=args.edit_min_short_side,
+        edit_max_aspect_mismatch=args.edit_max_aspect_mismatch,
     )
 
     callbacks: list[Callback] = [

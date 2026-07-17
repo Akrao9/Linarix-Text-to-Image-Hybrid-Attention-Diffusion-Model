@@ -98,41 +98,47 @@ def shared_edit_crop_box(
     return (left, top, left + side, top + side)
 
 
-# Pairs whose aspect ratios disagree by more than this are dropped: registration
-# would need a crop so aggressive that source and target likely no longer show
-# the same framing (corrupt/mispaired row).
-_MAX_ASPECT_MISMATCH = 1.5
+# Pairs whose aspect ratios disagree by more than this factor are dropped:
+# registration would crop away real content and can fabricate false editing
+# supervision (the "removed" content was just cropped). 1.05 = ~5% tolerance,
+# enough for rounding/resize jitter between the pair's render paths.
+DEFAULT_MAX_ASPECT_MISMATCH = 1.05
 
 
-def register_source_to_target(
-    source: Image.Image, target: Image.Image
+def register_target_to_source(
+    source: Image.Image,
+    target: Image.Image,
+    *,
+    max_aspect_mismatch: float = DEFAULT_MAX_ASPECT_MISMATCH,
 ) -> Image.Image | None:
-    """Bring the source onto the target's pixel grid so the pair can share a crop.
+    """Bring the TARGET onto the source's pixel grid so the pair can share a crop.
 
-    OmniEdit frequently stores the source at its ORIGINAL resolution while the
-    edited image is the generator's output size (often the same aspect, smaller).
-    Dropping those pairs would discard most of the corpus, so instead: center-crop
-    the source to the target's aspect (a no-op when aspects match), then resize to
-    the target's exact dimensions. Returns None when the aspects are irreconcilable.
+    The source is canonical: it is the ~768px canvas the editing models actually
+    consumed, while ``edited_img`` is sometimes stored at a different (often much
+    larger, original-photo) resolution. Registering source->target would upscale
+    the conditioning to e.g. 5184x3456 before cropping back down — wasted CPU/RAM
+    and lost source framing. So the target is center-cropped to the source's
+    aspect (a no-op when aspects match) and resized to the source's dimensions.
+    Returns None when the aspects are irreconcilable (> max_aspect_mismatch).
     """
-    if source.size == target.size:
-        return source
+    if target.size == source.size:
+        return target
     src_w, src_h = source.size
     tgt_w, tgt_h = target.size
     src_aspect = src_w / src_h
     tgt_aspect = tgt_w / tgt_h
     ratio = max(src_aspect / tgt_aspect, tgt_aspect / src_aspect)
-    if ratio > _MAX_ASPECT_MISMATCH:
+    if ratio > max_aspect_mismatch:
         return None
-    if src_aspect > tgt_aspect:  # source too wide: crop width
-        new_w = max(1, round(src_h * tgt_aspect))
-        left = (src_w - new_w) // 2
-        source = source.crop((left, 0, left + new_w, src_h))
-    elif src_aspect < tgt_aspect:  # source too tall: crop height
-        new_h = max(1, round(src_w / tgt_aspect))
-        top = (src_h - new_h) // 2
-        source = source.crop((0, top, src_w, top + new_h))
-    return source.resize((tgt_w, tgt_h), Image.BICUBIC)
+    if tgt_aspect > src_aspect:  # target too wide: crop width
+        new_w = max(1, round(tgt_h * src_aspect))
+        left = (tgt_w - new_w) // 2
+        target = target.crop((left, 0, left + new_w, tgt_h))
+    elif tgt_aspect < src_aspect:  # target too tall: crop height
+        new_h = max(1, round(tgt_w / src_aspect))
+        top = (tgt_h - new_h) // 2
+        target = target.crop((0, top, tgt_w, top + new_h))
+    return target.resize((src_w, src_h), Image.BICUBIC)
 
 
 def _pixels(image: Image.Image, box: tuple[int, int, int, int], resolution: int) -> torch.Tensor:
@@ -157,6 +163,7 @@ def edit_row_to_record(
     min_o_score: float | None = None,
     tasks: tuple[str, ...] | None = None,
     min_short_side: int = 0,
+    max_aspect_mismatch: float = DEFAULT_MAX_ASPECT_MISMATCH,
 ) -> EditRecord | None:
     """Decode one OmniEdit row, or None when it fails a filter / is unusable.
 
@@ -199,10 +206,12 @@ def edit_row_to_record(
     if min(source.size) < min_short_side or min(target.size) < min_short_side:
         return None
     if source.size != target.size:
-        # Common in OmniEdit (source at original res, edited at generator res):
-        # register the source onto the target grid instead of dropping the row.
-        source = register_source_to_target(source, target)
-        if source is None:
+        # Common in OmniEdit (edited image stored at original-photo resolution):
+        # register the TARGET onto the source's grid instead of dropping the row.
+        target = register_target_to_source(
+            source, target, max_aspect_mismatch=max_aspect_mismatch
+        )
+        if target is None:
             print(f"[edit-pairs] drop aspect-mismatched row {key!r}", flush=True)
             return None
 
@@ -255,6 +264,7 @@ class EditPairsStreamingDataset(MonetDirectStreamingDataset):
     min_o_score: float | None = None
     tasks: tuple[str, ...] | None = None
     min_short_side: int = 0
+    max_aspect_mismatch: float = DEFAULT_MAX_ASPECT_MISMATCH
 
     def __post_init__(self) -> None:
         if isinstance(self.tasks, str):  # tolerate a CSV string from the CLI
@@ -288,6 +298,7 @@ class EditPairsStreamingDataset(MonetDirectStreamingDataset):
             min_o_score=self.min_o_score,
             tasks=self.tasks,
             min_short_side=self.min_short_side,
+            max_aspect_mismatch=self.max_aspect_mismatch,
         )
 
 
@@ -296,6 +307,6 @@ __all__ = [
     "EditRecord",
     "collate_edit_records",
     "edit_row_to_record",
-    "register_source_to_target",
+    "register_target_to_source",
     "shared_edit_crop_box",
 ]

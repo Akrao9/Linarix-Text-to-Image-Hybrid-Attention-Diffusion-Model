@@ -21,7 +21,7 @@ from boomer.datasets.edit_pairs import (  # noqa: E402
     EditRecord,
     collate_edit_records,
     edit_row_to_record,
-    register_source_to_target,
+    register_target_to_source,
     shared_edit_crop_box,
 )
 
@@ -101,9 +101,9 @@ def test_row_filters() -> None:
     assert edit_row_to_record(row, resolution=64, tasks=("addition",)) is not None
     assert edit_row_to_record(row, resolution=64, min_short_side=128) is None
     assert edit_row_to_record(_row(src, tgt, edited_prompt_list=[]), resolution=64) is None
-    # Irreconcilable aspect ratios (>1.5x apart) are dropped.
+    # Aspect mismatch beyond the ~5% tolerance is dropped, not registered.
     assert edit_row_to_record(
-        _row(src, tgt.resize((60, 96))), resolution=64  # 2.0 vs 0.625 aspect
+        _row(src, tgt.resize((160, 96))), resolution=64  # 2.0 vs 1.67 aspect
     ) is None
     # Raw bytes (no {bytes,path} struct) are tolerated.
     raw = _row(src, tgt)
@@ -112,29 +112,35 @@ def test_row_filters() -> None:
     assert edit_row_to_record(raw, resolution=64) is not None
 
 
-def test_size_mismatched_pair_is_registered_not_dropped() -> None:
-    """OmniEdit's common case: source at original res, edited at generator res
-    (same aspect). The source is registered onto the target grid, and the
-    edit-aware crop still lands on the edited region."""
-    src, tgt = _pair()  # 192x96
-    big_src = src.resize((384, 192), Image.BICUBIC)  # 2x original-res source
-    rec = edit_row_to_record(_row(big_src, tgt), resolution=64, prompt_pick="first")
+def test_size_mismatched_pair_is_registered_onto_the_source_grid() -> None:
+    """OmniEdit's verified geometry: src_img is the ~768px generated canvas the
+    editors consumed; edited_img is sometimes stored at the ORIGINAL photo's
+    much larger resolution. The TARGET is registered onto the source grid
+    (source stays canonical — never upscaled), and the edit-aware crop still
+    lands on the edited region."""
+    src, tgt = _pair()  # 192x96 each
+    big_tgt = tgt.resize((768, 384), Image.BICUBIC)  # 4x "original photo" target
+    rec = edit_row_to_record(_row(src, big_tgt), resolution=64, prompt_pick="first")
     assert rec is not None
     diff = (rec.target_pixels.int() - rec.source_pixels.int()).abs().sum(dim=0)
     assert float(diff.sum()) > 0  # the edit is visible
     assert float((diff > 20).float().mean()) < 0.5  # aligned: no global shift
 
-    # register helper directly: same-aspect -> pure resize to target dims.
-    registered = register_source_to_target(big_src, tgt)
-    assert registered.size == tgt.size
-    # mild aspect mismatch -> center-crop + resize, still target dims.
-    slightly_wide = src.resize((240, 96), Image.BICUBIC)
-    registered = register_source_to_target(slightly_wide, tgt)
-    assert registered.size == tgt.size
-    # irreconcilable aspect -> None.
-    assert register_source_to_target(src.resize((96, 192)), tgt) is None
+    # register helper directly: same aspect -> pure resize DOWN to source dims.
+    registered = register_target_to_source(src, big_tgt)
+    assert registered.size == src.size
+    # mild aspect mismatch (within 1.05) -> center-crop + resize to source dims.
+    slightly_wide_tgt = tgt.resize((196, 96), Image.BICUBIC)  # 2.04 vs 2.0 aspect
+    registered = register_target_to_source(src, slightly_wide_tgt)
+    assert registered.size == src.size
+    # beyond the tolerance -> None (default 1.05).
+    assert register_target_to_source(src, tgt.resize((240, 96))) is None  # 2.5 vs 2.0
+    # ...unless explicitly widened.
+    assert register_target_to_source(
+        src, tgt.resize((240, 96)), max_aspect_mismatch=1.5
+    ).size == src.size
     # exact match -> returned unchanged.
-    assert register_source_to_target(src, tgt) is src
+    assert register_target_to_source(src, tgt) is tgt
 
 
 def test_collate_contract_for_training_step() -> None:
