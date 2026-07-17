@@ -1255,8 +1255,10 @@ class CondSamplePreviewCallback(Callback):
         hf_token: str | bool | None,
         fill_mask_probs: dict[str, float] | None = None,
         encode_chunk: int = 8,
+        image_cfg_scale: float = 0.0,
     ) -> None:
         self.mode = mode
+        self.image_cfg_scale = image_cfg_scale
         self.every_n_steps = every_n_steps
         self.count = max(1, count)
         self.ema_callback = ema_callback
@@ -1426,6 +1428,7 @@ class CondSamplePreviewCallback(Callback):
                         stork_substeps=self.stork_substeps,
                         cfg_interval=self.cfg_interval,
                         cond_input=cond_all[i : i + 1],
+                        image_cfg_scale=self.image_cfg_scale,
                     )
                 latent = denormalize_latent(latent.float(), self.latent_mean, self.latent_std)
                 decoded = decode_image_latent(self._vae, latent, self._cache_config)
@@ -1935,10 +1938,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="mask-type mix, e.g. 'blob=0.3,rect=0.25,outpaint=0.15,full=0.1,"
                         "tiny=0.2' (normalized; that mix is the default). 'full' = pure-t2i "
                         "retention samples under the fill interface.")
-    p.add_argument("--cond-input-dropout", type=float, default=0.0,
+    p.add_argument("--cond-input-dropout", type=float, default=0.1,
                    help="per-sample probability of zeroing the WHOLE cond_input block "
-                        "(exactly the zero-fed t2i pretrain state) -> image-side CFG at "
-                        "inference. Independent of --cond-dropout on the text.")
+                        "(exactly the zero-fed t2i pretrain state) -> retains pure t2i and "
+                        "enables image-side CFG (--sample-image-cfg / IP2P dual guidance). "
+                        "Independent of --cond-dropout on the text; only applies when a "
+                        "cond_input exists (fill/edit phases). Set 0 to disable.")
     p.add_argument("--edit-direct", action=bo, default=False,
                    help="E2: stream OmniEdit-style parquet pixel pairs directly; both sides "
                         "are DC-AE-encoded on the fly, source latent + all-ones mask become "
@@ -1968,6 +1973,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="fill/edit runs: number of FIXED conditioned previews captured from "
                         "the first training batch and logged with --sample-every-steps "
                         "(0 disables the conditioning preview).")
+    p.add_argument("--sample-image-cfg", type=float, default=0.0,
+                   help="conditioning previews: IP2P dual-guidance image scale (three-branch "
+                        "CFG: uncond / source-only / source+instruction). 0 = classic "
+                        "two-branch text CFG with the condition pinned in both branches. "
+                        "Typical: 1.2-1.8 once --cond-input-dropout trained the zero branch.")
+    p.add_argument("--expect-pristine-cond-input", action=bo, default=False,
+                   help="fail launch if the x_embedder reserved slice is NON-zero — guard "
+                        "for a fresh E1 start from a pure-t2i seed (leave off for E1 "
+                        "resumes / E2 init from an E1 checkpoint).")
 
     # On-the-fly text encoder (used with --monet-direct / --cache-captions-only / --edit-direct).
     p.add_argument("--text-encoder-id", default="Qwen/Qwen3.5-4B")
@@ -2448,6 +2462,11 @@ def main() -> None:
         )
         print(f"[cond-input] x_embedder reserved-slice abs-max={extra_absmax:.3e}: {state}",
               flush=True)
+        if args.expect_pristine_cond_input and extra_absmax != 0.0:
+            raise SystemExit(
+                "--expect-pristine-cond-input: reserved slice is non-zero — this is not a "
+                "pure-t2i seed. Drop the flag if resuming E1 / seeding E2 from an E1 checkpoint."
+            )
 
     datamodule = BoomerData(
         cache_wds=args.cache_wds,
@@ -2568,6 +2587,7 @@ def main() -> None:
             hf_token=hf_token,
             fill_mask_probs=parse_fill_mask_probs(args.fill_mask_probs),
             encode_chunk=args.edit_encode_chunk,
+            image_cfg_scale=args.sample_image_cfg,
         ))
     # Appended AFTER ModelCheckpoint so a checkpoint written this step already exists on
     # disk when this callback's hook runs and enqueues it for async upload.

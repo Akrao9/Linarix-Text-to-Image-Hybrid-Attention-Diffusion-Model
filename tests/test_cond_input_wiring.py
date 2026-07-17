@@ -65,6 +65,66 @@ def test_predict_velocity_legacy_model_without_cond_kwarg() -> None:
     assert out.shape == (1, 4, 8, 8)
 
 
+def test_predict_velocity_image_cfg_three_branches() -> None:
+    model = _SpyModel()
+    cond = torch.randn(1, 5, 8, 8)
+    predict_velocity(model, *_pv_args(), cfg_scale=4.0, cond_input=cond, image_cfg_scale=1.5)
+    tripled = model.calls[-1]
+    # IP2P dual guidance: [no-source, source, source] over one tripled batch.
+    assert tripled.shape[0] == 3
+    assert float(tripled[0].abs().max()) == 0.0
+    assert torch.equal(tripled[1], cond[0]) and torch.equal(tripled[2], cond[0])
+
+
+class _CondCountingModel(nn.Module):
+    """sample_latent-compatible stub that records cond_input on every call."""
+
+    def __init__(self, channels: int = 4, size: int = 8) -> None:
+        super().__init__()
+        from types import SimpleNamespace
+
+        self.config = SimpleNamespace(latent_channels=channels, latent_size=size)
+        self.calls: list[torch.Tensor | None] = []
+
+    def null_condition(self, batch, *, device, dtype, mask_dtype=None, token_num=None):
+        text = torch.zeros(batch, token_num or 6, 16, device=device, dtype=dtype)
+        mask = torch.zeros(batch, token_num or 6, device=device,
+                           dtype=mask_dtype or torch.float32)
+        return text, mask
+
+    def forward(self, latent, timestep, text, mask, cond_input=None):
+        self.calls.append(cond_input)
+        return torch.zeros_like(latent)
+
+
+@pytest.mark.parametrize("sampler", ["euler", "heun", "stork2"])
+def test_sample_latent_threads_cond_through_every_call(sampler) -> None:
+    # Regression: the Euler/Heun FIRST velocity call used to drop cond_input,
+    # silently unconditioning fill/edit sampling on non-STORK samplers.
+    if sampler.startswith("stork"):
+        pytest.importorskip("diffusers")  # STORKScheduler imports diffusers
+    from boomer.sampling import sample_latent
+
+    model = _CondCountingModel()
+    cond = torch.randn(1, 5, 8, 8)
+    sample_latent(
+        model,
+        torch.randn(1, 6, 16),
+        torch.ones(1, 6),
+        steps=2,
+        seed=0,
+        dtype=torch.float32,
+        device="cpu",
+        cfg_scale=2.0,
+        sampler=sampler,
+        cond_input=cond,
+    )
+    assert len(model.calls) >= 2
+    for call in model.calls:
+        assert call is not None, f"{sampler}: a velocity call dropped cond_input"
+        assert torch.equal(call[0], cond[0])
+
+
 # --------------------------------------------------------------------------- #
 # training_step conditioning
 # --------------------------------------------------------------------------- #

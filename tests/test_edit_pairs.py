@@ -21,6 +21,7 @@ from boomer.datasets.edit_pairs import (  # noqa: E402
     EditRecord,
     collate_edit_records,
     edit_row_to_record,
+    register_source_to_target,
     shared_edit_crop_box,
 )
 
@@ -100,15 +101,40 @@ def test_row_filters() -> None:
     assert edit_row_to_record(row, resolution=64, tasks=("addition",)) is not None
     assert edit_row_to_record(row, resolution=64, min_short_side=128) is None
     assert edit_row_to_record(_row(src, tgt, edited_prompt_list=[]), resolution=64) is None
-    # Size-mismatched pair cannot share a crop -> dropped.
+    # Irreconcilable aspect ratios (>1.5x apart) are dropped.
     assert edit_row_to_record(
-        _row(src, tgt.resize((100, 50))), resolution=64
+        _row(src, tgt.resize((60, 96))), resolution=64  # 2.0 vs 0.625 aspect
     ) is None
     # Raw bytes (no {bytes,path} struct) are tolerated.
     raw = _row(src, tgt)
     raw["src_img"] = _png_bytes(src)
     raw["edited_img"] = _png_bytes(tgt)
     assert edit_row_to_record(raw, resolution=64) is not None
+
+
+def test_size_mismatched_pair_is_registered_not_dropped() -> None:
+    """OmniEdit's common case: source at original res, edited at generator res
+    (same aspect). The source is registered onto the target grid, and the
+    edit-aware crop still lands on the edited region."""
+    src, tgt = _pair()  # 192x96
+    big_src = src.resize((384, 192), Image.BICUBIC)  # 2x original-res source
+    rec = edit_row_to_record(_row(big_src, tgt), resolution=64, prompt_pick="first")
+    assert rec is not None
+    diff = (rec.target_pixels.int() - rec.source_pixels.int()).abs().sum(dim=0)
+    assert float(diff.sum()) > 0  # the edit is visible
+    assert float((diff > 20).float().mean()) < 0.5  # aligned: no global shift
+
+    # register helper directly: same-aspect -> pure resize to target dims.
+    registered = register_source_to_target(big_src, tgt)
+    assert registered.size == tgt.size
+    # mild aspect mismatch -> center-crop + resize, still target dims.
+    slightly_wide = src.resize((240, 96), Image.BICUBIC)
+    registered = register_source_to_target(slightly_wide, tgt)
+    assert registered.size == tgt.size
+    # irreconcilable aspect -> None.
+    assert register_source_to_target(src.resize((96, 192)), tgt) is None
+    # exact match -> returned unchanged.
+    assert register_source_to_target(src, tgt) is src
 
 
 def test_collate_contract_for_training_step() -> None:

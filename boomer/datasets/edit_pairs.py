@@ -98,6 +98,43 @@ def shared_edit_crop_box(
     return (left, top, left + side, top + side)
 
 
+# Pairs whose aspect ratios disagree by more than this are dropped: registration
+# would need a crop so aggressive that source and target likely no longer show
+# the same framing (corrupt/mispaired row).
+_MAX_ASPECT_MISMATCH = 1.5
+
+
+def register_source_to_target(
+    source: Image.Image, target: Image.Image
+) -> Image.Image | None:
+    """Bring the source onto the target's pixel grid so the pair can share a crop.
+
+    OmniEdit frequently stores the source at its ORIGINAL resolution while the
+    edited image is the generator's output size (often the same aspect, smaller).
+    Dropping those pairs would discard most of the corpus, so instead: center-crop
+    the source to the target's aspect (a no-op when aspects match), then resize to
+    the target's exact dimensions. Returns None when the aspects are irreconcilable.
+    """
+    if source.size == target.size:
+        return source
+    src_w, src_h = source.size
+    tgt_w, tgt_h = target.size
+    src_aspect = src_w / src_h
+    tgt_aspect = tgt_w / tgt_h
+    ratio = max(src_aspect / tgt_aspect, tgt_aspect / src_aspect)
+    if ratio > _MAX_ASPECT_MISMATCH:
+        return None
+    if src_aspect > tgt_aspect:  # source too wide: crop width
+        new_w = max(1, round(src_h * tgt_aspect))
+        left = (src_w - new_w) // 2
+        source = source.crop((left, 0, left + new_w, src_h))
+    elif src_aspect < tgt_aspect:  # source too tall: crop height
+        new_h = max(1, round(src_w / tgt_aspect))
+        top = (src_h - new_h) // 2
+        source = source.crop((0, top, src_w, top + new_h))
+    return source.resize((tgt_w, tgt_h), Image.BICUBIC)
+
+
 def _pixels(image: Image.Image, box: tuple[int, int, int, int], resolution: int) -> torch.Tensor:
     cropped = image.crop(box)
     if cropped.size != (resolution, resolution):
@@ -159,13 +196,15 @@ def edit_row_to_record(
     except Exception as exc:  # noqa: BLE001 - one corrupt image must not kill the stream
         print(f"[edit-pairs] drop undecodable row {key!r}: {exc}", flush=True)
         return None
+    if min(source.size) < min_short_side or min(target.size) < min_short_side:
+        return None
     if source.size != target.size:
-        # A mismatched pair cannot share a crop window; conditioning would misalign.
-        print(f"[edit-pairs] drop size-mismatched row {key!r}: "
-              f"{source.size} vs {target.size}", flush=True)
-        return None
-    if min(source.size) < min_short_side:
-        return None
+        # Common in OmniEdit (source at original res, edited at generator res):
+        # register the source onto the target grid instead of dropping the row.
+        source = register_source_to_target(source, target)
+        if source is None:
+            print(f"[edit-pairs] drop aspect-mismatched row {key!r}", flush=True)
+            return None
 
     box = shared_edit_crop_box(source, target)
     return EditRecord(
@@ -257,5 +296,6 @@ __all__ = [
     "EditRecord",
     "collate_edit_records",
     "edit_row_to_record",
+    "register_source_to_target",
     "shared_edit_crop_box",
 ]

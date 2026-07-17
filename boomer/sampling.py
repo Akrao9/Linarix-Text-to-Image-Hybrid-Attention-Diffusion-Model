@@ -30,6 +30,7 @@ def predict_velocity(
     sigma_value: float | None = None,
     cfg_interval: tuple[float, float] = (0.0, 1.0),
     cond_input: torch.Tensor | None = None,
+    image_cfg_scale: float = 0.0,
 ) -> torch.Tensor:
     # Guidance interval (Kynkäänniemi et al. 2024, "Applying Guidance in a Limited
     # Interval"): only apply CFG while sigma is inside [low, high]. Outside it we run
@@ -40,6 +41,30 @@ def predict_velocity(
     # Only pass the kwarg when conditioning is present: legacy model classes
     # (mamba_anchor_dit) predate cond_input in their forward signature.
     extra = {} if cond_input is None else {"cond_input": cond_input}
+
+    if cond_input is not None and image_cfg_scale > 0.0 and in_interval:
+        # InstructPix2Pix dual guidance (training used INDEPENDENT text/cond
+        # dropout, so all three branches are in-distribution):
+        #   v = v_00 + s_img * (v_i0 - v_00) + s_txt * (v_it - v_i0)
+        # branch 00: no source, no text | i0: source only | it: source + text.
+        # s_img pulls toward source faithfulness, s_txt toward the instruction.
+        latent_batch = latent.repeat(3, 1, 1, 1)
+        timestep_batch = timestep.repeat(3)
+        text_batch = torch.cat(
+            [uncond_text_embedding, uncond_text_embedding, text_embedding], dim=0
+        )
+        mask_batch = torch.cat(
+            [uncond_attention_mask, uncond_attention_mask, attention_mask], dim=0
+        )
+        cond_batch = torch.cat(
+            [torch.zeros_like(cond_input), cond_input, cond_input], dim=0
+        )
+        v_00, v_i0, v_it = model(
+            latent_batch, timestep_batch, text_batch, mask_batch, cond_input=cond_batch
+        ).chunk(3)
+        guided = v_00 + image_cfg_scale * (v_i0 - v_00) + cfg_scale * (v_it - v_i0)
+        return _rescale(guided, v_it, cfg_rescale)
+
     if cfg_scale == 1.0 or not in_interval:
         return model(latent, timestep, text_embedding, attention_mask, **extra)
 
@@ -47,19 +72,23 @@ def predict_velocity(
     timestep_batch = timestep.repeat(2)
     text_batch = torch.cat([uncond_text_embedding, text_embedding], dim=0)
     mask_batch = torch.cat([uncond_attention_mask, attention_mask], dim=0)
-    # FLUX-Fill-style guidance: the image condition (masked latent + mask / source
-    # latent) rides along in BOTH branches, so CFG steers text adherence while the
-    # spatial conditioning stays pinned. (Dual image+text guidance would need a
-    # third branch; not worth 1.5x the FLOPs for previews.)
+    # FLUX-Fill-style guidance (image_cfg_scale=0): the image condition rides
+    # along in BOTH branches, so CFG steers text adherence while the spatial
+    # conditioning stays pinned.
     if cond_input is not None:
         extra = {"cond_input": cond_input.repeat(2, 1, 1, 1)}
     uncond_velocity, cond_velocity = model(
         latent_batch, timestep_batch, text_batch, mask_batch, **extra
     ).chunk(2)
     guided = uncond_velocity + cfg_scale * (cond_velocity - uncond_velocity)
+    return _rescale(guided, cond_velocity, cfg_rescale)
+
+
+def _rescale(guided: torch.Tensor, cond_velocity: torch.Tensor, cfg_rescale: float) -> torch.Tensor:
+    """CFG-rescale (Lin et al.): pull the guided velocity's per-sample std back
+    toward the conditional branch's std, blended by ``cfg_rescale``."""
     if cfg_rescale <= 0.0:
         return guided
-
     std_cond = cond_velocity.std(dim=(1, 2, 3), keepdim=True)
     std_guided = guided.std(dim=(1, 2, 3), keepdim=True)
     rescaled = guided * (std_cond / std_guided.clamp_min(1e-5))
@@ -83,6 +112,7 @@ def sample_latent(
     stork_substeps: int = 50,
     cfg_interval: tuple[float, float] = (0.0, 1.0),
     cond_input: torch.Tensor | None = None,
+    image_cfg_scale: float = 0.0,
 ) -> torch.Tensor:
     generator = torch.Generator(device=device).manual_seed(seed)
     config = model.config
@@ -132,6 +162,7 @@ def sample_latent(
                 sigma_value=float(sigma),
                 cfg_interval=cfg_interval,
                 cond_input=cond_input,
+                image_cfg_scale=image_cfg_scale,
             )
             latent = scheduler.step(velocity, sigma, latent, return_dict=True).prev_sample
         return latent
@@ -154,6 +185,8 @@ def sample_latent(
             cfg_rescale,
             sigma_value=float(sigma),
             cfg_interval=cfg_interval,
+            cond_input=cond_input,
+            image_cfg_scale=image_cfg_scale,
         )
         if sampler == "euler":
             latent = latent - velocity * dt
@@ -173,6 +206,7 @@ def sample_latent(
                 sigma_value=float(next_sigma),
                 cfg_interval=cfg_interval,
                 cond_input=cond_input,
+                image_cfg_scale=image_cfg_scale,
             )
             latent = latent - 0.5 * dt * (velocity + next_velocity)
         else:
