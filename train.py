@@ -121,14 +121,23 @@ from boomer.sana_flow import (  # noqa: E402
     noise_latent_at_sigma,
     sample_flow_sigmas,
 )
+from boomer.datasets.edit_pairs import (  # noqa: E402
+    EditPairsStreamingDataset,
+    collate_edit_records,
+)
+from boomer.fill_masks import parse_fill_mask_probs, sample_fill_masks  # noqa: E402
 from boomer.latent_norm import denormalize_latent  # noqa: E402
 from boomer.sampling import sample_latent  # noqa: E402
 from boomer.sana_latent_cache import (  # noqa: E402
+    DEFAULT_SCALING_FACTOR,
+    DEFAULT_VAE_ID,
     CacheConfig,
     decode_image_latent,
+    extract_latent,
     hf_token_value,
     load_vae,
     tensor_to_image,
+    vae_scaling_factor,
 )
 
 
@@ -186,6 +195,13 @@ class BoomerLit(pl.LightningModule):
         # clip), and out of Lightning's device management (moved lazily on first use).
         self._hf_token = hf_token
         self._text_encoder_box: list[QwenReferenceEncoder] = []
+        # Frozen on-the-fly DC-AE (--edit-direct pixel pairs). Same out-of-tree
+        # residency rules as the text encoder box above.
+        self._vae_box: list[Any] = []
+        # --fill-training: mask-type mix, parsed once (fails fast on a bad spec).
+        self._fill_mask_probs = (
+            parse_fill_mask_probs(hp.get("fill_mask_probs")) if hp.get("fill_training") else None
+        )
         if hp.get("compile"):
             self.model = torch.compile(self.model, mode=hp.get("compile_mode", "default"))
 
@@ -238,6 +254,50 @@ class BoomerLit(pl.LightningModule):
             # rather than crash on the dtype mismatch.
             hidden = hidden.to(self.model.caption_embedder.y_proj[0].weight.dtype)
         return hidden, mask
+
+    def _resident_vae(self) -> Any:
+        if not self._vae_box:
+            hp = self.hparams
+            cfg = CacheConfig(
+                vae_id=getattr(hp, "edit_vae_id", DEFAULT_VAE_ID),
+                dtype="bf16",
+                device=str(self.device),
+                scaling_factor=getattr(hp, "edit_scaling_factor", DEFAULT_SCALING_FACTOR),
+            )
+            vae = load_vae(cfg, hf_token=self._hf_token)
+            vae.requires_grad_(False)
+            vae.eval()
+            print(f"[edit-direct] DC-AE {cfg.vae_id} resident (frozen, bf16, "
+                  f"scaling={cfg.scaling_factor})", flush=True)
+            self._vae_box.append(vae)
+        vae = self._vae_box[0]
+        if next(vae.parameters()).device != self.device:
+            vae = vae.to(self.device)
+            self._vae_box[0] = vae
+        return vae
+
+    @torch.no_grad()
+    def encode_pixels(self, pixels: torch.Tensor) -> torch.Tensor:
+        """Encode uint8 (B, 3, H, W) pixels to DC-AE latents in RAW cache space.
+
+        Chunked (--edit-encode-chunk) so 2x batch images at 1024^2 never spike
+        VRAM next to the DiT. no_grad (not inference_mode) for the same reason
+        as encode_captions: the latents enter the training graph directly.
+        The scaling factor matches the cache pipeline (verified round-trip
+        corr 0.994 against boomer-finet2i-1024-parquet), so on-the-fly latents
+        live in the exact distribution the t2i phases trained on.
+        """
+        hp = self.hparams
+        vae = self._resident_vae()
+        dtype = next(vae.parameters()).dtype
+        chunk = max(1, int(getattr(hp, "edit_encode_chunk", 8)))
+        scale = vae_scaling_factor(vae, getattr(hp, "edit_scaling_factor", DEFAULT_SCALING_FACTOR))
+        parts = []
+        for part in pixels.split(chunk):
+            images = part.to(device=self.device, dtype=dtype, non_blocking=True)
+            images = images / 127.5 - 1.0
+            parts.append(extract_latent(vae.encode(images)))
+        return torch.cat(parts, dim=0) * scale
 
     def configure_model(self) -> None:
         """--fsdp2 (Lightning ModelParallelStrategy): shard every DiT block, then the
@@ -317,9 +377,17 @@ class BoomerLit(pl.LightningModule):
 
     def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         hp = self.hparams
-        x0 = batch["image_latent"]
+        x0 = batch.get("image_latent")
+        src_latent = None
+        if x0 is None:
+            # --edit-direct: the batch carries a pixel pair; encode both sides
+            # with the resident frozen DC-AE (target -> x0, source -> conditioning).
+            x0 = self.encode_pixels(batch["target_pixels"])
+            src_latent = self.encode_pixels(batch["source_pixels"])
         if hp.latent_mean != 0.0 or hp.latent_std != 1.0:
             x0 = (x0 - hp.latent_mean) / hp.latent_std
+            if src_latent is not None:
+                src_latent = (src_latent - hp.latent_mean) / hp.latent_std
 
         text = batch.get("text_embedding")
         if text is None:
@@ -355,6 +423,32 @@ class BoomerLit(pl.LightningModule):
         x_t, _ = noise_latent_at_sigma(x0, t, noise=noise)
         target = noise - x0
 
+        # Reserved-channel conditioning (extra_input_channels = latent + 1):
+        #   * --fill-training (E1): [x0 * (1 - m), m] from a synthesized mask mix —
+        #     self-supervised inpainting over the plain t2i stream.
+        #   * --edit-direct (E2): [source latent, all-ones mask] — full-frame
+        #     instruction editing under the same fill interface.
+        # Both in the NORMALIZED latent space the model sees. cond_input_dropout
+        # zeroes the whole block per-sample (exactly the zero-fed t2i pretrain
+        # state), enabling image-side CFG at inference.
+        cond_input = None
+        if self._fill_mask_probs is not None:
+            fill_mask = sample_fill_masks(
+                x0.shape[0], x0.shape[-2], x0.shape[-1],
+                probs=self._fill_mask_probs, device=x0.device, dtype=x0.dtype,
+            )
+            cond_input = torch.cat([x0 * (1.0 - fill_mask), fill_mask], dim=1)
+        elif src_latent is not None:
+            ones = src_latent.new_ones(src_latent.shape[0], 1, *src_latent.shape[-2:])
+            cond_input = torch.cat([src_latent, ones], dim=1)
+        if cond_input is not None:
+            drop_p = float(getattr(hp, "cond_input_dropout", 0.0))
+            if drop_p > 0.0:
+                drop = torch.rand(cond_input.shape[0], device=cond_input.device) < drop_p
+                cond_input = torch.where(
+                    drop.view(-1, 1, 1, 1), torch.zeros_like(cond_input), cond_input
+                )
+
         # REPA: align a pooled mid-depth feature to monet's DINOv2 CLS when enabled
         # (repa_dim > 0, repa_weight > 0, and the cache carries dino_embedding).
         repa_target = batch.get("dino_embedding")
@@ -367,6 +461,7 @@ class BoomerLit(pl.LightningModule):
         want_disp = hp.dispersive_weight > 0.0
         out = self.model(
             x_t, t, text, mask,
+            cond_input=cond_input,
             return_repa=want_repa,
             return_dispersive=want_disp,
         )
@@ -404,6 +499,11 @@ class BoomerLit(pl.LightningModule):
         self.log("train/sigma_mean", t.float().mean(), on_step=True, on_epoch=False, batch_size=bs)
         if hp.t_sampler_final:
             self.log("train/t_polish", float(polish), on_step=True, on_epoch=False, batch_size=bs)
+        if self._fill_mask_probs is not None:
+            # Mean hole fraction across the batch (post mask-mix, pre cond dropout):
+            # sanity signal that the mask distribution is what --fill-mask-probs asked for.
+            self.log("train/fill_coverage", fill_mask.float().mean(),
+                     on_step=True, on_epoch=False, batch_size=bs)
 
         if repa_feat is not None:
             cos = F.cosine_similarity(
@@ -612,10 +712,22 @@ class BoomerData(pl.LightningDataModule):
         monet_min_aesthetic: float | None = None,
         monet_max_nsfw: float | None = None,
         monet_max_watermark: float | None = None,
+        edit_direct: bool = False,
+        edit_resolution: int = 1024,
+        edit_min_o_score: float | None = None,
+        edit_tasks: tuple[str, ...] | None = None,
+        edit_prompt_pick: str = "random",
+        edit_min_short_side: int = 0,
     ) -> None:
         super().__init__()
         self.captions_only = captions_only
         self.monet_direct = monet_direct
+        self.edit_direct = edit_direct
+        self.edit_resolution = edit_resolution
+        self.edit_min_o_score = edit_min_o_score
+        self.edit_tasks = edit_tasks
+        self.edit_prompt_pick = edit_prompt_pick
+        self.edit_min_short_side = edit_min_short_side
         self.monet_latent_key = monet_latent_key
         self.monet_caption_keys = monet_caption_keys
         self.monet_caption_probs = monet_caption_probs
@@ -670,6 +782,27 @@ class BoomerData(pl.LightningDataModule):
         return None, None
 
     def _dataset(self, *, seed_salt: int = 0):
+        if self.edit_direct:
+            rank, world = self._trainer_rank_world()
+            return EditPairsStreamingDataset(
+                paths=self.cache_wds,
+                hf_token=self.hf_token,
+                shuffle_buffer=self.shuffle_buffer,
+                seed=self.seed + seed_salt,
+                download_max_retries=self.download_max_retries,
+                read_batch_size=self.parquet_read_batch_size,
+                memory_trim_every=self.parquet_memory_trim_every,
+                prefetch_ranges=self.parquet_prefetch_ranges,
+                range_size_mib=self.parquet_range_size_mib,
+                resolution=self.edit_resolution,
+                min_o_score=self.edit_min_o_score,
+                tasks=self.edit_tasks,
+                prompt_pick=self.edit_prompt_pick,
+                min_short_side=self.edit_min_short_side,
+                glob_weights=self.monet_weights,
+                rank=rank,
+                world_size=world,
+            )
         if self.monet_direct:
             rank, world = self._trainer_rank_world()
             return MonetDirectStreamingDataset(
@@ -716,7 +849,7 @@ class BoomerData(pl.LightningDataModule):
         # The rolling remote TAR cache REQUIRES num_workers=0 (single-process shard
         # download). Parquet range-streaming and local globs use multiple workers
         # (datasets shards parquet files across workers automatically).
-        parquet = self.monet_direct or is_parquet_cache(self.cache_wds)
+        parquet = self.monet_direct or self.edit_direct or is_parquet_cache(self.cache_wds)
         if parquet:
             workers = self.num_workers
         elif is_remote_cache(self.cache_wds):
@@ -769,7 +902,11 @@ class BoomerData(pl.LightningDataModule):
             self._dataset(seed_salt=seed_salt),
             batch_size=self.batch_size,
             num_workers=workers,
-            collate_fn=collate_monet_records if self.monet_direct else collate_latent_records,
+            collate_fn=(
+                collate_edit_records if self.edit_direct
+                else collate_monet_records if self.monet_direct
+                else collate_latent_records
+            ),
             pin_memory=self.pin_memory,
             drop_last=True,
             persistent_workers=persistent and workers > 0,
@@ -1072,6 +1209,247 @@ class SamplePreviewCallback(Callback):
 
     def _park_vae(self) -> None:
         # Keep the decoder on CPU between previews so it costs ~0 steady-state GPU memory.
+        if self._vae is not None:
+            self._vae = self._vae.to("cpu")
+
+
+# --------------------------------------------------------------------------- #
+# Fill/edit conditioning previews -> W&B
+# --------------------------------------------------------------------------- #
+class CondSamplePreviewCallback(Callback):
+    """Every N optimizer steps, regenerate a FIXED set of CONDITIONED samples.
+
+    Conditioning material is captured once from the FIRST training batch (zero
+    startup cost — no extra stream, no eval-set plumbing):
+      * fill mode: the first K clean latents + captions, with K deterministic
+        masks synthesized once (seeded) and reused all run — so previews are
+        comparable across steps: watch the kept region lock in early and the
+        hole sharpen over training.
+      * edit mode: the first K source images + instructions; mask is all-ones
+        and the source is DC-AE-encoded at preview time.
+    Logs [conditioning | generated] pairs under "cond_samples". Same
+    never-kill-training / EMA-swap / parked-VAE discipline as SamplePreviewCallback.
+    """
+
+    def __init__(
+        self,
+        *,
+        mode: str,  # "fill" | "edit"
+        every_n_steps: int,
+        count: int,
+        ema_callback: "EMACallback | None",
+        use_ema: bool,
+        steps: int,
+        sampler: str,
+        stork_substeps: int,
+        cfg_scale: float,
+        cfg_rescale: float,
+        cfg_interval: tuple[float, float],
+        flow_shift: float,
+        latent_mean: float,
+        latent_std: float,
+        seed: int,
+        dtype: str,
+        vae_id: str,
+        scaling_factor: float,
+        hf_token: str | bool | None,
+        fill_mask_probs: dict[str, float] | None = None,
+        encode_chunk: int = 8,
+    ) -> None:
+        self.mode = mode
+        self.every_n_steps = every_n_steps
+        self.count = max(1, count)
+        self.ema_callback = ema_callback
+        self.use_ema = use_ema
+        self.steps = steps
+        self.sampler = sampler
+        self.stork_substeps = stork_substeps
+        self.cfg_scale = cfg_scale
+        self.cfg_rescale = cfg_rescale
+        self.cfg_interval = cfg_interval
+        self.flow_shift = flow_shift
+        self.latent_mean = latent_mean
+        self.latent_std = latent_std
+        self.seed = seed
+        self.dtype = dtype
+        self.hf_token = hf_token
+        self.fill_mask_probs = fill_mask_probs
+        self.encode_chunk = max(1, encode_chunk)
+        self._enabled = False
+        self._last_preview_step = -1
+        self._prompts: list[str] = []
+        self._latents: torch.Tensor | None = None  # fill: RAW cache-space (K,C,H,W)
+        self._masks: torch.Tensor | None = None  # fill: fixed (K,1,H,W)
+        self._pixels: torch.Tensor | None = None  # edit: uint8 (K,3,R,R)
+        self._text: torch.Tensor | None = None
+        self._text_mask: torch.Tensor | None = None
+        self._vae = None
+        self._cache_config = CacheConfig(
+            vae_id=vae_id, dtype=dtype, device="cuda", scaling_factor=scaling_factor
+        )
+
+    def on_fit_start(self, trainer, pl_module) -> None:
+        if trainer.global_rank != 0:
+            return
+        if not isinstance(trainer.logger, WandbLogger):
+            print("[cond-preview] no WandbLogger; conditioning previews disabled.", flush=True)
+            return
+        self._enabled = True
+        print(f"[cond-preview] {self.mode} mode: {self.count} fixed conditions from the "
+              f"first batch, every {self.every_n_steps} steps "
+              f"({'EMA' if self.use_ema else 'live'} weights).", flush=True)
+
+    @torch.no_grad()
+    def _capture(self, batch: dict[str, Any]) -> None:
+        self._prompts = [str(c) for c in batch["caption"][: self.count]]
+        if self.mode == "fill":
+            lat = batch["image_latent"][: self.count].detach().float().cpu()
+            self._latents = lat
+            gen = torch.Generator().manual_seed(self.seed)
+            self._masks = sample_fill_masks(
+                lat.shape[0], lat.shape[-2], lat.shape[-1],
+                probs=self.fill_mask_probs, generator=gen,
+            )
+            # Cached-text runs carry usable embeddings; captions-only/monet runs
+            # leave them None and the resident encoder fills in at first preview.
+            text = batch.get("text_embedding")
+            if text is not None:
+                self._text = text[: self.count].detach().cpu()
+                self._text_mask = batch["attention_mask"][: self.count].detach().cpu()
+        else:
+            self._pixels = batch["source_pixels"][: self.count].detach().cpu()
+        coverage = ""
+        if self._masks is not None:
+            coverage = f", mask coverage {[round(float(m.mean()), 2) for m in self._masks]}"
+        print(f"[cond-preview] captured {len(self._prompts)} conditions from the first "
+              f"batch{coverage}.", flush=True)
+
+    @torch.no_grad()
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:
+        if not self._enabled:
+            return
+        if not self._prompts:
+            try:
+                self._capture(batch)
+            except Exception as exc:  # noqa: BLE001 - never kill training
+                print(f"[cond-preview] capture failed ({type(exc).__name__}: {exc}); "
+                      "conditioning previews disabled.", flush=True)
+                self._enabled = False
+                return
+        step = trainer.global_step
+        if step == 0 or step % self.every_n_steps != 0 or step == self._last_preview_step:
+            return
+        self._last_preview_step = step
+        try:
+            self._run_preview(trainer, pl_module, step)
+        except Exception as exc:  # noqa: BLE001 - a preview must never kill training
+            print(f"[cond-preview] step {step} failed ({type(exc).__name__}: {exc}); "
+                  "skipping and continuing training.", flush=True)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def _encode_source_latents(self, device: str) -> torch.Tensor:
+        """edit mode: source pixels -> RAW cache-space latents via the preview VAE."""
+        dtype = next(self._vae.parameters()).dtype
+        scale = vae_scaling_factor(self._vae, self._cache_config.scaling_factor)
+        parts = []
+        for part in self._pixels.split(self.encode_chunk):
+            images = part.to(device=device, dtype=dtype) / 127.5 - 1.0
+            parts.append(extract_latent(self._vae.encode(images)))
+        return torch.cat(parts, dim=0).float() * scale
+
+    def _run_preview(self, trainer, pl_module, step: int) -> None:
+        import wandb
+
+        if self._text is None:
+            emb, mask = pl_module.encode_captions(self._prompts)
+            self._text = emb.cpu()
+            self._text_mask = mask.cpu()
+
+        device = str(pl_module.device)
+        device_type = "cuda" if "cuda" in device else "cpu"
+        amp_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[self.dtype]
+        eager = getattr(pl_module.model, "_orig_mod", pl_module.model)
+        was_training = eager.training
+        eager.eval()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        backup = None
+        if self.use_ema and self.ema_callback is not None and self.ema_callback.ema:
+            backup = {k: v.detach().to("cpu", copy=True) for k, v in eager.state_dict().items()}
+            eager.load_state_dict(
+                SamplePreviewCallback._strip_compile_prefix(self.ema_callback.ema), strict=False
+            )
+
+        try:
+            self._ensure_vae(device)
+            # Build the conditioning batch in the NORMALIZED space the model sees,
+            # and a raw-space visual of what the model was shown.
+            if self.mode == "fill":
+                raw = self._latents.to(device)
+                masks = self._masks.to(device=device, dtype=raw.dtype)
+                norm = (raw - self.latent_mean) / self.latent_std
+                cond_all = torch.cat([norm * (1.0 - masks), masks], dim=1)
+                visual_latents = raw * (1.0 - masks)  # raw-space holes decode ~gray
+            else:
+                raw = self._encode_source_latents(device)
+                norm = (raw - self.latent_mean) / self.latent_std
+                ones = norm.new_ones(norm.shape[0], 1, *norm.shape[-2:])
+                cond_all = torch.cat([norm, ones], dim=1)
+                visual_latents = None
+
+            images = []
+            for i, prompt in enumerate(self._prompts):
+                if visual_latents is not None:
+                    shown = decode_image_latent(
+                        self._vae, visual_latents[i : i + 1], self._cache_config
+                    )
+                    cond_pil = tensor_to_image(shown)
+                else:
+                    from PIL import Image as _PILImage
+
+                    cond_pil = _PILImage.fromarray(self._pixels[i].permute(1, 2, 0).numpy())
+                with torch.autocast(device_type=device_type, dtype=amp_dtype, enabled=self.dtype != "fp32"):
+                    latent = sample_latent(
+                        eager,
+                        self._text[i : i + 1],
+                        self._text_mask[i : i + 1],
+                        steps=self.steps,
+                        seed=self.seed,
+                        dtype=torch.float32,
+                        device=device,
+                        cfg_scale=self.cfg_scale,
+                        cfg_rescale=self.cfg_rescale,
+                        sampler=self.sampler,
+                        flow_shift=self.flow_shift,
+                        stork_substeps=self.stork_substeps,
+                        cfg_interval=self.cfg_interval,
+                        cond_input=cond_all[i : i + 1],
+                    )
+                latent = denormalize_latent(latent.float(), self.latent_mean, self.latent_std)
+                decoded = decode_image_latent(self._vae, latent, self._cache_config)
+                images.append(wandb.Image(cond_pil, caption=f"[{self.mode} input] {prompt}"))
+                images.append(wandb.Image(tensor_to_image(decoded), caption=prompt))
+            trainer.logger.experiment.log({"cond_samples": images, "trainer/global_step": step})
+            print(f"[cond-preview] logged {len(self._prompts)} conditioned pairs at step {step}.",
+                  flush=True)
+        finally:
+            if backup is not None:
+                eager.load_state_dict(backup, strict=False)
+                del backup
+            if was_training:
+                eager.train()
+            self._park_vae()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def _ensure_vae(self, device: str) -> None:
+        if self._vae is None:
+            self._vae = load_vae(self._cache_config, hf_token=self.hf_token)
+        self._vae = self._vae.to(device)
+
+    def _park_vae(self) -> None:
         if self._vae is not None:
             self._vae = self._vae.to("cpu")
 
@@ -1544,7 +1922,54 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--monet-min-aesthetic", type=float, default=None)
     p.add_argument("--monet-max-nsfw", type=float, default=None)
     p.add_argument("--monet-max-watermark", type=float, default=None)
-    # On-the-fly text encoder (used with --monet-direct / --cache-captions-only).
+
+    # Editing phases: E1 self-supervised inpaint/fill over any latent cache, and
+    # E2 instruction editing over pixel-pair corpora (OmniEdit). Both condition the
+    # model's reserved input channels (--extra-input-channels = latent_channels + 1).
+    p.add_argument("--fill-training", action=bo, default=False,
+                   help="E1: synthesize inpainting masks over the latent stream and train "
+                        "with cond_input=[x0*(1-m), m] (FLUX-Fill style). Works with any "
+                        "cache/monet stream; requires --extra-input-channels = "
+                        "latent_channels + 1.")
+    p.add_argument("--fill-mask-probs", default=None,
+                   help="mask-type mix, e.g. 'blob=0.3,rect=0.25,outpaint=0.15,full=0.1,"
+                        "tiny=0.2' (normalized; that mix is the default). 'full' = pure-t2i "
+                        "retention samples under the fill interface.")
+    p.add_argument("--cond-input-dropout", type=float, default=0.0,
+                   help="per-sample probability of zeroing the WHOLE cond_input block "
+                        "(exactly the zero-fed t2i pretrain state) -> image-side CFG at "
+                        "inference. Independent of --cond-dropout on the text.")
+    p.add_argument("--edit-direct", action=bo, default=False,
+                   help="E2: stream OmniEdit-style parquet pixel pairs directly; both sides "
+                        "are DC-AE-encoded on the fly, source latent + all-ones mask become "
+                        "cond_input, the instruction is the caption (encoded by "
+                        "--text-encoder-*). No cache build.")
+    p.add_argument("--edit-resolution", type=int, default=1024,
+                   help="square training resolution for the edit pair (edit-aware shared "
+                        "crop, then resize).")
+    p.add_argument("--edit-min-o-score", type=float, default=None,
+                   help="drop rows below this o_score (OmniEdit-Filtered is already >= 9).")
+    p.add_argument("--edit-tasks", default=None,
+                   help="CSV whitelist of OmniEdit task names; unset = all tasks.")
+    p.add_argument("--edit-prompt-pick", choices=["random", "first", "last"], default="random",
+                   help="which entry of edited_prompt_list to train on; 'random' samples "
+                        "per pass (short vs detailed phrasing augmentation).")
+    p.add_argument("--edit-min-short-side", type=int, default=0,
+                   help="drop pairs whose short side is below this many pixels (0 = keep "
+                        "all; OmniEdit's minimum is 768).")
+    p.add_argument("--edit-encode-chunk", type=int, default=8,
+                   help="images per DC-AE encode chunk in training_step (bounds encode VRAM).")
+    p.add_argument("--edit-vae-id", default=DEFAULT_VAE_ID,
+                   help="DC-AE used for on-the-fly pixel encoding (must match the VAE the "
+                        "t2i latents were cached with).")
+    p.add_argument("--edit-scaling-factor", type=float, default=DEFAULT_SCALING_FACTOR,
+                   help="latent scaling factor for on-the-fly encoding (cache parity).")
+    p.add_argument("--sample-cond-count", type=int, default=4,
+                   help="fill/edit runs: number of FIXED conditioned previews captured from "
+                        "the first training batch and logged with --sample-every-steps "
+                        "(0 disables the conditioning preview).")
+
+    # On-the-fly text encoder (used with --monet-direct / --cache-captions-only / --edit-direct).
     p.add_argument("--text-encoder-id", default="Qwen/Qwen3.5-4B")
     p.add_argument("--text-encoder-layer", type=int, default=-2,
                    help="hidden_states readout layer (-2 = second-to-last, raw/un-normed; "
@@ -1802,6 +2227,36 @@ def main() -> None:
             "Use only one per-timestep loss weighting: --timestep-weight "
             "(Sana sqrt(1+sigma^2)/sigma) OR --min-snr-gamma, not both."
         )
+    # Editing-phase invariants (fail at launch, not at first step).
+    if args.fill_training and args.edit_direct:
+        raise SystemExit("--fill-training and --edit-direct are separate phases (E1/E2); "
+                         "pick one per run.")
+    if args.edit_direct and (args.monet_direct or args.cache_captions_only):
+        raise SystemExit("--edit-direct streams pixel pairs; it cannot combine with "
+                         "--monet-direct or --cache-captions-only.")
+    if args.fill_training or args.edit_direct:
+        expected_extra = args.latent_channels + 1
+        if args.extra_input_channels != expected_extra:
+            raise SystemExit(
+                f"--fill-training/--edit-direct condition on [latent ({args.latent_channels}ch) "
+                f"+ mask (1ch)]; set --extra-input-channels {expected_extra} "
+                f"(got {args.extra_input_channels}). This must also match the seeded checkpoint."
+            )
+        parse_fill_mask_probs(args.fill_mask_probs)  # fail fast on a bad spec
+    if args.edit_direct and args.latent_size * 32 != args.edit_resolution:
+        # DC-AE f32: latent grid = resolution / 32. A mismatch would build a DiT whose
+        # RoPE/token grid disagrees with what encode_pixels produces every step.
+        raise SystemExit(
+            f"--edit-resolution {args.edit_resolution} needs --latent-size "
+            f"{args.edit_resolution // 32} (DC-AE f32), got --latent-size {args.latent_size}."
+        )
+    if args.edit_direct and args.wds_shuffle_buffer > 512:
+        # A pixel-pair record is ~6 MB (2 x 3 x 1024^2 uint8) vs ~64 KB for a latent
+        # record; a latent-sized reservoir would be tens of GB of host RAM per worker
+        # group. Shard-order shuffling still decorrelates the stream.
+        print(f"[edit-direct] clamping --wds-shuffle-buffer {args.wds_shuffle_buffer} -> 512 "
+              "(pixel records are ~6 MB each)", flush=True)
+        args.wds_shuffle_buffer = 512
     # Fail CSV-alignment errors at launch, not minutes later inside a spawned
     # DataLoader worker (the dataset re-validates, but this is the friendly path).
     def _csv_len(csv: str) -> int:
@@ -1883,20 +2338,25 @@ def main() -> None:
 
     hf_token = hf_token_value(args.hf_token)
 
-    if args.monet_direct or args.cache_captions_only:
+    if args.monet_direct or args.cache_captions_only or args.edit_direct:
         # On-the-fly text: text_seq_len is the fixed encode length and text_dim comes
         # from the encoder's config.json. --monet-direct also skips the shard peek
         # entirely (monet's 512px f32c32 latents are the --latent-* defaults);
-        # --cache-captions-only keeps the peek for LATENT dims (e.g. 1024px caches).
+        # --cache-captions-only keeps the peek for LATENT dims (e.g. 1024px caches);
+        # --edit-direct has no latents to peek at all (pixels; dims from flags).
         args.text_seq_len = args.text_encoder_max_length
         args.text_dim = text_encoder_hidden_size(args.text_encoder_id, hf_token)
-        tag = "monet-direct" if args.monet_direct else "captions-only"
+        tag = (
+            "monet-direct" if args.monet_direct
+            else "edit-direct" if args.edit_direct
+            else "captions-only"
+        )
         print(
             f"[{tag}] on-the-fly text: {args.text_encoder_id} "
             f"(layer {args.text_encoder_layer}) -> text=({args.text_seq_len},{args.text_dim})",
             flush=True,
         )
-    if args.monet_direct:
+    if args.monet_direct or args.edit_direct:
         args.skip_peek = True
 
     if args.skip_peek:
@@ -1919,6 +2379,13 @@ def main() -> None:
         config,
         hf_token=hf_token,
         monet_direct=args.monet_direct,
+        fill_training=args.fill_training,
+        fill_mask_probs=args.fill_mask_probs,
+        cond_input_dropout=args.cond_input_dropout,
+        edit_direct=args.edit_direct,
+        edit_vae_id=args.edit_vae_id,
+        edit_scaling_factor=args.edit_scaling_factor,
+        edit_encode_chunk=args.edit_encode_chunk,
         fsdp2=args.fsdp2,
         text_encoder_id=args.text_encoder_id,
         text_encoder_layer=args.text_encoder_layer,
@@ -1968,6 +2435,20 @@ def main() -> None:
         print(f"resume-weights-only: loaded weights "
               f"(missing={len(missing)}, unexpected={len(unexpected)})", flush=True)
 
+    if args.fill_training or args.edit_direct:
+        # The reserved-channel embedder slice was zero-init'ed and receives zero
+        # gradient while fed zeros, so a pure-t2i seed must still be exactly 0 here
+        # (verified on the v6 512 checkpoint). Non-zero = already fill/edit-trained.
+        eager = getattr(module.model, "_orig_mod", module.model)
+        extra_absmax = float(eager.x_embedder.weight[:, config.latent_channels:].abs().max())
+        state = (
+            "pristine zero (t2i seed; conditioning pathway lights up from scratch)"
+            if extra_absmax == 0.0
+            else "non-zero (seed already fill/edit-trained)"
+        )
+        print(f"[cond-input] x_embedder reserved-slice abs-max={extra_absmax:.3e}: {state}",
+              flush=True)
+
     datamodule = BoomerData(
         cache_wds=args.cache_wds,
         local_dir=args.wds_local_dir,
@@ -2011,6 +2492,15 @@ def main() -> None:
         monet_min_aesthetic=args.monet_min_aesthetic,
         monet_max_nsfw=args.monet_max_nsfw,
         monet_max_watermark=args.monet_max_watermark,
+        edit_direct=args.edit_direct,
+        edit_resolution=args.edit_resolution,
+        edit_min_o_score=args.edit_min_o_score,
+        edit_tasks=(
+            tuple(t.strip() for t in args.edit_tasks.split(",") if t.strip())
+            if args.edit_tasks else None
+        ),
+        edit_prompt_pick=args.edit_prompt_pick,
+        edit_min_short_side=args.edit_min_short_side,
     )
 
     callbacks: list[Callback] = [
@@ -2051,8 +2541,33 @@ def main() -> None:
             scaling_factor=args.sample_scaling_factor,
             max_length=args.text_seq_len,
             hf_token=hf_token,
-            encode_on_the_fly=args.monet_direct or args.cache_captions_only,
+            encode_on_the_fly=args.monet_direct or args.cache_captions_only or args.edit_direct,
             prompts_file=args.sample_prompts_file,
+        ))
+    if (args.fill_training or args.edit_direct) and args.sample_every_steps > 0 \
+            and args.sample_cond_count > 0:
+        callbacks.append(CondSamplePreviewCallback(
+            mode="fill" if args.fill_training else "edit",
+            every_n_steps=args.sample_every_steps,
+            count=args.sample_cond_count,
+            ema_callback=ema_cb,
+            use_ema=args.sample_weights == "ema",
+            steps=args.sample_steps,
+            sampler=args.sample_sampler,
+            stork_substeps=args.sample_stork_substeps,
+            cfg_scale=args.sample_cfg_scale,
+            cfg_rescale=args.sample_cfg_rescale,
+            cfg_interval=(args.sample_cfg_interval_low, args.sample_cfg_interval_high),
+            flow_shift=args.flow_shift,
+            latent_mean=args.latent_mean,
+            latent_std=args.latent_std,
+            seed=args.sample_seed,
+            dtype=args.dtype or "bf16",
+            vae_id=args.sample_vae_id,
+            scaling_factor=args.sample_scaling_factor,
+            hf_token=hf_token,
+            fill_mask_probs=parse_fill_mask_probs(args.fill_mask_probs),
+            encode_chunk=args.edit_encode_chunk,
         ))
     # Appended AFTER ModelCheckpoint so a checkpoint written this step already exists on
     # disk when this callback's hook runs and enqueues it for async upload.

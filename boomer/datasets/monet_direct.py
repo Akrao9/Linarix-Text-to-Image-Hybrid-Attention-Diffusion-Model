@@ -368,6 +368,21 @@ class MonetDirectStreamingDataset(ParquetStreamingLatentCacheDataset):
             return pq.ParquetFile(handle), handle
         return pq.ParquetFile(path), None
 
+    def _shard_usable(self, path: str, schema: Any) -> bool:
+        """Whether one shard's schema carries usable data (subclasses override:
+        edit_pairs checks for its image-pair columns instead of a latent)."""
+        available = set(schema.names)
+        if self.latent_key not in available:
+            print(f"[monet-direct] skip {path}: no {self.latent_key} column", flush=True)
+            return False
+        latent_type = str(schema.field(self.latent_key).type)
+        if "list" not in latent_type:
+            # e.g. ~9/713 cc12m shards store the VAE latent as `string`; unusable.
+            print(f"[monet-direct] skip {path}: latent column is {latent_type}, not a list",
+                  flush=True)
+            return False
+        return True
+
     def _iter_shard(self, path: str) -> Iterator[LatentRecord | None]:
         """Yield decoded records (or None for filtered rows) from one shard. Shards
         whose latent column is missing or not a list type — the handful of monet
@@ -375,17 +390,9 @@ class MonetDirectStreamingDataset(ParquetStreamingLatentCacheDataset):
         pf, handle = self._open_parquet(path)
         try:
             schema = pf.schema_arrow
-            available = set(schema.names)
-            if self.latent_key not in available:
-                print(f"[monet-direct] skip {path}: no {self.latent_key} column", flush=True)
+            if not self._shard_usable(path, schema):
                 return
-            latent_type = str(schema.field(self.latent_key).type)
-            if "list" not in latent_type:
-                # e.g. ~9/713 cc12m shards store the VAE latent as `string`; unusable.
-                print(f"[monet-direct] skip {path}: latent column is {latent_type}, not a list",
-                      flush=True)
-                return
-            want = self._wanted_columns(available)
+            want = self._wanted_columns(set(schema.names))
             for batch in pf.iter_batches(columns=want, batch_size=max(1, int(self.read_batch_size))):
                 cols = {}
                 for c in batch.schema.names:

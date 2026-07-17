@@ -29,6 +29,7 @@ def predict_velocity(
     *,
     sigma_value: float | None = None,
     cfg_interval: tuple[float, float] = (0.0, 1.0),
+    cond_input: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # Guidance interval (Kynkäänniemi et al. 2024, "Applying Guidance in a Limited
     # Interval"): only apply CFG while sigma is inside [low, high]. Outside it we run
@@ -36,14 +37,25 @@ def predict_velocity(
     # over-saturation/detail loss CFG causes at very low noise, plus the wasted
     # contrast at very high noise where cond/uncond barely differ.
     in_interval = sigma_value is None or cfg_interval[0] <= float(sigma_value) <= cfg_interval[1]
+    # Only pass the kwarg when conditioning is present: legacy model classes
+    # (mamba_anchor_dit) predate cond_input in their forward signature.
+    extra = {} if cond_input is None else {"cond_input": cond_input}
     if cfg_scale == 1.0 or not in_interval:
-        return model(latent, timestep, text_embedding, attention_mask)
+        return model(latent, timestep, text_embedding, attention_mask, **extra)
 
     latent_batch = latent.repeat(2, 1, 1, 1)
     timestep_batch = timestep.repeat(2)
     text_batch = torch.cat([uncond_text_embedding, text_embedding], dim=0)
     mask_batch = torch.cat([uncond_attention_mask, attention_mask], dim=0)
-    uncond_velocity, cond_velocity = model(latent_batch, timestep_batch, text_batch, mask_batch).chunk(2)
+    # FLUX-Fill-style guidance: the image condition (masked latent + mask / source
+    # latent) rides along in BOTH branches, so CFG steers text adherence while the
+    # spatial conditioning stays pinned. (Dual image+text guidance would need a
+    # third branch; not worth 1.5x the FLOPs for previews.)
+    if cond_input is not None:
+        extra = {"cond_input": cond_input.repeat(2, 1, 1, 1)}
+    uncond_velocity, cond_velocity = model(
+        latent_batch, timestep_batch, text_batch, mask_batch, **extra
+    ).chunk(2)
     guided = uncond_velocity + cfg_scale * (cond_velocity - uncond_velocity)
     if cfg_rescale <= 0.0:
         return guided
@@ -70,6 +82,7 @@ def sample_latent(
     stork_derivative_order: int = 2,
     stork_substeps: int = 50,
     cfg_interval: tuple[float, float] = (0.0, 1.0),
+    cond_input: torch.Tensor | None = None,
 ) -> torch.Tensor:
     generator = torch.Generator(device=device).manual_seed(seed)
     config = model.config
@@ -84,6 +97,8 @@ def sample_latent(
     )
     text_embedding = text_embedding.to(device=device, dtype=dtype)
     attention_mask = attention_mask.to(device=device)
+    if cond_input is not None:
+        cond_input = cond_input.to(device=device, dtype=dtype)
     uncond_text_embedding, uncond_attention_mask = model.null_condition(
         1,
         device=device,
@@ -116,6 +131,7 @@ def sample_latent(
                 cfg_rescale,
                 sigma_value=float(sigma),
                 cfg_interval=cfg_interval,
+                cond_input=cond_input,
             )
             latent = scheduler.step(velocity, sigma, latent, return_dict=True).prev_sample
         return latent
@@ -156,6 +172,7 @@ def sample_latent(
                 cfg_rescale,
                 sigma_value=float(next_sigma),
                 cfg_interval=cfg_interval,
+                cond_input=cond_input,
             )
             latent = latent - 0.5 * dt * (velocity + next_velocity)
         else:
