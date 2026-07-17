@@ -1615,7 +1615,7 @@ class CheckpointUploadCallback(Callback):
             try:
                 # copyfile, not copy2: FUSE-backed mounts (hf-mount buckets, some
                 # Drive mounts) often reject the chmod/utime metadata step.
-                shutil.copyfile(str(local), str(tmp))  # copy to tmp...
+                self._copy_and_fsync(local, tmp)       # copy to tmp + force durable...
                 os.replace(str(tmp), str(dest))        # ...then atomic swap into place
             except OSError as exc:
                 # Mounts without rename support: copy straight to the final name. This
@@ -1626,11 +1626,43 @@ class CheckpointUploadCallback(Callback):
                       f"copying {local.name} directly", flush=True)
                 tmp.unlink(missing_ok=True)
                 try:
-                    shutil.copyfile(str(local), str(dest))
+                    self._copy_and_fsync(local, dest)
                 except BaseException:
                     Path(dest).unlink(missing_ok=True)
                     raise
+            self._fsync_dir(Path(self.remote))         # persist the rename itself
         print(f"[ckpt-upload] uploaded {local.name}", flush=True)
+
+    @staticmethod
+    def _copy_and_fsync(src: Path, dst: Path) -> None:
+        """Copy then fsync the destination. On a Drive/drivefs FUSE mount a plain
+        copy only fills the client's local cache — the background upload to Google
+        can still be in flight when the runtime is torn down, so the last
+        checkpoint of a run silently never lands (the copy call returns success
+        regardless). fsync forces drivefs to commit the bytes upstream before we
+        move on, which is the subprocess-callable equivalent of Colab's
+        drive.flush_and_unmount() (that API needs the notebook kernel and can't be
+        called from this spawned process). No-op cost on real local disks."""
+        with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+            shutil.copyfileobj(fsrc, fdst)
+            fdst.flush()
+            try:
+                os.fsync(fdst.fileno())
+            except OSError:
+                pass  # some mounts don't support fsync on files; best effort
+
+    @staticmethod
+    def _fsync_dir(path: Path) -> None:
+        # fsync the directory so the rename/new entry is durable too (drivefs and
+        # POSIX both need this for the metadata, not just the file contents).
+        try:
+            fd = os.open(str(path), os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass  # directory fsync unsupported on this mount; best effort
 
     # ---- pruning ---------------------------------------------------------- #
     @staticmethod
@@ -1752,6 +1784,17 @@ class CheckpointUploadCallback(Callback):
                     self._uploaded.add(ckpt.name)
             except Exception as exc:  # noqa: BLE001 - a flush failure must not abort exit
                 print(f"[ckpt-upload] final flush FAILED {ckpt.name}: {exc}", flush=True)
+        # Directory/mount remotes: a final global sync forces any drivefs upload
+        # queue to drain before the process (and often the whole runtime) exits.
+        # _upload_one already fsync'd each file; this is the belt-and-suspenders
+        # push for anything the mount buffered lazily. hf/rclone remotes upload
+        # synchronously via their CLI, so they need nothing here.
+        if not self.use_hf and not self.use_rclone:
+            try:
+                os.sync()
+                print("[ckpt-upload] os.sync() flushed mount buffers", flush=True)
+            except OSError:
+                pass
 
 
 # --------------------------------------------------------------------------- #
