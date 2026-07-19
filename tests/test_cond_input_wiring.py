@@ -247,6 +247,28 @@ def test_training_step_cond_input_dropout_zeroes_everything() -> None:
     assert float(seen["cond_input"].abs().max()) == 0.0
 
 
+def test_training_step_t2i_direct_encodes_single_image_no_cond() -> None:
+    module, seen = _spyed_module(_tiny_config(), **_hp(latent_mean=0.5, latent_std=2.0))
+    x0_raw = torch.randn(2, 32, 16, 16)
+    calls = []
+
+    def fake_encode(pixels):
+        calls.append(pixels.shape)
+        return x0_raw
+
+    module.encode_pixels = fake_encode
+    batch = {
+        "pixels": torch.zeros(2, 3, 512, 512, dtype=torch.uint8),
+        "caption": ["a", "b"],
+        "text_embedding": torch.randn(2, 12, 64),
+        "attention_mask": torch.ones(2, 12),
+    }
+    loss = module.training_step(batch, 0)
+    assert torch.isfinite(loss)
+    assert calls == [(2, 3, 512, 512)]  # single image encoded once (no pair)
+    assert seen["cond_input"] is None   # plain t2i: no reserved-channel conditioning
+
+
 def test_training_step_edit_uses_source_latent_and_ones_mask() -> None:
     module, seen = _spyed_module(_tiny_config(), **_hp(latent_mean=0.5, latent_std=2.0))
     src_raw = torch.randn(2, 32, 16, 16)
@@ -309,3 +331,18 @@ def test_main_rejects_edit_resolution_latent_size_mismatch() -> None:
         _run_main(["--cache-wds", "x.parquet", "--edit-direct",
                    "--extra-input-channels", "33", "--latent-size", "16",
                    "--edit-resolution", "1024"])
+
+
+def test_main_rejects_t2i_plus_edit() -> None:
+    with pytest.raises(SystemExit, match="cannot combine"):
+        _run_main(["--t2i-direct", "--edit-direct", "--extra-input-channels", "33"])
+
+
+def test_main_rejects_t2i_resolution_latent_size_mismatch() -> None:
+    with pytest.raises(SystemExit, match="--latent-size 32"):
+        _run_main(["--t2i-direct", "--latent-size", "16", "--t2i-resolution", "1024"])
+
+
+def test_main_requires_cache_wds_without_t2i_direct() -> None:
+    with pytest.raises(SystemExit, match="--cache-wds is required"):
+        _run_main(["--monet-direct"])

@@ -125,6 +125,11 @@ from boomer.datasets.edit_pairs import (  # noqa: E402
     EditPairsStreamingDataset,
     collate_edit_records,
 )
+from boomer.datasets.fine_t2i import (  # noqa: E402
+    DEFAULT_T2I_REPO,
+    FineT2IStreamingDataset,
+    collate_t2i_records,
+)
 from boomer.fill_masks import parse_fill_mask_probs, sample_fill_masks  # noqa: E402
 from boomer.latent_norm import denormalize_latent  # noqa: E402
 from boomer.sampling import sample_latent  # noqa: E402
@@ -380,10 +385,16 @@ class BoomerLit(pl.LightningModule):
         x0 = batch.get("image_latent")
         src_latent = None
         if x0 is None:
-            # --edit-direct: the batch carries a pixel pair; encode both sides
-            # with the resident frozen DC-AE (target -> x0, source -> conditioning).
-            x0 = self.encode_pixels(batch["target_pixels"])
-            src_latent = self.encode_pixels(batch["source_pixels"])
+            pixels = batch.get("pixels")
+            if pixels is not None:
+                # --t2i-direct: the batch carries a single image; encode it to x0
+                # with the resident frozen DC-AE (plain t2i, no cond_input).
+                x0 = self.encode_pixels(pixels)
+            else:
+                # --edit-direct: the batch carries a pixel pair; encode both sides
+                # with the resident frozen DC-AE (target -> x0, source -> conditioning).
+                x0 = self.encode_pixels(batch["target_pixels"])
+                src_latent = self.encode_pixels(batch["source_pixels"])
         if hp.latent_mean != 0.0 or hp.latent_std != 1.0:
             x0 = (x0 - hp.latent_mean) / hp.latent_std
             if src_latent is not None:
@@ -719,6 +730,16 @@ class BoomerData(pl.LightningDataModule):
         edit_prompt_pick: str = "random",
         edit_min_short_side: int = 0,
         edit_max_aspect_mismatch: float = 1.05,
+        t2i_direct: bool = False,
+        t2i_repo: str = DEFAULT_T2I_REPO,
+        t2i_config: str | None = None,
+        t2i_data_dir: str | None = None,
+        t2i_split: str = "train",
+        t2i_resolution: int = 1024,
+        t2i_caption_mode: str = "sample",
+        t2i_short_prob: float = 0.5,
+        t2i_min_short_side: int = 0,
+        t2i_min_aesthetic: float | None = None,
     ) -> None:
         super().__init__()
         self.captions_only = captions_only
@@ -730,6 +751,16 @@ class BoomerData(pl.LightningDataModule):
         self.edit_prompt_pick = edit_prompt_pick
         self.edit_min_short_side = edit_min_short_side
         self.edit_max_aspect_mismatch = edit_max_aspect_mismatch
+        self.t2i_direct = t2i_direct
+        self.t2i_repo = t2i_repo
+        self.t2i_config = t2i_config
+        self.t2i_data_dir = t2i_data_dir
+        self.t2i_split = t2i_split
+        self.t2i_resolution = t2i_resolution
+        self.t2i_caption_mode = t2i_caption_mode
+        self.t2i_short_prob = t2i_short_prob
+        self.t2i_min_short_side = t2i_min_short_side
+        self.t2i_min_aesthetic = t2i_min_aesthetic
         self.monet_latent_key = monet_latent_key
         self.monet_caption_keys = monet_caption_keys
         self.monet_caption_probs = monet_caption_probs
@@ -784,6 +815,24 @@ class BoomerData(pl.LightningDataModule):
         return None, None
 
     def _dataset(self, *, seed_salt: int = 0):
+        if self.t2i_direct:
+            rank, world = self._trainer_rank_world()
+            return FineT2IStreamingDataset(
+                repo_id=self.t2i_repo,
+                config_name=self.t2i_config,
+                data_dir=self.t2i_data_dir,
+                split=self.t2i_split,
+                hf_token=self.hf_token,
+                resolution=self.t2i_resolution,
+                shuffle_buffer=self.shuffle_buffer,
+                seed=self.seed + seed_salt,
+                caption_mode=self.t2i_caption_mode,
+                short_prob=self.t2i_short_prob,
+                min_short_side=self.t2i_min_short_side,
+                min_aesthetic=self.t2i_min_aesthetic,
+                rank=rank,
+                world_size=world,
+            )
         if self.edit_direct:
             rank, world = self._trainer_rank_world()
             return EditPairsStreamingDataset(
@@ -852,7 +901,10 @@ class BoomerData(pl.LightningDataModule):
         # The rolling remote TAR cache REQUIRES num_workers=0 (single-process shard
         # download). Parquet range-streaming and local globs use multiple workers
         # (datasets shards parquet files across workers automatically).
-        parquet = self.monet_direct or self.edit_direct or is_parquet_cache(self.cache_wds)
+        parquet = (
+            self.monet_direct or self.edit_direct or self.t2i_direct
+            or is_parquet_cache(self.cache_wds)
+        )
         if parquet:
             workers = self.num_workers
         elif is_remote_cache(self.cache_wds):
@@ -906,7 +958,8 @@ class BoomerData(pl.LightningDataModule):
             batch_size=self.batch_size,
             num_workers=workers,
             collate_fn=(
-                collate_edit_records if self.edit_direct
+                collate_t2i_records if self.t2i_direct
+                else collate_edit_records if self.edit_direct
                 else collate_monet_records if self.monet_direct
                 else collate_latent_records
             ),
@@ -1903,7 +1956,9 @@ def build_parser() -> argparse.ArgumentParser:
     bo = argparse.BooleanOptionalAction
 
     # data
-    p.add_argument("--cache-wds", required=True, help="WDS glob, e.g. hf://datasets/<repo>/chunk_*/*.tar")
+    p.add_argument("--cache-wds", default=None,
+                   help="WDS glob, e.g. hf://datasets/<repo>/chunk_*/*.tar. Required unless "
+                        "--t2i-direct (which streams from --t2i-repo instead).")
     p.add_argument("--wds-local-dir", default="/content/_wds_cache")
     p.add_argument("--wds-prefetch-shards", type=int, default=8,
                    help="hf:// caches: tars to download in parallel ahead of the GPU "
@@ -2033,7 +2088,35 @@ def build_parser() -> argparse.ArgumentParser:
                    help="DC-AE used for on-the-fly pixel encoding (must match the VAE the "
                         "t2i latents were cached with).")
     p.add_argument("--edit-scaling-factor", type=float, default=DEFAULT_SCALING_FACTOR,
-                   help="latent scaling factor for on-the-fly encoding (cache parity).")
+                   help="latent scaling factor for on-the-fly encoding (cache parity). Also "
+                        "applies to --t2i-direct pixel encoding.")
+    p.add_argument("--t2i-direct", action=bo, default=False,
+                   help="Plain t2i on the fly: stream a single-image WebDataset (default "
+                        "ma-xu/fine-t2i), DC-AE-encode each image on-GPU, caption encoded by "
+                        "--text-encoder-*. No cache build, no cond_input. Uses "
+                        "--edit-vae-id/--edit-scaling-factor/--edit-encode-chunk for the encode.")
+    p.add_argument("--t2i-repo", default=DEFAULT_T2I_REPO,
+                   help="HF dataset repo id to stream for --t2i-direct (WebDataset format).")
+    p.add_argument("--t2i-config", default=None,
+                   help="dataset config name (unset = default config).")
+    p.add_argument("--t2i-data-dir", default=None,
+                   help="restrict streaming to one subfolder of shards, e.g. "
+                        "synthetic_enhanced_prompt_square_resolution (square 1024 canvases "
+                        "with enhanced prompts — no crop loss).")
+    p.add_argument("--t2i-split", default="train", help="dataset split to stream.")
+    p.add_argument("--t2i-resolution", type=int, default=1024,
+                   help="square training resolution (short side resized, center-cropped).")
+    p.add_argument("--t2i-caption-mode", choices=["sample", "short", "enhanced"], default="sample",
+                   help="'sample' picks per-row between the short (json.prompt/txt) and enhanced "
+                        "(json.enhanced_prompt) caption; 'short'/'enhanced' pin one field.")
+    p.add_argument("--t2i-short-prob", type=float, default=0.5,
+                   help="P(short caption) when --t2i-caption-mode sample.")
+    p.add_argument("--t2i-min-short-side", type=int, default=0,
+                   help="drop images whose short side is below this many pixels before "
+                        "resize (0 = keep all; guards against upscaling tiny images to 1024).")
+    p.add_argument("--t2i-min-aesthetic", type=float, default=None,
+                   help="drop rows below this json.aesthetic_predictor_v_2_5_score "
+                        "(unset = no aesthetic filter).")
     p.add_argument("--sample-cond-count", type=int, default=4,
                    help="fill/edit runs: number of FIXED conditioned previews captured from "
                         "the first training batch and logged with --sample-every-steps "
@@ -2306,6 +2389,41 @@ def main() -> None:
             "Use only one per-timestep loss weighting: --timestep-weight "
             "(Sana sqrt(1+sigma^2)/sigma) OR --min-snr-gamma, not both."
         )
+    # --t2i-direct: plain single-image on-the-fly t2i. Cannot combine with the
+    # latent-cache / captions-only / conditioning phases (it streams raw pixels
+    # and builds no cond_input). Checked first so a conflicting combo errors on
+    # the conflict, not on a downstream resolution detail.
+    if args.t2i_direct:
+        conflicts = [
+            name for name, on in (
+                ("--monet-direct", args.monet_direct),
+                ("--edit-direct", args.edit_direct),
+                ("--fill-training", args.fill_training),
+                ("--cache-captions-only", args.cache_captions_only),
+            ) if on
+        ]
+        if conflicts:
+            raise SystemExit(
+                "--t2i-direct streams plain single images on the fly; it cannot combine "
+                f"with {', '.join(conflicts)}."
+            )
+        if args.latent_size * 32 != args.t2i_resolution:
+            # DC-AE f32: latent grid = resolution / 32. A mismatch would build a DiT
+            # whose RoPE/token grid disagrees with what encode_pixels produces.
+            raise SystemExit(
+                f"--t2i-resolution {args.t2i_resolution} needs --latent-size "
+                f"{args.t2i_resolution // 32} (DC-AE f32), got --latent-size {args.latent_size}."
+            )
+        if args.wds_shuffle_buffer > 512:
+            # A single-image record is ~3 MB (3 x 1024^2 uint8) vs ~64 KB for a latent;
+            # a latent-sized reservoir would be tens of GB per worker. Shard-order
+            # shuffling (datasets .shuffle buffer) still decorrelates the stream.
+            print(f"[t2i-direct] clamping --wds-shuffle-buffer {args.wds_shuffle_buffer} -> 512 "
+                  "(pixel records are ~3 MB each)", flush=True)
+            args.wds_shuffle_buffer = 512
+    elif not args.cache_wds:
+        raise SystemExit("--cache-wds is required unless --t2i-direct (which streams "
+                         "from --t2i-repo).")
     # Editing-phase invariants (fail at launch, not at first step).
     if args.fill_training and args.edit_direct:
         raise SystemExit("--fill-training and --edit-direct are separate phases (E1/E2); "
@@ -2417,17 +2535,18 @@ def main() -> None:
 
     hf_token = hf_token_value(args.hf_token)
 
-    if args.monet_direct or args.cache_captions_only or args.edit_direct:
+    if args.monet_direct or args.cache_captions_only or args.edit_direct or args.t2i_direct:
         # On-the-fly text: text_seq_len is the fixed encode length and text_dim comes
         # from the encoder's config.json. --monet-direct also skips the shard peek
         # entirely (monet's 512px f32c32 latents are the --latent-* defaults);
         # --cache-captions-only keeps the peek for LATENT dims (e.g. 1024px caches);
-        # --edit-direct has no latents to peek at all (pixels; dims from flags).
+        # --edit-direct / --t2i-direct have no latents to peek (pixels; dims from flags).
         args.text_seq_len = args.text_encoder_max_length
         args.text_dim = text_encoder_hidden_size(args.text_encoder_id, hf_token)
         tag = (
             "monet-direct" if args.monet_direct
             else "edit-direct" if args.edit_direct
+            else "t2i-direct" if args.t2i_direct
             else "captions-only"
         )
         print(
@@ -2435,7 +2554,7 @@ def main() -> None:
             f"(layer {args.text_encoder_layer}) -> text=({args.text_seq_len},{args.text_dim})",
             flush=True,
         )
-    if args.monet_direct or args.edit_direct:
+    if args.monet_direct or args.edit_direct or args.t2i_direct:
         args.skip_peek = True
 
     if args.skip_peek:
@@ -2586,6 +2705,16 @@ def main() -> None:
         edit_prompt_pick=args.edit_prompt_pick,
         edit_min_short_side=args.edit_min_short_side,
         edit_max_aspect_mismatch=args.edit_max_aspect_mismatch,
+        t2i_direct=args.t2i_direct,
+        t2i_repo=args.t2i_repo,
+        t2i_config=args.t2i_config,
+        t2i_data_dir=args.t2i_data_dir,
+        t2i_split=args.t2i_split,
+        t2i_resolution=args.t2i_resolution,
+        t2i_caption_mode=args.t2i_caption_mode,
+        t2i_short_prob=args.t2i_short_prob,
+        t2i_min_short_side=args.t2i_min_short_side,
+        t2i_min_aesthetic=args.t2i_min_aesthetic,
     )
 
     callbacks: list[Callback] = [
@@ -2626,7 +2755,10 @@ def main() -> None:
             scaling_factor=args.sample_scaling_factor,
             max_length=args.text_seq_len,
             hf_token=hf_token,
-            encode_on_the_fly=args.monet_direct or args.cache_captions_only or args.edit_direct,
+            encode_on_the_fly=(
+                args.monet_direct or args.cache_captions_only or args.edit_direct
+                or args.t2i_direct
+            ),
             prompts_file=args.sample_prompts_file,
         ))
     if (args.fill_training or args.edit_direct) and args.sample_every_steps > 0 \
