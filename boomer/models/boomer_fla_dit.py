@@ -98,6 +98,13 @@ class BoomerFLADiTConfig:
     # exact shape (hidden 1152 / depth 28) used 22en6de. 0 = off (v6 layout, identical
     # parameters and state-dict keys).
     ddt_decoder_depth: int = 0
+    # Decoder pre-norm implementation. "native" = nn.RMSNorm then modulate (fused by
+    # torch.compile). "liger" = LigerModulatedRMSNorm, one Triton kernel for
+    # (1+scale)*rmsnorm(x)+shift — opt-in AFTER profiling shows the norm+modulate sites
+    # matter; a custom autograd Function inside a compiled region can graph-break, so
+    # benchmark under --compile before adopting. Both are non-affine (adaLN supplies the
+    # affine transform), so checkpoints are key-for-key interchangeable between impls.
+    ddt_norm_impl: str = "native"
     use_abs_pos_embed: bool = True
     patch_size: int = 1
     gradient_checkpointing: bool = False
@@ -1535,7 +1542,28 @@ class BoomerFLADDTDecoderBlock(nn.Module):
         super().__init__()
         del layer_idx  # uniform blocks; kept for signature parity with make_block
         hidden_dim = config.hidden_dim
-        self.norm1 = nn.RMSNorm(hidden_dim, eps=1e-6, elementwise_affine=False)
+        if config.ddt_norm_impl not in {"native", "liger"}:
+            raise ValueError(f"ddt_norm_impl must be 'native' or 'liger', got {config.ddt_norm_impl!r}")
+        self.norm_impl = config.ddt_norm_impl
+        if self.norm_impl == "liger":
+            try:
+                from liger_kernel.transformers.modulated_rms_norm import LigerModulatedRMSNorm
+            except ImportError as exc:
+                raise ImportError(
+                    "ddt_norm_impl='liger' requires the liger-kernel package (Triton/CUDA). "
+                    "pip install liger-kernel, or use the default 'native' impl."
+                ) from exc
+
+            def make_norm() -> nn.Module:
+                # Same math as native: fp32 rsqrt (llama casting), non-affine, then the
+                # (1+scale)*x+shift modulation fused into the same kernel.
+                return LigerModulatedRMSNorm(hidden_dim, eps=1e-6, elementwise_affine=False)
+        else:
+
+            def make_norm() -> nn.Module:
+                return nn.RMSNorm(hidden_dim, eps=1e-6, elementwise_affine=False)
+
+        self.norm1 = make_norm()
         self.attn = FullImageSelfAttention(
             hidden_dim,
             config.num_heads,
@@ -1545,7 +1573,7 @@ class BoomerFLADDTDecoderBlock(nn.Module):
             rope=config.image_attention_rope,
             rope_ntk_factor=config.rope_ntk_factor,
         )
-        self.norm2 = nn.RMSNorm(hidden_dim, eps=1e-6, elementwise_affine=False)
+        self.norm2 = make_norm()
         self.mlp = GLUMBConv(hidden_dim, config.mlp_ratio)
         # Plain Linear: s is already silu-activated. Zero-init in initialize_weights
         # (adaLN-Zero); the per-block scale_shift_table carries layer variation.
@@ -1553,6 +1581,20 @@ class BoomerFLADDTDecoderBlock(nn.Module):
         self.scale_shift_table = nn.Parameter(torch.zeros(6, hidden_dim))
         self.sandwich_attn = make_sandwich_norm(config)
         self.sandwich_mlp = make_sandwich_norm(config)
+
+    def _norm_mod(
+        self,
+        norm: nn.Module,
+        x: torch.Tensor,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """modulate(norm(x), shift, scale) — one fused Triton kernel on the liger impl."""
+        if self.norm_impl == "liger":
+            # unbind(dim=2) hands out non-contiguous views; the liger op .view()s the
+            # modulation tensors, which requires contiguity.
+            return norm(x, scale.contiguous(), shift.contiguous())
+        return modulate(norm(x), shift, scale)
 
     def forward(
         self,
@@ -1571,10 +1613,10 @@ class BoomerFLADDTDecoderBlock(nn.Module):
             self.scale_shift_table[None, None] + mod
         ).unbind(dim=2)
         y = y + gate_attn * self.sandwich_attn(
-            self.attn(modulate(self.norm1(y), shift_attn, scale_attn))
+            self.attn(self._norm_mod(self.norm1, y, shift_attn, scale_attn))
         )
         y = y + gate_mlp * self.sandwich_mlp(
-            self.mlp(modulate(self.norm2(y), shift_mlp, scale_mlp), height=height, width=width)
+            self.mlp(self._norm_mod(self.norm2, y, shift_mlp, scale_mlp), height=height, width=width)
         )
         return y
 

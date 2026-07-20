@@ -170,6 +170,54 @@ def test_decoder_norms_are_nonaffine_rmsnorm() -> None:
     assert isinstance(block.cond_mod, torch.nn.Linear)  # s is pre-activated; no SiLU here
 
 
+def _liger_available() -> bool:
+    try:
+        import liger_kernel.transformers.modulated_rms_norm  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def test_norm_impl_validation_and_missing_liger() -> None:
+    with pytest.raises(ValueError, match="ddt_norm_impl"):
+        BoomerFLADiT(_config(ddt_norm_impl="triton"))
+    if _liger_available():
+        pytest.skip("liger-kernel installed; the import-error path is not reachable")
+    with pytest.raises(ImportError, match="liger-kernel"):
+        BoomerFLADiT(_config(ddt_norm_impl="liger"))
+
+
+@pytest.mark.skipif(not _liger_available(), reason="liger-kernel not installed")
+def test_liger_norm_matches_native() -> None:
+    """Same config, same weights: the fused kernel must reproduce the native path."""
+    torch.manual_seed(0)
+    native = BoomerFLADiT(_config(ddt_norm_impl="native")).eval()
+    torch.manual_seed(0)
+    liger = BoomerFLADiT(_config(ddt_norm_impl="liger")).eval()
+    liger.load_state_dict(native.state_dict())  # interchangeable: no norm keys
+    config = _config()
+    latent, t, text, mask = _inputs(config)
+    torch.nn.init.normal_(native.out_proj.weight, std=0.02)
+    liger.out_proj.weight.data.copy_(native.out_proj.weight.data)
+    with torch.no_grad():
+        out_native = native(latent, t, text, mask)
+        out_liger = liger(latent, t, text, mask)
+    assert torch.allclose(out_native, out_liger, atol=1e-5, rtol=1e-4)
+
+
+def test_train_cli_wires_ddt_norm_impl() -> None:
+    import train as train_module
+
+    parser = train_module.build_parser()
+    args = parser.parse_args(
+        ["--skip-peek", "--latent-channels", "4", "--latent-size", "8",
+         "--text-dim", "16", "--text-seq-len", "6", "--ddt-norm-impl", "liger"]
+    )
+    assert train_module.build_config(args, record=None).ddt_norm_impl == "liger"
+    args_default = parser.parse_args(["--skip-peek"])
+    assert train_module.build_config(args_default, record=None).ddt_norm_impl == "native"
+
+
 def test_decoder_block_rejects_mismatched_s() -> None:
     config = _config()
     block = BoomerFLADDTDecoderBlock(config, layer_idx=4)

@@ -1939,6 +1939,7 @@ def build_config(args: argparse.Namespace, record: Any) -> BoomerFLADiTConfig:
         sandwich_rmsnorm=args.sandwich_rmsnorm,
         rope_ntk_factor=args.rope_ntk_factor,
         ddt_decoder_depth=args.ddt_decoder_depth,
+        ddt_norm_impl=args.ddt_norm_impl,
         use_abs_pos_embed=args.abs_pos_embed,
         patch_size=args.patch_size,
         extra_input_channels=args.extra_input_channels,
@@ -2210,6 +2211,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "final layer conditioned on silu(t+z)). DDT-XL/2 at hidden 1152/depth 28 "
                         "used 6, keeping vanilla REPA placement (--repa-layer 8). 0 = off (v6 "
                         "layout). --repa-layer -1 => encoder mid-depth.")
+    p.add_argument("--ddt-norm-impl", default="native", choices=["native", "liger"],
+                   help="DDT decoder pre-norm impl. native = nn.RMSNorm + modulate (torch.compile "
+                        "fuses it). liger = LigerModulatedRMSNorm, one Triton kernel for "
+                        "(1+scale)*rmsnorm(x)+shift; needs liger-kernel installed. Opt in only "
+                        "after profiling shows the norm sites matter, and benchmark under "
+                        "--compile first (custom autograd can graph-break). Checkpoints are "
+                        "interchangeable between impls (both non-affine, no keys).")
     p.add_argument("--sandwich-rmsnorm", action=bo, default=False,
                    help="v6: Lumina-Next sandwich norm — RMSNorm each sublayer output before the "
                         "residual add (the residual stream itself is never normalized).")
