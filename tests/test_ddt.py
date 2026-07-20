@@ -98,7 +98,7 @@ def test_gradients_flow_through_encoder_via_z() -> None:
     # both so this tests graph CONNECTIVITY, not the deliberate zero init.
     torch.nn.init.normal_(model.out_proj.weight, std=0.02)
     for block in model.decoder_blocks:
-        torch.nn.init.normal_(block.cond_mod[1].weight, std=0.02)
+        torch.nn.init.normal_(block.cond_mod.weight, std=0.02)
     latent, t, text, mask = _inputs(config)
     out = model(latent, t, text, mask)
     (out - latent).pow(2).mean().backward()
@@ -115,7 +115,7 @@ def test_gradient_checkpointing_decoder_path() -> None:
     latent, t, text, mask = _inputs(config)
     out = model(latent, t, text, mask)
     (out - latent).pow(2).mean().backward()
-    assert model.decoder_blocks[0].cond_mod[1].weight.grad is not None
+    assert model.decoder_blocks[0].cond_mod.weight.grad is not None
 
 
 def test_repa_defaults_to_encoder_mid_with_ddt() -> None:
@@ -160,13 +160,23 @@ def test_validation_errors() -> None:
         BoomerFLADiT(_config(dispersive_layer=4))
 
 
-def test_decoder_block_rejects_mismatched_z() -> None:
+def test_decoder_norms_are_nonaffine_rmsnorm() -> None:
+    """Boomer/DDT hybrid: decoder pre-norms follow official DDT (RMSNorm), non-affine
+    because adaLN supplies the affine transform; encoder keeps LayerNorm."""
+    block = BoomerFLADDTDecoderBlock(_config(), layer_idx=4)
+    assert isinstance(block.norm1, torch.nn.RMSNorm)
+    assert isinstance(block.norm2, torch.nn.RMSNorm)
+    assert block.norm1.weight is None
+    assert isinstance(block.cond_mod, torch.nn.Linear)  # s is pre-activated; no SiLU here
+
+
+def test_decoder_block_rejects_mismatched_s() -> None:
     config = _config()
     block = BoomerFLADDTDecoderBlock(config, layer_idx=4)
     y = torch.randn(2, 64, config.hidden_dim)
-    z = torch.randn(2, 32, config.hidden_dim)
-    with pytest.raises(ValueError, match="z shape"):
-        block(y, z, torch.randn(2, config.hidden_dim), height=8, width=8)
+    s = torch.randn(2, 32, config.hidden_dim)
+    with pytest.raises(ValueError, match="s shape"):
+        block(y, s, height=8, width=8)
 
 
 def test_train_cli_wires_ddt_decoder_depth() -> None:

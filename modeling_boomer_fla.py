@@ -31,9 +31,12 @@ class AttentionRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim) * scale_factor)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        normed = x.float() * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        # Upcast BEFORE squaring (Llama convention): squaring in bf16 and reducing over
+        # ~1e3 elements loses mantissa bits exactly where the rsqrt is most sensitive.
+        x_fp32 = x.float()
+        normed = x_fp32 * torch.rsqrt(x_fp32.square().mean(dim=-1, keepdim=True) + self.eps)
         weight = self.weight.view(*([1] * (x.ndim - 2)), -1)
-        return (weight * normed).type_as(x)
+        return (weight.float() * normed).to(dtype=x.dtype)
 
 
 class CaptionEmbedder(nn.Module):
@@ -1624,22 +1627,26 @@ class BoomerFLAJointRefreshBlock(JointTextImageAttentionMixin, nn.Module):
 class BoomerFLADDTDecoderBlock(nn.Module):
     """v7 DDT velocity-decoder block: full softmax attention + GLUMBConv.
 
-    Conditioned token-wise on the condition encoder's output z via adaLN — each image
-    token gets its own shift/scale/gate computed from z[token] + t_emb, so the decoder
-    re-reads the encoder's semantic plan at every layer (DDT's layerwise conditioning)
-    instead of receiving it once. All six decoder sublayers are full softmax attention:
-    the decoder is where final part-to-part structure gets committed, and 6 full-attn
-    layers over the <=1024-token DC-AE grid are cheap.
+    Conditioned token-wise on the shared semantic state s = silu(t + z), computed ONCE
+    in BoomerFLADiT.forward (official DDT form) — each image token gets its own
+    shift/scale/gate from a plain Linear over s[token], so the decoder re-reads the
+    encoder's semantic plan at every layer. All decoder sublayers are full softmax
+    attention: the decoder is where final part-to-part structure gets committed, and a
+    few full-attn layers over the <=1024-token DC-AE grid are cheap.
+
+    Pre-norms are non-affine RMSNorm (official DDT uses RMSNorm here; non-affine
+    because adaLN supplies the affine transform). Encoder blocks keep Boomer's
+    non-affine LayerNorm — a deliberate Boomer/DDT hybrid, not an exact reproduction.
 
     No text inputs: text conditioning is entirely the encoder's job; the decoder sees
-    text only through z. No FLA mixer: global attention every layer supersedes it here.
+    text only through s. No FLA mixer: global attention every layer supersedes it here.
     """
 
     def __init__(self, config: BoomerFLADiTConfig, *, layer_idx: int) -> None:
         super().__init__()
         del layer_idx  # uniform blocks; kept for signature parity with make_block
         hidden_dim = config.hidden_dim
-        self.norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
+        self.norm1 = nn.RMSNorm(hidden_dim, eps=1e-6, elementwise_affine=False)
         self.attn = FullImageSelfAttention(
             hidden_dim,
             config.num_heads,
@@ -1647,14 +1654,13 @@ class BoomerFLADDTDecoderBlock(nn.Module):
             qk_rmsnorm=config.image_attention_qk_rmsnorm,
             grid_size=config.latent_size // config.patch_size,
             rope=config.image_attention_rope,
-            rope_theta=config.image_rope_theta,
             rope_ntk_factor=config.rope_ntk_factor,
         )
-        self.norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
+        self.norm2 = nn.RMSNorm(hidden_dim, eps=1e-6, elementwise_affine=False)
         self.mlp = GLUMBConv(hidden_dim, config.mlp_ratio)
-        # Token-wise conditioning projection over z + t (zero-init in initialize_weights,
-        # adaLN-Zero convention); the per-block scale_shift_table carries layer variation.
-        self.cond_mod = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
+        # Plain Linear: s is already silu-activated. Zero-init in initialize_weights
+        # (adaLN-Zero); the per-block scale_shift_table carries layer variation.
+        self.cond_mod = nn.Linear(hidden_dim, hidden_dim * 6)
         self.scale_shift_table = nn.Parameter(torch.zeros(6, hidden_dim))
         self.sandwich_attn = make_sandwich_norm(config)
         self.sandwich_mlp = make_sandwich_norm(config)
@@ -1662,17 +1668,16 @@ class BoomerFLADDTDecoderBlock(nn.Module):
     def forward(
         self,
         y: torch.Tensor,
-        z: torch.Tensor,
-        t_emb: torch.Tensor,
+        s: torch.Tensor,
         *,
         height: int,
         width: int,
     ) -> torch.Tensor:
         batch, tokens, _ = y.shape
-        if z.shape[:2] != (batch, tokens):
-            raise ValueError(f"z shape {tuple(z.shape)} must match decoder tokens {(batch, tokens)}")
-        # (B, T, 6, D): per-token modulation from the self-condition + timestep.
-        mod = self.cond_mod(z + t_emb.unsqueeze(1)).reshape(batch, tokens, 6, -1)
+        if s.shape[:2] != (batch, tokens):
+            raise ValueError(f"s shape {tuple(s.shape)} must match decoder tokens {(batch, tokens)}")
+        # (B, T, 6, D): per-token modulation from the shared semantic state.
+        mod = self.cond_mod(s).reshape(batch, tokens, 6, -1)
         shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp = (
             self.scale_shift_table[None, None] + mod
         ).unbind(dim=2)
@@ -1898,10 +1903,10 @@ class BoomerFLADiT(nn.Module):
                     nn.init.normal_(block.image_attn_scale_shift_table, std=0.02)
 
         for block in self.decoder_blocks:
-            # adaLN-Zero over z: token-wise modulation starts at the (small-normal) table
+            # adaLN-Zero over s: token-wise modulation starts at the (small-normal) table
             # values, same convention as every other block family here.
-            nn.init.zeros_(block.cond_mod[1].weight)
-            nn.init.zeros_(block.cond_mod[1].bias)
+            nn.init.zeros_(block.cond_mod.weight)
+            nn.init.zeros_(block.cond_mod.bias)
             nn.init.normal_(block.scale_shift_table, std=0.02)
 
         for shared in (
@@ -2181,12 +2186,14 @@ class BoomerFLADiT(nn.Module):
                 # Pool image tokens -> per-sample feature; dispersion is computed in the
                 # loss. No projector: the regularizer acts on the raw hidden state.
                 dispersive_feat = x.mean(dim=1)
-        z: torch.Tensor | None = None
+        s: torch.Tensor | None = None
         if self.decoder_x_embedder is not None:
-            # v7 DDT: the encoder output is the self-condition z; the velocity decoder
-            # restarts from a fresh embedding of the (conditioned) noisy latent and reads
-            # z token-wise through each decoder block's adaLN.
-            z = x
+            # v7 DDT: the encoder output z becomes ONE shared semantic state
+            # s = silu(t + z), computed once (official DDT form) and fed to every decoder
+            # block and the head — one saved silu activation instead of one per site.
+            # The velocity decoder restarts from a fresh embedding of the (conditioned)
+            # noisy latent and reads s token-wise through each block's adaLN.
+            s = F.silu(x + t_emb.unsqueeze(1))
             if self.patch_size == 1:
                 x = self.decoder_x_embedder(model_input.flatten(2).transpose(1, 2))
             else:
@@ -2195,17 +2202,17 @@ class BoomerFLADiT(nn.Module):
                 x = x + self.pos_embed
             for block in self.decoder_blocks:
                 if use_ckpt:
-                    def _dec_fn(y, zz, te, _blk=block, h=token_height, w=token_width):
-                        return _blk(y, zz, te, height=h, width=w)
-                    x = _ckpt(_dec_fn, x, z, t_emb,
+                    def _dec_fn(y, ss, _blk=block, h=token_height, w=token_width):
+                        return _blk(y, ss, height=h, width=w)
+                    x = _ckpt(_dec_fn, x, s,
                               use_reentrant=False, preserve_rng_state=False)
                 else:
-                    x = block(x, z, t_emb, height=token_height, width=token_width)
-        if z is not None:
-            # DDT final layer: token-wise modulation from silu(t + z) (final_t_block is
-            # SiLU->Linear, matching the official FinalLayer(x, s) exactly), so the head
-            # also reads the self-condition, not just the timestep.
-            final_mod = self.final_t_block(z + t_emb.unsqueeze(1))
+                    x = block(x, s, height=token_height, width=token_width)
+        if s is not None:
+            # DDT FinalLayer(x, s): token-wise modulation from s. Only the Linear half of
+            # final_t_block runs (s is already silu-activated), so the parameters and the
+            # computation match the official head exactly.
+            final_mod = self.final_t_block[1](s)
             shift, scale = final_mod.reshape(batch, token_count, 2, -1).unbind(dim=2)
         else:
             final_mod = self.final_t_block(t_emb)

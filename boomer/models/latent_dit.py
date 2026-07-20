@@ -34,9 +34,12 @@ class AttentionRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim) * scale_factor)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        normed = x.float() * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        # Upcast BEFORE squaring (Llama convention): squaring in bf16 and reducing over
+        # ~1e3 elements loses mantissa bits exactly where the rsqrt is most sensitive.
+        x_fp32 = x.float()
+        normed = x_fp32 * torch.rsqrt(x_fp32.square().mean(dim=-1, keepdim=True) + self.eps)
         weight = self.weight.view(*([1] * (x.ndim - 2)), -1)
-        return (weight * normed).type_as(x)
+        return (weight.float() * normed).to(dtype=x.dtype)
 
 
 class CaptionEmbedder(nn.Module):
