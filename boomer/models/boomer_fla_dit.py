@@ -1728,11 +1728,10 @@ class BoomerFLADiT(nn.Module):
         self.out_proj = nn.Linear(hidden_dim, config.latent_channels * config.patch_size * config.patch_size)
         # REPA: pooled feature -> SSL embedding space. 3-layer MLP head per the REPA
         # paper; only built (and only run) when repa_dim > 0 and return_repa is set.
-        # With DDT, the default alignment target is the encoder OUTPUT z (DDT aligns the
-        # self-condition, not a mid block); without DDT it stays the mid-depth block.
-        self.repa_layer = config.repa_layer if config.repa_layer >= 0 else (
-            encoder_depth - 1 if config.ddt_decoder_depth > 0 else config.depth // 2
-        )
+        # -1 => encoder mid-depth. The official DDT-XL 22en6de recipe keeps vanilla
+        # REPA placement (align_layer 8, a mid-shallow ENCODER block) — it does NOT
+        # align the encoder output z, so the default stays mid-depth under DDT too.
+        self.repa_layer = config.repa_layer if config.repa_layer >= 0 else encoder_depth // 2
         # Dispersive loss: no projector (parameter-free); only the capture layer is needed.
         self.dispersive_layer = (
             config.dispersive_layer if config.dispersive_layer >= 0 else encoder_depth // 2
@@ -2074,6 +2073,7 @@ class BoomerFLADiT(nn.Module):
                 # Pool image tokens -> per-sample feature; dispersion is computed in the
                 # loss. No projector: the regularizer acts on the raw hidden state.
                 dispersive_feat = x.mean(dim=1)
+        z: torch.Tensor | None = None
         if self.decoder_x_embedder is not None:
             # v7 DDT: the encoder output is the self-condition z; the velocity decoder
             # restarts from a fresh embedding of the (conditioned) noisy latent and reads
@@ -2093,8 +2093,15 @@ class BoomerFLADiT(nn.Module):
                               use_reentrant=False, preserve_rng_state=False)
                 else:
                     x = block(x, z, t_emb, height=token_height, width=token_width)
-        final_mod = self.final_t_block(t_emb)
-        shift, scale = final_mod.reshape(batch, 2, -1).chunk(2, dim=1)
+        if z is not None:
+            # DDT final layer: token-wise modulation from silu(t + z) (final_t_block is
+            # SiLU->Linear, matching the official FinalLayer(x, s) exactly), so the head
+            # also reads the self-condition, not just the timestep.
+            final_mod = self.final_t_block(z + t_emb.unsqueeze(1))
+            shift, scale = final_mod.reshape(batch, token_count, 2, -1).unbind(dim=2)
+        else:
+            final_mod = self.final_t_block(t_emb)
+            shift, scale = final_mod.reshape(batch, 2, -1).chunk(2, dim=1)
         x = modulate(self.final_norm(x), shift, scale)
         x = self.out_proj(x)
         if self.patch_size == 1:

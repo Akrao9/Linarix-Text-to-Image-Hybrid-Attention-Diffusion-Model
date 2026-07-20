@@ -118,10 +118,12 @@ def test_gradient_checkpointing_decoder_path() -> None:
     assert model.decoder_blocks[0].cond_mod[1].weight.grad is not None
 
 
-def test_repa_defaults_to_encoder_output_with_ddt() -> None:
+def test_repa_defaults_to_encoder_mid_with_ddt() -> None:
+    """Official DDT keeps vanilla REPA placement (a mid-shallow encoder block, e.g.
+    align_layer 8 for 22en6de) — NOT the encoder output z."""
     config = _config(repa_dim=8, repa_layer=-1)
     model = BoomerFLADiT(config)
-    assert model.repa_layer == model.encoder_depth - 1  # align z, not depth//2
+    assert model.repa_layer == model.encoder_depth // 2  # encoder mid, in-range
     latent, t, text, mask = _inputs(config)
     out, repa = model(latent, t, text, mask, return_repa=True)
     assert out.shape == latent.shape

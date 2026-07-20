@@ -2206,9 +2206,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ddt-decoder-depth", type=int, default=0,
                    help="v7: DDT split (arXiv 2504.05741) — the last N of --depth blocks become a "
                         "velocity decoder (full softmax attention + GLUMBConv, conditioned "
-                        "token-wise on the encoder output z via adaLN, noisy latent re-embedded). "
-                        "DDT-XL/2 at hidden 1152/depth 28 used 6. 0 = off (v6 layout). With DDT on, "
-                        "--repa-layer -1 aligns the encoder OUTPUT z instead of depth//2.")
+                        "token-wise on the encoder output z via adaLN, noisy latent re-embedded, "
+                        "final layer conditioned on silu(t+z)). DDT-XL/2 at hidden 1152/depth 28 "
+                        "used 6, keeping vanilla REPA placement (--repa-layer 8). 0 = off (v6 "
+                        "layout). --repa-layer -1 => encoder mid-depth.")
     p.add_argument("--sandwich-rmsnorm", action=bo, default=False,
                    help="v6: Lumina-Next sandwich norm — RMSNorm each sublayer output before the "
                         "residual add (the residual stream itself is never normalized).")
