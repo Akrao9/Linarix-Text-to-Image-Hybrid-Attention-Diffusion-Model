@@ -198,6 +198,14 @@ class BoomerFLADiTConfig:
     # v6: NTK-aware RoPE rescaling for the image-spatial axes only (never text positions).
     # 1.0 for 512px pretrain; ~2.0 for the 1024px fine-tune where the token grid doubles.
     rope_ntk_factor: float = 1.0
+    # v7: DDT-style encoder/decoder split (arXiv 2504.05741). The last N blocks become a
+    # velocity decoder: full softmax attention + GLUMBConv, conditioned TOKEN-WISE on the
+    # condition encoder's output z (the "self-condition") via adaLN, with the noisy latent
+    # re-embedded through a separate decoder embedder. The first depth-N blocks (dual-stream
+    # prefix + GDN2 spine + joint refresh) become the condition encoder. DDT-XL/2 at this
+    # exact shape (hidden 1152 / depth 28) used 22en6de. 0 = off (v6 layout, identical
+    # parameters and state-dict keys).
+    ddt_decoder_depth: int = 0
     use_abs_pos_embed: bool = True
     patch_size: int = 1
     gradient_checkpointing: bool = False
@@ -1613,6 +1621,70 @@ class BoomerFLAJointRefreshBlock(JointTextImageAttentionMixin, nn.Module):
         return x, text_tokens
 
 
+class BoomerFLADDTDecoderBlock(nn.Module):
+    """v7 DDT velocity-decoder block: full softmax attention + GLUMBConv.
+
+    Conditioned token-wise on the condition encoder's output z via adaLN — each image
+    token gets its own shift/scale/gate computed from z[token] + t_emb, so the decoder
+    re-reads the encoder's semantic plan at every layer (DDT's layerwise conditioning)
+    instead of receiving it once. All six decoder sublayers are full softmax attention:
+    the decoder is where final part-to-part structure gets committed, and 6 full-attn
+    layers over the <=1024-token DC-AE grid are cheap.
+
+    No text inputs: text conditioning is entirely the encoder's job; the decoder sees
+    text only through z. No FLA mixer: global attention every layer supersedes it here.
+    """
+
+    def __init__(self, config: BoomerFLADiTConfig, *, layer_idx: int) -> None:
+        super().__init__()
+        del layer_idx  # uniform blocks; kept for signature parity with make_block
+        hidden_dim = config.hidden_dim
+        self.norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
+        self.attn = FullImageSelfAttention(
+            hidden_dim,
+            config.num_heads,
+            backend=config.image_attention_backend,
+            qk_rmsnorm=config.image_attention_qk_rmsnorm,
+            grid_size=config.latent_size // config.patch_size,
+            rope=config.image_attention_rope,
+            rope_theta=config.image_rope_theta,
+            rope_ntk_factor=config.rope_ntk_factor,
+        )
+        self.norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
+        self.mlp = GLUMBConv(hidden_dim, config.mlp_ratio)
+        # Token-wise conditioning projection over z + t (zero-init in initialize_weights,
+        # adaLN-Zero convention); the per-block scale_shift_table carries layer variation.
+        self.cond_mod = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
+        self.scale_shift_table = nn.Parameter(torch.zeros(6, hidden_dim))
+        self.sandwich_attn = make_sandwich_norm(config)
+        self.sandwich_mlp = make_sandwich_norm(config)
+
+    def forward(
+        self,
+        y: torch.Tensor,
+        z: torch.Tensor,
+        t_emb: torch.Tensor,
+        *,
+        height: int,
+        width: int,
+    ) -> torch.Tensor:
+        batch, tokens, _ = y.shape
+        if z.shape[:2] != (batch, tokens):
+            raise ValueError(f"z shape {tuple(z.shape)} must match decoder tokens {(batch, tokens)}")
+        # (B, T, 6, D): per-token modulation from the self-condition + timestep.
+        mod = self.cond_mod(z + t_emb.unsqueeze(1)).reshape(batch, tokens, 6, -1)
+        shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp = (
+            self.scale_shift_table[None, None] + mod
+        ).unbind(dim=2)
+        y = y + gate_attn * self.sandwich_attn(
+            self.attn(modulate(self.norm1(y), shift_attn, scale_attn))
+        )
+        y = y + gate_mlp * self.sandwich_mlp(
+            self.mlp(modulate(self.norm2(y), shift_mlp, scale_mlp), height=height, width=width)
+        )
+        return y
+
+
 class BoomerFLADiT(nn.Module):
     """Boomer DiT with FLA mixers, optional full image attention, and GLUMBConv FFNs."""
 
@@ -1626,8 +1698,20 @@ class BoomerFLADiT(nn.Module):
             )
         if config.dual_stream_depth < 0:
             raise ValueError(f"dual_stream_depth must be non-negative, got {config.dual_stream_depth}")
-        if config.dual_stream_depth > config.depth:
-            raise ValueError(f"dual_stream_depth={config.dual_stream_depth} exceeds depth={config.depth}")
+        if config.ddt_decoder_depth < 0:
+            raise ValueError(f"ddt_decoder_depth must be non-negative, got {config.ddt_decoder_depth}")
+        if config.ddt_decoder_depth >= config.depth:
+            raise ValueError(
+                f"ddt_decoder_depth={config.ddt_decoder_depth} must leave at least one encoder "
+                f"block (depth={config.depth})"
+            )
+        # depth counts ALL blocks; the last ddt_decoder_depth of them are decoder blocks.
+        encoder_depth = config.depth - config.ddt_decoder_depth
+        if config.dual_stream_depth > encoder_depth:
+            raise ValueError(
+                f"dual_stream_depth={config.dual_stream_depth} exceeds the encoder depth "
+                f"{encoder_depth} (depth={config.depth} - ddt_decoder_depth={config.ddt_decoder_depth})"
+            )
         if config.cross_attention_every < 1:
             raise ValueError(f"cross_attention_every must be >= 1, got {config.cross_attention_every}")
         if config.joint_refresh_attention and config.image_attention_every <= 0:
@@ -1668,7 +1752,7 @@ class BoomerFLADiT(nn.Module):
         refresh_indices: set[int] = set()
         if config.joint_refresh_attention:
             reader_after = False
-            for i in reversed(range(config.dual_stream_depth, config.depth)):
+            for i in reversed(range(config.dual_stream_depth, encoder_depth)):
                 if (i + 1) % config.image_attention_every == 0 and reader_after:
                     refresh_indices.add(i)
                     reads_text = True
@@ -1681,12 +1765,13 @@ class BoomerFLADiT(nn.Module):
         if config.shared_adaln:
             # Joint refresh blocks consume the same 9-way shared_mod as BoomerFLABlock
             # (their cross rows modulate the joint attention) and the same 6-way text
-            # projection as the dual-stream prefix.
-            if config.dual_stream_depth < config.depth:
+            # projection as the dual-stream prefix. DDT decoder blocks never use shared
+            # adaLN — their modulation is token-wise from z, inherently per-block.
+            if config.dual_stream_depth < encoder_depth:
                 self.shared_mod = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 9))
             has_image_attn = config.image_attention_every > 0 and any(
                 (i + 1) % config.image_attention_every == 0 and i not in refresh_indices
-                for i in range(config.dual_stream_depth, config.depth)
+                for i in range(config.dual_stream_depth, encoder_depth)
             )
             if has_image_attn:
                 self.shared_image_attn_mod = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 3))
@@ -1720,17 +1805,55 @@ class BoomerFLADiT(nn.Module):
                 return BoomerFLAJointRefreshBlock(config, layer_idx=i)
             return BoomerFLABlock(config, layer_idx=i)
 
-        self.blocks = nn.ModuleList([make_block(i) for i in range(config.depth)])
+        # self.blocks is the condition encoder (== the whole model when DDT is off).
+        self.blocks = nn.ModuleList([make_block(i) for i in range(encoder_depth)])
+        self.encoder_depth = encoder_depth
+        # v7 DDT velocity decoder: empty ModuleList (no state-dict keys) when off, so a
+        # ddt_decoder_depth=0 model is key-for-key identical to pre-v7 checkpoints.
+        self.decoder_blocks = nn.ModuleList(
+            [
+                BoomerFLADDTDecoderBlock(config, layer_idx=encoder_depth + i)
+                for i in range(config.ddt_decoder_depth)
+            ]
+        )
+        # DDT decoder re-embeds the noisy latent itself (D(x_t, z, t), not D(enc_out)):
+        # z is forced to carry pure semantics, and the encoder can be reused across
+        # adjacent sampling steps at inference.
+        self.decoder_x_embedder = None
+        if config.ddt_decoder_depth > 0:
+            self.decoder_x_embedder = (
+                nn.Linear(in_channels, hidden_dim)
+                if config.patch_size == 1
+                else nn.Conv2d(
+                    in_channels,
+                    hidden_dim,
+                    kernel_size=config.patch_size,
+                    stride=config.patch_size,
+                )
+            )
         self.final_norm = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
         self.final_t_block = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 2))
         self.out_proj = nn.Linear(hidden_dim, config.latent_channels * config.patch_size * config.patch_size)
-        # REPA: pooled mid-depth feature -> SSL embedding space. 3-layer MLP head per the
-        # REPA paper; only built (and only run) when repa_dim > 0 and return_repa is set.
-        self.repa_layer = config.repa_layer if config.repa_layer >= 0 else config.depth // 2
+        # REPA: pooled feature -> SSL embedding space. 3-layer MLP head per the REPA
+        # paper; only built (and only run) when repa_dim > 0 and return_repa is set.
+        # With DDT, the default alignment target is the encoder OUTPUT z (DDT aligns the
+        # self-condition, not a mid block); without DDT it stays the mid-depth block.
+        self.repa_layer = config.repa_layer if config.repa_layer >= 0 else (
+            encoder_depth - 1 if config.ddt_decoder_depth > 0 else config.depth // 2
+        )
         # Dispersive loss: no projector (parameter-free); only the capture layer is needed.
         self.dispersive_layer = (
-            config.dispersive_layer if config.dispersive_layer >= 0 else config.depth // 2
+            config.dispersive_layer if config.dispersive_layer >= 0 else encoder_depth // 2
         )
+        if self.repa_layer >= encoder_depth:
+            raise ValueError(
+                f"repa_layer={self.repa_layer} must index an encoder block "
+                f"(< {encoder_depth}); DDT decoder blocks are not alignment targets"
+            )
+        if self.dispersive_layer >= encoder_depth:
+            raise ValueError(
+                f"dispersive_layer={self.dispersive_layer} must index an encoder block (< {encoder_depth})"
+            )
         self.repa_proj = (
             nn.Sequential(
                 nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6),
@@ -1775,6 +1898,13 @@ class BoomerFLADiT(nn.Module):
                         nn.init.zeros_(block.image_attn_mod[1].bias)
                     nn.init.normal_(block.image_attn_scale_shift_table, std=0.02)
 
+        for block in self.decoder_blocks:
+            # adaLN-Zero over z: token-wise modulation starts at the (small-normal) table
+            # values, same convention as every other block family here.
+            nn.init.zeros_(block.cond_mod[1].weight)
+            nn.init.zeros_(block.cond_mod[1].bias)
+            nn.init.normal_(block.scale_shift_table, std=0.02)
+
         for shared in (
             self.shared_mod,
             self.shared_image_attn_mod,
@@ -1798,7 +1928,7 @@ class BoomerFLADiT(nn.Module):
         # and the sandwich-wrapped output projections get a small normal init. The
         # model's zero-output-at-init property is unaffected (the head stays zero).
         if self.config.sandwich_rmsnorm:
-            for block in self.blocks:
+            for block in [*self.blocks, *self.decoder_blocks]:
                 for module in block.modules():
                     if isinstance(module, GLUMBConv):
                         nn.init.normal_(module.point_fc.weight, std=0.02)
@@ -1815,6 +1945,8 @@ class BoomerFLADiT(nn.Module):
         if self.config.extra_input_channels > 0:
             with torch.no_grad():
                 self.x_embedder.weight[:, self.config.latent_channels :].zero_()
+                if self.decoder_x_embedder is not None:
+                    self.decoder_x_embedder.weight[:, self.config.latent_channels :].zero_()
 
     def _mixer_perm(
         self, height: int, width: int, device: torch.device
@@ -2050,6 +2182,25 @@ class BoomerFLADiT(nn.Module):
                 # Pool image tokens -> per-sample feature; dispersion is computed in the
                 # loss. No projector: the regularizer acts on the raw hidden state.
                 dispersive_feat = x.mean(dim=1)
+        if self.decoder_x_embedder is not None:
+            # v7 DDT: the encoder output is the self-condition z; the velocity decoder
+            # restarts from a fresh embedding of the (conditioned) noisy latent and reads
+            # z token-wise through each decoder block's adaLN.
+            z = x
+            if self.patch_size == 1:
+                x = self.decoder_x_embedder(model_input.flatten(2).transpose(1, 2))
+            else:
+                x = self.decoder_x_embedder(model_input).flatten(2).transpose(1, 2)
+            if self.pos_embed is not None:
+                x = x + self.pos_embed
+            for block in self.decoder_blocks:
+                if use_ckpt:
+                    def _dec_fn(y, zz, te, _blk=block, h=token_height, w=token_width):
+                        return _blk(y, zz, te, height=h, width=w)
+                    x = _ckpt(_dec_fn, x, z, t_emb,
+                              use_reentrant=False, preserve_rng_state=False)
+                else:
+                    x = block(x, z, t_emb, height=token_height, width=token_width)
         final_mod = self.final_t_block(t_emb)
         shift, scale = final_mod.reshape(batch, 2, -1).chunk(2, dim=1)
         x = modulate(self.final_norm(x), shift, scale)
