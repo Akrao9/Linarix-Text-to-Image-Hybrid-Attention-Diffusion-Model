@@ -178,6 +178,11 @@ def _liger_available() -> bool:
     return True
 
 
+# Liger is Triton: import success does NOT imply the kernel can run. The parity suite
+# needs an actual CUDA device and must place model + tensors on it.
+_LIGER_CUDA = _liger_available() and torch.cuda.is_available()
+
+
 def test_norm_impl_validation_and_missing_liger() -> None:
     with pytest.raises(ValueError, match="ddt_norm_impl"):
         BoomerFLADiT(_config(ddt_norm_impl="triton"))
@@ -187,22 +192,73 @@ def test_norm_impl_validation_and_missing_liger() -> None:
         BoomerFLADiT(_config(ddt_norm_impl="liger"))
 
 
-@pytest.mark.skipif(not _liger_available(), reason="liger-kernel not installed")
-def test_liger_norm_matches_native() -> None:
-    """Same config, same weights: the fused kernel must reproduce the native path."""
+def _paired_models(device: str, **config_overrides):
+    """Native + liger models with identical weights (incl. a randomized head so
+    outputs are non-trivially nonzero), on `device`."""
     torch.manual_seed(0)
-    native = BoomerFLADiT(_config(ddt_norm_impl="native")).eval()
-    torch.manual_seed(0)
-    liger = BoomerFLADiT(_config(ddt_norm_impl="liger")).eval()
-    liger.load_state_dict(native.state_dict())  # interchangeable: no norm keys
-    config = _config()
-    latent, t, text, mask = _inputs(config)
+    native = BoomerFLADiT(_config(ddt_norm_impl="native", **config_overrides)).to(device)
     torch.nn.init.normal_(native.out_proj.weight, std=0.02)
-    liger.out_proj.weight.data.copy_(native.out_proj.weight.data)
-    with torch.no_grad():
+    for block in native.decoder_blocks:
+        torch.nn.init.normal_(block.cond_mod.weight, std=0.02)
+    liger = BoomerFLADiT(_config(ddt_norm_impl="liger", **config_overrides)).to(device)
+    liger.load_state_dict(native.state_dict())  # interchangeable: no norm keys
+    return native, liger
+
+
+@pytest.mark.skipif(not _LIGER_CUDA, reason="needs CUDA + liger-kernel (Triton path)")
+def test_liger_norm_matches_native_forward_and_backward() -> None:
+    device = "cuda"
+    native, liger = _paired_models(device)
+    config = _config()
+    latent, t, text, mask = (x.to(device) for x in _inputs(config))
+
+    out_native = native(latent, t, text, mask)
+    out_liger = liger(latent, t, text, mask)
+    assert torch.allclose(out_native, out_liger, atol=1e-5, rtol=1e-4)
+
+    out_native.pow(2).mean().backward()
+    out_liger.pow(2).mean().backward()
+    pairs = [
+        (native.decoder_blocks[0].cond_mod.weight, liger.decoder_blocks[0].cond_mod.weight),
+        (native.decoder_x_embedder.weight, liger.decoder_x_embedder.weight),
+        # x_embedder grads flow only through z -> s: catches a broken fused backward w.r.t. scale/shift.
+        (native.x_embedder.weight, liger.x_embedder.weight),
+    ]
+    for p_native, p_liger in pairs:
+        assert p_native.grad is not None and p_liger.grad is not None
+        assert torch.allclose(p_native.grad, p_liger.grad, atol=1e-5, rtol=1e-3)
+
+
+@pytest.mark.skipif(not _LIGER_CUDA, reason="needs CUDA + liger-kernel (Triton path)")
+def test_liger_norm_matches_native_bf16() -> None:
+    device = "cuda"
+    native, liger = _paired_models(device)
+    config = _config()
+    latent, t, text, mask = (x.to(device) for x in _inputs(config))
+    with torch.autocast("cuda", dtype=torch.bfloat16), torch.no_grad():
         out_native = native(latent, t, text, mask)
         out_liger = liger(latent, t, text, mask)
+    assert torch.allclose(out_native.float(), out_liger.float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not _LIGER_CUDA, reason="needs CUDA + liger-kernel (Triton path)")
+def test_liger_norm_under_gradient_checkpointing() -> None:
+    """The fused autograd Function must recompute correctly inside torch.utils.checkpoint."""
+    device = "cuda"
+    native, liger = _paired_models(device, gradient_checkpointing=True)
+    native.train()
+    liger.train()
+    config = _config()
+    latent, t, text, mask = (x.to(device) for x in _inputs(config))
+    out_native = native(latent, t, text, mask)
+    out_liger = liger(latent, t, text, mask)
     assert torch.allclose(out_native, out_liger, atol=1e-5, rtol=1e-4)
+    out_native.pow(2).mean().backward()
+    out_liger.pow(2).mean().backward()
+    g_native = native.decoder_blocks[0].cond_mod.weight.grad
+    g_liger = liger.decoder_blocks[0].cond_mod.weight.grad
+    assert g_native is not None and g_liger is not None
+    assert torch.allclose(g_native, g_liger, atol=1e-5, rtol=1e-3)
 
 
 def test_train_cli_wires_ddt_norm_impl() -> None:

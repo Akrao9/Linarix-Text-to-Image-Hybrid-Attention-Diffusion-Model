@@ -1556,8 +1556,13 @@ class BoomerFLADDTDecoderBlock(nn.Module):
 
             def make_norm() -> nn.Module:
                 # Same math as native: fp32 rsqrt (llama casting), non-affine, then the
-                # (1+scale)*x+shift modulation fused into the same kernel.
-                return LigerModulatedRMSNorm(hidden_dim, eps=1e-6, elementwise_affine=False)
+                # (1+scale)*x+shift modulation fused into the same kernel. in_place=False:
+                # the in-place backward overwrites the upstream grad buffer (dY) to save
+                # memory — conservative rollout keeps it off until the CUDA parity suite
+                # (forward/backward/bf16/checkpointing) passes with it enabled.
+                return LigerModulatedRMSNorm(
+                    hidden_dim, eps=1e-6, elementwise_affine=False, in_place=False
+                )
         else:
 
             def make_norm() -> nn.Module:
