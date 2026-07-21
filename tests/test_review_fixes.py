@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 from torch import nn
 
@@ -194,6 +195,99 @@ def test_ema_restore_migrates_legacy_glumbconv_keys() -> None:
     assert "blocks.0.mlp.point_fc.weight" in cb.ema
     assert cb.ema["blocks.0.mlp.point_fc.weight"].shape == (64, 128)
     assert "blocks.0.mlp.point_conv.conv.weight" not in cb.ema
+
+
+class _FakeTrainer:
+    def __init__(self, global_step: int = 0) -> None:
+        self.global_step = global_step
+
+
+class _FakeModule:
+    def __init__(self, value: float) -> None:
+        self.model = nn.Linear(2, 2)
+        with torch.no_grad():
+            for p in self.model.parameters():
+                p.fill_(value)
+
+    def set(self, value: float) -> None:
+        with torch.no_grad():
+            for p in self.model.parameters():
+                p.fill_(value)
+
+
+def _run_accumulated(cb, trainer, module, *, steps: int, accumulate: int) -> None:
+    """Drive the callback the way Lightning does: one call per micro-batch, with
+    global_step advancing only on the last micro-batch of each accumulation window."""
+    for _ in range(steps):
+        for micro in range(accumulate):
+            if micro == accumulate - 1:
+                trainer.global_step += 1
+            cb.on_train_batch_end(trainer, module, None, None, micro)
+
+
+def test_ema_updates_once_per_optimizer_step_not_per_micro_batch() -> None:
+    import train
+
+    decay = 0.9
+    trainer, module = _FakeTrainer(), _FakeModule(0.0)
+    cb = train.EMACallback(decay=decay)
+    cb.on_fit_start(trainer, module)
+
+    module.set(1.0)
+    _run_accumulated(cb, trainer, module, steps=3, accumulate=4)
+
+    # EMA started at 0.0 and the target has been 1.0 for 3 optimizer steps. One update
+    # per step => decay**3; the old per-micro-batch behaviour gave decay**12.
+    expected = 1.0 - decay**3
+    assert cb.ema["weight"].flatten()[0].item() == pytest.approx(expected, rel=1e-6)
+
+
+def test_ema_update_every_counts_optimizer_steps() -> None:
+    import train
+
+    trainer, module = _FakeTrainer(), _FakeModule(0.0)
+    cb = train.EMACallback(decay=0.5, update_every=3)
+    cb.on_fit_start(trainer, module)
+
+    module.set(1.0)
+    _run_accumulated(cb, trainer, module, steps=9, accumulate=4)
+
+    # Steps 3, 6 and 9 satisfy step % 3 == 0 -> exactly 3 updates, regardless of
+    # the accumulation factor.
+    assert cb.ema["weight"].flatten()[0].item() == pytest.approx(1.0 - 0.5**3, rel=1e-6)
+
+
+def test_ema_resume_does_not_spend_an_update_on_prior_weights() -> None:
+    import train
+
+    trainer, module = _FakeTrainer(global_step=20_000), _FakeModule(0.0)
+    cb = train.EMACallback(decay=0.9)
+    cb.on_fit_start(trainer, module)
+    cb.on_train_start(trainer, module)
+
+    # The first micro-batch after a resume repeats the restored global_step; it must
+    # not trigger an update before the optimizer has actually stepped.
+    module.set(1.0)
+    cb.on_train_batch_end(trainer, module, None, None, 0)
+    assert cb.ema["weight"].flatten()[0].item() == 0.0
+
+
+def test_ema_anchor_survives_lightning_restore_ordering() -> None:
+    """Lightning restores the loop state (and thus global_step) in
+    restore_training_state(), which runs AFTER the on_fit_start hooks. A resumed run
+    therefore still reads global_step == 0 in on_fit_start, so the anchor has to be
+    (re)taken in on_train_start or the first micro-batch burns a spurious update."""
+    import train
+
+    trainer, module = _FakeTrainer(global_step=0), _FakeModule(0.0)
+    cb = train.EMACallback(decay=0.9)
+    cb.on_fit_start(trainer, module)  # resume: global_step not restored yet
+    trainer.global_step = 20_000  # restore_training_state() lands here
+    cb.on_train_start(trainer, module)
+
+    module.set(1.0)
+    cb.on_train_batch_end(trainer, module, None, None, 0)
+    assert cb.ema["weight"].flatten()[0].item() == 0.0
 
 
 def test_optimizer_moments_reshaped_to_current_params() -> None:
