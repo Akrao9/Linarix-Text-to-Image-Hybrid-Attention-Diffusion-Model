@@ -90,6 +90,10 @@ class QwenReferenceEncoder(nn.Module):
         # stable across transformers versions; relying on hidden_states[-1] being normed
         # is NOT (a version change silently shifted the readout scale ~700x).
         self._readout_is_final = True
+        # Set once we truncate: the readout is then the LAST layer of the truncated
+        # stack and the final norm is an Identity, so last_hidden_state is bit-identical
+        # to hidden_states[readout_layer] and output_hidden_states becomes unnecessary.
+        self._truncated_to_last = False
 
     # -- lazy load -----------------------------------------------------------
     def load(self) -> None:
@@ -225,6 +229,7 @@ class QwenReferenceEncoder(nn.Module):
                     cfg_obj.num_hidden_layers = r_abs
                 except Exception:
                     pass
+        self._truncated_to_last = True
         print(f"[qwen] truncated encoder to {r_abs}/{n} layers (readout={r_abs}); upper layers + lm_head skipped.")
 
     @property
@@ -294,15 +299,27 @@ class QwenReferenceEncoder(nn.Module):
             if (text_only and self._base_model is not None and not self._base_failed)
             else model
         )
+        # output_hidden_states makes HF retain EVERY layer output simultaneously
+        # (~100 MiB each at B=64/L=320/D=2560 bf16, so multiple GB for ~36 layers) when
+        # we read exactly one of them. On the truncated base-model path that one is the
+        # last entry, and the final norm is an Identity, so last_hidden_state is
+        # bit-identical — request the states only when we actually have to index them.
+        # The full model returns CausalLM output with no last_hidden_state, so it always
+        # needs the flag (including the fallback retry below).
+        want_hidden = not (self._truncated_to_last and runner is not model)
         try:
-            out = runner(**inputs, output_hidden_states=True, use_cache=False, return_dict=True)
+            out = runner(**inputs, output_hidden_states=want_hidden, use_cache=False, return_dict=True)
         except Exception:
             if runner is not model:
                 self._base_failed = True  # fall back to the full model for the rest of the run
+                want_hidden = True
                 out = model(**inputs, output_hidden_states=True, use_cache=False, return_dict=True)
             else:
                 raise
-        if self._readout_is_final and getattr(out, "last_hidden_state", None) is not None:
+        if not want_hidden:
+            # Truncated base-model path: readout == last layer, final norm is Identity.
+            hidden_states = out.last_hidden_state
+        elif self._readout_is_final and getattr(out, "last_hidden_state", None) is not None:
             # Post-final-norm output: matches the validated cache (abs-max ~72) regardless
             # of whether this transformers version post-norms hidden_states[-1].
             hidden_states = out.last_hidden_state
