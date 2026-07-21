@@ -197,6 +197,13 @@ def main() -> None:
     parser.add_argument("--no-y-norm", dest="y_norm", action="store_false", help="Override checkpoint y-norm off.")
     parser.add_argument("--y-norm-scale-factor", type=float, help="Override checkpoint y-norm scale.")
     parser.add_argument("--hf-token", help="Hugging Face token, or 'true' to use the logged-in token.")
+    parser.add_argument(
+        "--encoder-reuse-steps", type=int, default=1,
+        help="DDT encoder amortization: recompute the condition-encoder output every N "
+             "sampling steps and reuse it in between (decoder-only ~6/28 blocks per reused "
+             "step). 1 = off (full model every step). A/B this against 1 on the SAME seed to "
+             "judge the speed/quality trade at a given checkpoint. DDT checkpoints only.",
+    )
     args = parser.parse_args()
     validate_condition_args(parser, args)
     if args.cfg_scale < 0.0:
@@ -273,6 +280,7 @@ def main() -> None:
         stork_derivative_order=args.stork_derivative_order,
         stork_substeps=args.stork_substeps,
         cfg_interval=(args.cfg_interval_low, args.cfg_interval_high),
+        encoder_reuse_steps=args.encoder_reuse_steps,
     )
     latent = denormalize_latent(latent, latent_mean, latent_std)
 

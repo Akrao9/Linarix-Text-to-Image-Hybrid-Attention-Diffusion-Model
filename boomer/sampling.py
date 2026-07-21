@@ -15,6 +15,27 @@ from boomer.sana_flow import make_inference_sigmas
 from boomer.stork_scheduler import make_stork_scheduler
 
 
+class EncoderStateCache:
+    """Holds a DDT condition-encoder output z for reuse across adjacent sampling steps.
+
+    Encoder amortization (DDT paper §inference): the semantic state z changes slowly
+    over a sampling trajectory, so recompute it only every ``reuse_steps`` steps and run
+    the cheap velocity decoder in between (decoder ≈ 6/28 blocks here). ``reuse_steps=1``
+    disables reuse (z recomputed every step) — a plain full-model run.
+
+    The cached z is keyed by batch size: CFG batches cond/uncond together, and the batch
+    can change at a cfg_interval boundary (2 -> 1), so a shape mismatch forces a refresh
+    rather than feeding a stale-shaped z.
+    """
+
+    def __init__(self, reuse_steps: int) -> None:
+        self.reuse_steps = max(1, reuse_steps)
+        self.z: torch.Tensor | None = None
+
+    def refresh_at(self, step_index: int) -> bool:
+        return self.reuse_steps == 1 or step_index % self.reuse_steps == 0
+
+
 @torch.inference_mode()
 def predict_velocity(
     model: torch.nn.Module,
@@ -31,7 +52,26 @@ def predict_velocity(
     cfg_interval: tuple[float, float] = (0.0, 1.0),
     cond_input: torch.Tensor | None = None,
     image_cfg_scale: float = 0.0,
+    encoder_cache: EncoderStateCache | None = None,
+    refresh_encoder: bool = True,
 ) -> torch.Tensor:
+    def _run(latent_b, timestep_b, text_b, mask_b, extra_b):
+        """One model call, transparently caching / reusing the DDT encoder state."""
+        if encoder_cache is None:
+            return model(latent_b, timestep_b, text_b, mask_b, **extra_b)
+        reuse = (
+            not refresh_encoder
+            and encoder_cache.z is not None
+            and encoder_cache.z.shape[0] == latent_b.shape[0]
+        )
+        if reuse:
+            return model(latent_b, timestep_b, text_b, mask_b, **extra_b, encoder_state=encoder_cache.z)
+        out, z = model(
+            latent_b, timestep_b, text_b, mask_b, **extra_b, return_encoder_state=True
+        )
+        encoder_cache.z = z
+        return out
+
     # Guidance interval (Kynkäänniemi et al. 2024, "Applying Guidance in a Limited
     # Interval"): only apply CFG while sigma is inside [low, high]. Outside it we run
     # the single conditional pass — cheaper (one forward, not two) and avoids the
@@ -59,14 +99,14 @@ def predict_velocity(
         cond_batch = torch.cat(
             [torch.zeros_like(cond_input), cond_input, cond_input], dim=0
         )
-        v_00, v_i0, v_it = model(
-            latent_batch, timestep_batch, text_batch, mask_batch, cond_input=cond_batch
+        v_00, v_i0, v_it = _run(
+            latent_batch, timestep_batch, text_batch, mask_batch, {"cond_input": cond_batch}
         ).chunk(3)
         guided = v_00 + image_cfg_scale * (v_i0 - v_00) + cfg_scale * (v_it - v_i0)
         return _rescale(guided, v_it, cfg_rescale)
 
     if cfg_scale == 1.0 or not in_interval:
-        return model(latent, timestep, text_embedding, attention_mask, **extra)
+        return _run(latent, timestep, text_embedding, attention_mask, extra)
 
     latent_batch = latent.repeat(2, 1, 1, 1)
     timestep_batch = timestep.repeat(2)
@@ -77,8 +117,8 @@ def predict_velocity(
     # conditioning stays pinned.
     if cond_input is not None:
         extra = {"cond_input": cond_input.repeat(2, 1, 1, 1)}
-    uncond_velocity, cond_velocity = model(
-        latent_batch, timestep_batch, text_batch, mask_batch, **extra
+    uncond_velocity, cond_velocity = _run(
+        latent_batch, timestep_batch, text_batch, mask_batch, extra
     ).chunk(2)
     guided = uncond_velocity + cfg_scale * (cond_velocity - uncond_velocity)
     return _rescale(guided, cond_velocity, cfg_rescale)
@@ -113,9 +153,20 @@ def sample_latent(
     cfg_interval: tuple[float, float] = (0.0, 1.0),
     cond_input: torch.Tensor | None = None,
     image_cfg_scale: float = 0.0,
+    encoder_reuse_steps: int = 1,
 ) -> torch.Tensor:
     generator = torch.Generator(device=device).manual_seed(seed)
     config = model.config
+    # Encoder amortization: reuse the DDT condition-encoder output across adjacent steps.
+    # Only valid on a DDT model (dense models have no separable encoder output).
+    encoder_cache: EncoderStateCache | None = None
+    if encoder_reuse_steps > 1:
+        if getattr(config, "ddt_decoder_depth", 0) <= 0:
+            raise ValueError(
+                "encoder_reuse_steps > 1 needs a DDT model (ddt_decoder_depth > 0); "
+                "a dense model recomputes the full stack every step."
+            )
+        encoder_cache = EncoderStateCache(encoder_reuse_steps)
     latent = torch.randn(
         1,
         config.latent_channels,
@@ -163,6 +214,8 @@ def sample_latent(
                 cfg_interval=cfg_interval,
                 cond_input=cond_input,
                 image_cfg_scale=image_cfg_scale,
+                encoder_cache=encoder_cache,
+                refresh_encoder=encoder_cache is None or encoder_cache.refresh_at(index),
             )
             latent = scheduler.step(velocity, sigma, latent, return_dict=True).prev_sample
         return latent
@@ -187,6 +240,8 @@ def sample_latent(
             cfg_interval=cfg_interval,
             cond_input=cond_input,
             image_cfg_scale=image_cfg_scale,
+            encoder_cache=encoder_cache,
+            refresh_encoder=encoder_cache is None or encoder_cache.refresh_at(index),
         )
         if sampler == "euler":
             latent = latent - velocity * dt
@@ -207,6 +262,10 @@ def sample_latent(
                 cfg_interval=cfg_interval,
                 cond_input=cond_input,
                 image_cfg_scale=image_cfg_scale,
+                encoder_cache=encoder_cache,
+                # Heun's corrector is the same step: reuse the z just computed above
+                # rather than paying a second encode within one step.
+                refresh_encoder=False,
             )
             latent = latent - 0.5 * dt * (velocity + next_velocity)
         else:
@@ -214,4 +273,4 @@ def sample_latent(
     return latent
 
 
-__all__ = ["predict_velocity", "sample_latent"]
+__all__ = ["EncoderStateCache", "predict_velocity", "sample_latent"]

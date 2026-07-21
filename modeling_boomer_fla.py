@@ -2058,6 +2058,80 @@ class BoomerFLADiT(nn.Module):
         attention_mask = torch.where(drop_mask, null_mask, attention_mask)
         return text_embedding, attention_mask
 
+    def _build_model_input(
+        self,
+        noisy_latent: torch.Tensor,
+        cond_input: torch.Tensor | None,
+        batch: int,
+        height: int,
+        width: int,
+    ) -> torch.Tensor:
+        """Concat the FLUX-Fill reserved channels (or zeros) onto the noisy latent."""
+        if self.config.extra_input_channels > 0:
+            if cond_input is None:
+                cond_input = noisy_latent.new_zeros(
+                    batch, self.config.extra_input_channels, height, width
+                )
+            elif cond_input.shape[1] != self.config.extra_input_channels:
+                raise ValueError(
+                    f"cond_input must have {self.config.extra_input_channels} channels, "
+                    f"got {tuple(cond_input.shape)}"
+                )
+            return torch.cat([noisy_latent, cond_input], dim=1)
+        if cond_input is not None:
+            raise ValueError("cond_input given but extra_input_channels=0")
+        return noisy_latent
+
+    def _ddt_decode(
+        self,
+        model_input: torch.Tensor,
+        z: torch.Tensor,
+        t_emb: torch.Tensor,
+        *,
+        token_height: int,
+        token_width: int,
+        use_ckpt: bool,
+    ) -> torch.Tensor:
+        """DDT velocity decoder: re-embed the noisy latent, run the decoder blocks under
+        the shared semantic state s = silu(t + z), and project to velocity.
+
+        ``z`` is the condition encoder's output (pre-silu). Passing a cached z here is
+        exactly encoder amortization — the 22 encoder blocks are skipped while t stays
+        current (s recombines the cached z with THIS step's t_emb), so a sampler can
+        reuse one z across several adjacent steps and pay only the ~6/28-block decoder.
+        """
+        batch = model_input.shape[0]
+        channels = self.config.latent_channels
+        height = token_height * self.patch_size
+        width = token_width * self.patch_size
+        token_count = token_height * token_width
+        s = F.silu(z + t_emb.unsqueeze(1))
+        if self.patch_size == 1:
+            x = self.decoder_x_embedder(model_input.flatten(2).transpose(1, 2))
+        else:
+            x = self.decoder_x_embedder(model_input).flatten(2).transpose(1, 2)
+        if self.pos_embed is not None:
+            x = x + self.pos_embed
+        for block in self.decoder_blocks:
+            if use_ckpt:
+                def _dec_fn(y, ss, _blk=block, h=token_height, w=token_width):
+                    return _blk(y, ss, height=h, width=w)
+                x = _ckpt(_dec_fn, x, s, use_reentrant=False, preserve_rng_state=False)
+            else:
+                x = block(x, s, height=token_height, width=token_width)
+        # DDT FinalLayer(x, s): token-wise modulation from s. Only the Linear half of
+        # final_t_block runs (s is already silu-activated), matching the official head.
+        final_mod = self.final_t_block[1](s)
+        shift, scale = final_mod.reshape(batch, token_count, 2, -1).unbind(dim=2)
+        x = modulate(self.final_norm(x), shift, scale)
+        x = self.out_proj(x)
+        if self.patch_size == 1:
+            return x.transpose(1, 2).reshape(batch, channels, height, width)
+        patch = self.patch_size
+        x = x.reshape(batch, token_height, token_width, channels, patch, patch)
+        x = x.permute(0, 3, 1, 4, 2, 5).contiguous()
+        return x.reshape(batch, channels, height, width)
+
     def forward(
         self,
         noisy_latent: torch.Tensor,
@@ -2067,6 +2141,8 @@ class BoomerFLADiT(nn.Module):
         cond_input: torch.Tensor | None = None,
         return_repa: bool = False,
         return_dispersive: bool = False,
+        encoder_state: torch.Tensor | None = None,
+        return_encoder_state: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         batch, channels, height, width = noisy_latent.shape
         if channels != self.config.latent_channels:
@@ -2085,6 +2161,35 @@ class BoomerFLADiT(nn.Module):
                 f"absolute pos_embed expects {self.pos_embed.shape[1]} latent tokens, got {token_count}. "
                 "Disable it with --no-abs-pos-embed for variable latent sizes."
             )
+
+        # Encoder amortization (DDT only): reuse a cached condition-encoder output z
+        # across adjacent sampling steps. When encoder_state is supplied we skip the 22
+        # encoder blocks (and the whole text/caption path) and go straight to the decoder;
+        # s = silu(t + z) still uses THIS step's t, so only the semantic encode is reused.
+        if encoder_state is not None or return_encoder_state:
+            if self.decoder_x_embedder is None:
+                raise ValueError(
+                    "encoder_state / return_encoder_state require a DDT model "
+                    "(ddt_decoder_depth > 0); a dense model has no separable encoder output."
+                )
+        if encoder_state is not None:
+            if return_repa or return_dispersive:
+                raise ValueError("encoder_state is inference-only; not compatible with REPA/dispersive returns")
+            expected = (batch, token_count, self.config.hidden_dim)
+            if tuple(encoder_state.shape) != expected:
+                raise ValueError(
+                    f"encoder_state shape {tuple(encoder_state.shape)} must be {expected} "
+                    "(batch, token_count, hidden_dim); a cache built at a different batch/size cannot be reused"
+                )
+            model_input = self._build_model_input(noisy_latent, cond_input, batch, height, width)
+            t_emb = self.t_embedder(timesteps)
+            out = self._ddt_decode(
+                model_input, encoder_state, t_emb,
+                token_height=token_height, token_width=token_width,
+                use_ckpt=self.config.gradient_checkpointing and self.training,
+            )
+            return out
+
         if text_embedding.shape[-1] != self.config.text_dim:
             raise ValueError(f"text_embedding last dim must be {self.config.text_dim}, got {text_embedding.shape[-1]}")
 
@@ -2094,21 +2199,7 @@ class BoomerFLADiT(nn.Module):
 
         # FLUX-Fill-style reserved channels: concat conditioning (or zeros) onto the
         # noisy latent before embedding. Zeros => behaviorally identical to no conditioning.
-        if self.config.extra_input_channels > 0:
-            if cond_input is None:
-                cond_input = noisy_latent.new_zeros(
-                    batch, self.config.extra_input_channels, height, width
-                )
-            elif cond_input.shape[1] != self.config.extra_input_channels:
-                raise ValueError(
-                    f"cond_input must have {self.config.extra_input_channels} channels, "
-                    f"got {tuple(cond_input.shape)}"
-                )
-            model_input = torch.cat([noisy_latent, cond_input], dim=1)
-        elif cond_input is not None:
-            raise ValueError("cond_input given but extra_input_channels=0")
-        else:
-            model_input = noisy_latent
+        model_input = self._build_model_input(noisy_latent, cond_input, batch, height, width)
 
         if self.patch_size == 1:
             x = model_input.flatten(2).transpose(1, 2)
@@ -2233,51 +2324,37 @@ class BoomerFLADiT(nn.Module):
                 # Pool image tokens -> per-sample feature; dispersion is computed in the
                 # loss. No projector: the regularizer acts on the raw hidden state.
                 dispersive_feat = x.mean(dim=1)
-        s: torch.Tensor | None = None
         if self.decoder_x_embedder is not None:
-            # v7 DDT: the encoder output z becomes ONE shared semantic state
-            # s = silu(t + z), computed once (official DDT form) and fed to every decoder
-            # block and the head — one saved silu activation instead of one per site.
-            # The velocity decoder restarts from a fresh embedding of the (conditioned)
-            # noisy latent and reads s token-wise through each block's adaLN.
-            s = F.silu(x + t_emb.unsqueeze(1))
-            if self.patch_size == 1:
-                x = self.decoder_x_embedder(model_input.flatten(2).transpose(1, 2))
-            else:
-                x = self.decoder_x_embedder(model_input).flatten(2).transpose(1, 2)
-            if self.pos_embed is not None:
-                x = x + self.pos_embed
-            for block in self.decoder_blocks:
-                if use_ckpt:
-                    def _dec_fn(y, ss, _blk=block, h=token_height, w=token_width):
-                        return _blk(y, ss, height=h, width=w)
-                    x = _ckpt(_dec_fn, x, s,
-                              use_reentrant=False, preserve_rng_state=False)
-                else:
-                    x = block(x, s, height=token_height, width=token_width)
-        if s is not None:
-            # DDT FinalLayer(x, s): token-wise modulation from s. Only the Linear half of
-            # final_t_block runs (s is already silu-activated), so the parameters and the
-            # computation match the official head exactly.
-            final_mod = self.final_t_block[1](s)
-            shift, scale = final_mod.reshape(batch, token_count, 2, -1).unbind(dim=2)
+            # v7 DDT: the encoder output z is the semantic state carrier. _ddt_decode
+            # re-embeds the noisy latent and runs the 6 decoder blocks under s=silu(t+z).
+            # The same z is what an amortizing sampler caches and feeds back as
+            # encoder_state on later steps (see the fast path at the top of forward).
+            z = x
+            out = self._ddt_decode(
+                model_input, z, t_emb,
+                token_height=token_height, token_width=token_width, use_ckpt=use_ckpt,
+            )
         else:
+            z = None
             final_mod = self.final_t_block(t_emb)
             shift, scale = final_mod.reshape(batch, 2, -1).chunk(2, dim=1)
-        x = modulate(self.final_norm(x), shift, scale)
-        x = self.out_proj(x)
-        if self.patch_size == 1:
-            out = x.transpose(1, 2).reshape(batch, channels, height, width)
-        else:
-            patch = self.patch_size
-            x = x.reshape(batch, token_height, token_width, channels, patch, patch)
-            x = x.permute(0, 3, 1, 4, 2, 5).contiguous()
-            out = x.reshape(batch, channels, height, width)
+            x = modulate(self.final_norm(x), shift, scale)
+            x = self.out_proj(x)
+            if self.patch_size == 1:
+                out = x.transpose(1, 2).reshape(batch, channels, height, width)
+            else:
+                patch = self.patch_size
+                x = x.reshape(batch, token_height, token_width, channels, patch, patch)
+                x = x.permute(0, 3, 1, 4, 2, 5).contiguous()
+                out = x.reshape(batch, channels, height, width)
         # Return contract (kept backward-compatible for existing callers):
+        #   return_encoder_state        -> (out, z)   [DDT only; inference amortization]
         #   return_repa only            -> (out, repa_feat)
         #   return_dispersive only      -> (out, dispersive_feat)
         #   both                        -> (out, repa_feat, dispersive_feat)
         #   neither                     -> out
+        if return_encoder_state:
+            return out, z
         if return_repa and return_dispersive:
             return out, repa_feat, dispersive_feat
         if return_repa:
