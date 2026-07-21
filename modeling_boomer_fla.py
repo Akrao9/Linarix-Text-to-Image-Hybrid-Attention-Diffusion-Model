@@ -1725,11 +1725,20 @@ class BoomerFLADDTDecoderBlock(nn.Module):
             raise ValueError(f"s shape {tuple(s.shape)} must match decoder tokens {(batch, tokens)}")
         # Per-token modulation, (B, T, 6, D). scale_shift_table is a per-CHANNEL constant
         # broadcast over (B, T) — the same role as cond_mod's bias — so fold it into the
-        # bias rather than materializing a second (B, T, 6, D) tensor for `table + mod`.
-        # Each of those is ~190 MiB at B=56/T=256/D=1152 and is held for backward, so this
-        # halves the decoder's modulation memory (~1.1 GiB over 6 blocks) and drops one
-        # elementwise kernel per block. Both parameters are kept (checkpoint layout and
-        # their distinct inits are unchanged); only where they are summed moves.
+        # bias rather than materializing a second (B, T, 6, D) tensor for the table add.
+        #
+        # Size of the win, honestly: the SUM `table + mod` is retained for backward (its
+        # unbind views feed the modulate/gate multiplies, which save their operands), but
+        # the raw linear output `mod` is NOT (Linear's backward needs s and W, not its
+        # output; Add's backward saves neither operand). So the old form cost one extra
+        # TRANSIENT buffer in the block currently executing, not one per block: ~189 MiB
+        # at B=56/T=256/D=1152, against 6 x 189 MiB persistent either way. Under
+        # torch.compile the saving may be ~0, since Inductor can already fuse a broadcast
+        # bias-add into the matmul epilogue. Treat 189 MiB as an upper bound — this is a
+        # free tidy-up, NOT an OOM remedy (gradient checkpointing is that).
+        #
+        # Both parameters are kept (checkpoint layout and their distinct inits are
+        # unchanged); only where they are summed moves.
         mod = F.linear(
             s, self.cond_mod.weight, self.cond_mod.bias + self.scale_shift_table.reshape(-1)
         ).reshape(batch, tokens, 6, -1)
