@@ -301,12 +301,18 @@ class QwenReferenceEncoder(nn.Module):
         )
         # output_hidden_states makes HF retain EVERY layer output simultaneously
         # (~100 MiB each at B=64/L=320/D=2560 bf16, so multiple GB for ~36 layers) when
-        # we read exactly one of them. On the truncated base-model path that one is the
-        # last entry, and the final norm is an Identity, so last_hidden_state is
-        # bit-identical — request the states only when we actually have to index them.
-        # The full model returns CausalLM output with no last_hidden_state, so it always
-        # needs the flag (including the fallback retry below).
-        want_hidden = not (self._truncated_to_last and runner is not model)
+        # we read exactly one of them. The base model always returns last_hidden_state,
+        # and that IS our readout in both configurations:
+        #   * truncated  -> the stack ends at the readout and the final norm is Identity,
+        #     so last_hidden_state == hidden_states[readout_layer], bit-identical;
+        #   * final-layer readout -> last_hidden_state is the post-final-norm output,
+        #     which is exactly what the readout below prefers anyway (hidden_states[-1]
+        #     being normed is version-dependent; last_hidden_state is not).
+        # Only an intermediate readout we failed to truncate needs the states indexed.
+        # The full model returns CausalLM output with no last_hidden_state, so that
+        # runner always needs the flag (including the fallback retry below).
+        base_runner = runner is not model
+        want_hidden = not (base_runner and (self._truncated_to_last or self._readout_is_final))
         try:
             out = runner(**inputs, output_hidden_states=want_hidden, use_cache=False, return_dict=True)
         except Exception:
@@ -317,7 +323,8 @@ class QwenReferenceEncoder(nn.Module):
             else:
                 raise
         if not want_hidden:
-            # Truncated base-model path: readout == last layer, final norm is Identity.
+            # Base-model path where last_hidden_state IS the readout: truncated (final
+            # norm neutralized) or a genuine final-layer readout (post-final-norm).
             hidden_states = out.last_hidden_state
         elif self._readout_is_final and getattr(out, "last_hidden_state", None) is not None:
             # Post-final-norm output: matches the validated cache (abs-max ~72) regardless

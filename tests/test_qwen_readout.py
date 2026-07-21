@@ -108,9 +108,11 @@ def test_truncated_readout_is_bit_identical_to_indexing_hidden_states() -> None:
     assert torch.equal(new_hidden, torch.full((1, SEQ, HIDDEN), float(LAYERS - 1)))
 
 
-def test_untruncated_readout_still_requests_hidden_states() -> None:
-    """Reading the genuine final layer leaves the real norm in place, so the flag must
-    stay on for the paths that index hidden_states."""
+def test_untruncated_final_readout_also_skips_hidden_states() -> None:
+    """A genuine final-layer readout keeps the real norm, but last_hidden_state is the
+    post-final-norm output the readout wants anyway — so the flag is unnecessary here
+    too, and skipping it also removes any chance of drifting onto the version-dependent
+    hidden_states[-1]."""
     enc, full, calls = _encoder(readout_layer=-1)
     enc._truncate_to_readout(full)
 
@@ -118,8 +120,25 @@ def test_untruncated_readout_still_requests_hidden_states() -> None:
     assert len(full.model.layers) == LAYERS
     assert not isinstance(full.model.norm, nn.Identity)
 
-    enc(["a prompt"])
+    hidden, _ = enc(["a prompt"])
+    assert calls == [("base", False)]
+    # Post-final-norm, not the raw last layer.
+    expected = full.model.norm(_states(LAYERS + 1)[-1])
+    assert torch.equal(hidden, expected)
+
+
+def test_untruncatable_intermediate_readout_still_requests_hidden_states() -> None:
+    """If truncation could not find the layer stack, an intermediate readout genuinely
+    has to index hidden_states — the optimization must not swallow that case."""
+    enc, full, calls = _encoder(readout_layer=-2)
+    # Never truncated: _truncated_to_last stays False. Force the intermediate-readout
+    # branch the way a structure we failed to recognize would leave it.
+    enc._readout_is_final = False
+    enc.config.readout_layer = LAYERS - 1
+
+    hidden, _ = enc(["a prompt"])
     assert calls == [("base", True)]
+    assert torch.equal(hidden, torch.full((1, SEQ, HIDDEN), float(LAYERS - 1)))
 
 
 def test_full_model_fallback_requests_hidden_states() -> None:
