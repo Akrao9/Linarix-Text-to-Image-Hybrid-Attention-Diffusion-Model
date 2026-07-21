@@ -1723,11 +1723,17 @@ class BoomerFLADDTDecoderBlock(nn.Module):
         batch, tokens, _ = y.shape
         if s.shape[:2] != (batch, tokens):
             raise ValueError(f"s shape {tuple(s.shape)} must match decoder tokens {(batch, tokens)}")
-        # (B, T, 6, D): per-token modulation from the shared semantic state.
-        mod = self.cond_mod(s).reshape(batch, tokens, 6, -1)
-        shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp = (
-            self.scale_shift_table[None, None] + mod
-        ).unbind(dim=2)
+        # Per-token modulation, (B, T, 6, D). scale_shift_table is a per-CHANNEL constant
+        # broadcast over (B, T) — the same role as cond_mod's bias — so fold it into the
+        # bias rather than materializing a second (B, T, 6, D) tensor for `table + mod`.
+        # Each of those is ~190 MiB at B=56/T=256/D=1152 and is held for backward, so this
+        # halves the decoder's modulation memory (~1.1 GiB over 6 blocks) and drops one
+        # elementwise kernel per block. Both parameters are kept (checkpoint layout and
+        # their distinct inits are unchanged); only where they are summed moves.
+        mod = F.linear(
+            s, self.cond_mod.weight, self.cond_mod.bias + self.scale_shift_table.reshape(-1)
+        ).reshape(batch, tokens, 6, -1)
+        shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp = mod.unbind(dim=2)
         y = y + gate_attn * self.sandwich_attn(
             self.attn(self._norm_mod(self.norm1, y, shift_attn, scale_attn))
         )

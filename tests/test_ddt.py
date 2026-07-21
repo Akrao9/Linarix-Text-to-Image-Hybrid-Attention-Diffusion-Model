@@ -274,6 +274,44 @@ def test_train_cli_wires_ddt_norm_impl() -> None:
     assert train_module.build_config(args_default, record=None).ddt_norm_impl == "native"
 
 
+def test_decoder_modulation_matches_explicit_table_add() -> None:
+    """The fused-bias modulation must equal the explicit `scale_shift_table + mod` form.
+
+    Folding the table into cond_mod's bias avoids a second (B, T, 6, D) allocation (the
+    OOM-relevant one: ~190 MiB per tensor at training shapes). Only the summation order
+    changes — (Ws+b)+t becomes Ws+(b+t) — so this is exact up to float reassociation.
+    """
+    config = _config()
+    block = BoomerFLADDTDecoderBlock(config, layer_idx=4).eval()
+    torch.nn.init.normal_(block.cond_mod.weight, std=0.02)
+    torch.nn.init.normal_(block.cond_mod.bias, std=0.02)
+    torch.nn.init.normal_(block.scale_shift_table, std=0.02)
+
+    batch, tokens = 2, config.latent_size ** 2
+    s = torch.randn(batch, tokens, config.hidden_dim)
+
+    fused = torch.nn.functional.linear(
+        s, block.cond_mod.weight, block.cond_mod.bias + block.scale_shift_table.reshape(-1)
+    ).reshape(batch, tokens, 6, -1)
+    explicit = block.scale_shift_table[None, None] + block.cond_mod(s).reshape(batch, tokens, 6, -1)
+    assert torch.allclose(fused, explicit, atol=1e-6, rtol=1e-5)
+
+    # Parameters (and therefore checkpoint keys) are untouched by the fusion.
+    names = dict(block.named_parameters())
+    assert "cond_mod.weight" in names and "cond_mod.bias" in names
+    assert names["scale_shift_table"].shape == (6, config.hidden_dim)
+
+    # Gradients still reach BOTH the bias and the table. The sublayer output projections
+    # are zero-init by construction (adaLN-Zero), which would zero every upstream grad —
+    # randomize them so this tests the modulation path, not the deliberate zero start.
+    torch.nn.init.normal_(block.attn.out_proj.weight, std=0.02)
+    torch.nn.init.normal_(block.mlp.point_fc.weight, std=0.02)
+    y = torch.randn(batch, tokens, config.hidden_dim)
+    block(y, s, height=config.latent_size, width=config.latent_size).pow(2).mean().backward()
+    assert block.cond_mod.bias.grad is not None and block.cond_mod.bias.grad.abs().sum() > 0
+    assert block.scale_shift_table.grad is not None and block.scale_shift_table.grad.abs().sum() > 0
+
+
 def test_decoder_block_rejects_mismatched_s() -> None:
     config = _config()
     block = BoomerFLADDTDecoderBlock(config, layer_idx=4)
