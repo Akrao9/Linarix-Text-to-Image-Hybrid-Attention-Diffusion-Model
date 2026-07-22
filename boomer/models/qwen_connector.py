@@ -82,6 +82,11 @@ class QwenReferenceEncoder(nn.Module):
         # directly for hidden-state readout skips the lm_head matmul (B*L*vocab FLOPs)
         # that the full causal-LM forward would otherwise compute and discard.
         self._base_model: nn.Module | None = None
+        # Uncompiled base kept alongside the compiled one (see compile_base_model) so a
+        # compiled-graph failure can drop back to EAGER BASE rather than to the full
+        # CausalLM — that path runs lm_head and materializes ~1 GiB of logits at
+        # B=64/L=57/vocab~152k, which is fatal on a memory-tight run.
+        self._eager_base_model: nn.Module | None = None
         self._base_failed = False
         self._processor: Any | None = None
         self.hidden_size: int | None = None
@@ -233,6 +238,47 @@ class QwenReferenceEncoder(nn.Module):
         print(f"[qwen] truncated encoder to {r_abs}/{n} layers (readout={r_abs}); upper layers + lm_head skipped.")
 
     @property
+    def _base_is_compiled(self) -> bool:
+        return (
+            self._eager_base_model is not None
+            and self._base_model is not None
+            and self._base_model is not self._eager_base_model
+        )
+
+    def compile_base_model(self, *, mode: str = "default") -> bool:
+        """torch.compile the truncated BASE transformer (opt-in, off by default).
+
+        Only the base model is compiled: text-only training never runs the CausalLM
+        head, so compiling the wrapper would specialize a graph we never execute.
+
+        ``dynamic=True`` is required, not optional. Captions are padded to the batch's
+        longest (``pad_to_max_length`` defaults to False, and should STAY false — at the
+        observed ~57 tokens vs a 320 cap, forcing static 320 would be ~5.6x the Qwen
+        compute and activation memory, far more than compilation can return). Batch size
+        also varies if CFG-dropped captions are ever skipped before encoding.
+
+        ``mode="default"`` deliberately: reduce-overhead/max-autotune enable CUDA graphs
+        and workspace caching, which pin extra GPU memory — the opposite of what a
+        memory-tight run wants.
+
+        Call AFTER load() (truncation) and after moving to the target device. Returns
+        whether compilation was applied.
+        """
+        if self._base_model is None:
+            print("[qwen] no base model to compile (full-model path); skipping", flush=True)
+            return False
+        if self._base_is_compiled:
+            return True
+        self._eager_base_model = self._base_model
+        self._base_model = torch.compile(self._base_model, mode=mode, dynamic=True)
+        print(
+            f"[qwen] compiled base transformer (mode={mode}, dynamic=True); "
+            "eager base retained for fallback",
+            flush=True,
+        )
+        return True
+
+    @property
     def model(self) -> nn.Module:
         if self._model is None:
             self.load()
@@ -315,8 +361,22 @@ class QwenReferenceEncoder(nn.Module):
         want_hidden = not (base_runner and (self._truncated_to_last or self._readout_is_final))
         try:
             out = runner(**inputs, output_hidden_states=want_hidden, use_cache=False, return_dict=True)
-        except Exception:
-            if runner is not model:
+        except Exception as exc:
+            if base_runner and self._base_is_compiled and runner is self._base_model:
+                # A compiled-graph failure must NOT skip to the full CausalLM: that path
+                # runs lm_head (~1 GiB of logits at B=64/L=57/vocab~152k) and would stay
+                # on it for the rest of the run. Drop compilation, keep the eager base.
+                print(
+                    f"[qwen] compiled base failed ({type(exc).__name__}); "
+                    "falling back to the eager base for the rest of the run",
+                    flush=True,
+                )
+                self._base_model = self._eager_base_model
+                self._eager_base_model = None  # no longer "compiled"; plain base from here
+                out = self._base_model(
+                    **inputs, output_hidden_states=want_hidden, use_cache=False, return_dict=True
+                )
+            elif base_runner:
                 self._base_failed = True  # fall back to the full model for the rest of the run
                 want_hidden = True
                 out = model(**inputs, output_hidden_states=True, use_cache=False, return_dict=True)

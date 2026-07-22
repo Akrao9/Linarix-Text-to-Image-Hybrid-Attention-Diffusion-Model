@@ -200,6 +200,7 @@ class BoomerLit(pl.LightningModule):
         # clip), and out of Lightning's device management (moved lazily on first use).
         self._hf_token = hf_token
         self._text_encoder_box: list[QwenReferenceEncoder] = []
+        self._text_encoder_compiled = False
         # Frozen on-the-fly DC-AE (--edit-direct pixel pairs). Same out-of-tree
         # residency rules as the text encoder box above.
         self._vae_box: list[Any] = []
@@ -234,6 +235,12 @@ class BoomerLit(pl.LightningModule):
         param = next(encoder.model.parameters())
         if param.device != self.device:
             encoder.to(self.device)
+        # Compile AFTER truncation (in load()) and after the device move, so the graph is
+        # traced on the layers/device actually used. Once per process; the encoder tracks
+        # its own compiled state.
+        if self.hparams.get("compile_text_encoder") and not self._text_encoder_compiled:
+            encoder.compile_base_model(mode=self.hparams.get("compile_mode", "default"))
+            self._text_encoder_compiled = True
         return encoder
 
     def encode_captions(self, captions: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
@@ -2449,6 +2456,15 @@ def build_parser() -> argparse.ArgumentParser:
                    default="default",
                    help="torch.compile mode. 'default' avoids aggressive Triton autotune candidates "
                         "that can exceed Blackwell's per-SM resource limits.")
+    p.add_argument("--compile-text-encoder", action="store_true",
+                   help="EXPERIMENT (default off): torch.compile the truncated Qwen BASE transformer "
+                        "(dynamic=True; the CausalLM head is never run on the text path). Compiled "
+                        "graphs and workspaces cost extra persistent GPU memory, so do NOT enable it "
+                        "on a memory-tight run -- validate in a separate process first, gating on "
+                        "END-TO-END step time and peak memory, not Qwen-local numbers. Leave "
+                        "--text-encoder-pad-to-max off: captions run ~57 tokens against a 320 cap, so "
+                        "forcing a static shape costs ~5.6x the Qwen compute that compilation is "
+                        "trying to save.")
     return p
 
 
@@ -2696,6 +2712,7 @@ def main() -> None:
         dispersive_anneal_steps=args.dispersive_anneal_steps,
         compile=args.compile,
         compile_mode=args.compile_mode,
+        compile_text_encoder=args.compile_text_encoder,
     )
 
     # Optionally seed the model from a checkpoint's weights without restoring the

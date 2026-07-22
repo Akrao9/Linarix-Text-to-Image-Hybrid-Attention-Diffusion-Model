@@ -141,6 +141,56 @@ def test_untruncatable_intermediate_readout_still_requests_hidden_states() -> No
     assert torch.equal(hidden, torch.full((1, SEQ, HIDDEN), float(LAYERS - 1)))
 
 
+def test_compile_base_model_keeps_eager_for_fallback(monkeypatch) -> None:
+    """compile_base_model wraps only the BASE transformer and retains the eager one."""
+    enc, full, _ = _encoder(readout_layer=-2)
+    enc._truncate_to_readout(full)
+    eager = enc._base_model
+
+    # Real torch.compile returns an OptimizedModule (an nn.Module); the encoder is an
+    # nn.Module too, so _base_model must stay assignable as a child module.
+    sentinel = nn.Identity()
+    monkeypatch.setattr(torch, "compile", lambda m, **kw: sentinel)
+    assert enc.compile_base_model() is True
+    assert enc._base_model is sentinel
+    assert enc._eager_base_model is eager  # kept for fallback
+    assert enc._base_is_compiled is True
+    assert enc.compile_base_model() is True  # idempotent
+    assert enc._eager_base_model is eager
+
+
+def test_compiled_base_failure_falls_back_to_eager_not_causal_lm(monkeypatch) -> None:
+    """A compiled-graph failure must retry the EAGER BASE. Falling through to the full
+    CausalLM would run lm_head (~1 GiB of logits) for the rest of the run."""
+    enc, full, calls = _encoder(readout_layer=-2)
+    enc._truncate_to_readout(full)
+
+    class _Boom(nn.Module):
+        """Stands in for a compiled graph that blows up at call time."""
+
+        def forward(self, **kwargs):
+            raise RuntimeError("inductor exploded")
+
+    monkeypatch.setattr(torch, "compile", lambda m, **kw: _Boom())
+    enc.compile_base_model()
+
+    hidden, _ = enc(["a prompt"])
+    # The eager BASE served the call; the full CausalLM was never touched.
+    assert calls == [("base", False)]
+    assert enc._base_failed is False
+    assert enc._base_is_compiled is False  # compilation permanently dropped
+    assert torch.equal(hidden, torch.full((1, SEQ, HIDDEN), float(LAYERS - 1)))
+
+    enc(["another"])  # subsequent calls stay on the eager base, no re-raise
+    assert calls == [("base", False), ("base", False)]
+
+
+def test_compile_base_model_noop_without_base() -> None:
+    enc, _, _ = _encoder(readout_layer=-2)
+    enc._base_model = None
+    assert enc.compile_base_model() is False
+
+
 def test_full_model_fallback_requests_hidden_states() -> None:
     """The full CausalLM has no last_hidden_state, so that runner always needs the flag
     even though the stack is truncated."""
