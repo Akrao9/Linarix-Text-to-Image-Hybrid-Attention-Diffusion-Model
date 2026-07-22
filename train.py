@@ -980,6 +980,27 @@ class EMACallback(Callback):
         self.ema: dict[str, torch.Tensor] = {}
         # Last global_step an EMA update ran for; see on_train_batch_end.
         self._last_step = -1
+        # Cached (keys, shadow tensors) for the multi-tensor update; see _ema_lists.
+        # MUST be invalidated whenever self.ema is replaced, or the update would keep
+        # writing into the old (detached) tensors while checkpoints save the new dict.
+        self._lists: tuple[list[str], list[torch.Tensor]] | None = None
+
+    def _ema_lists(self, pl_module: pl.LightningModule) -> tuple[list[str], list[torch.Tensor]]:
+        """Key order + shadow tensors aligned for torch._foreach_*, built once.
+
+        Also does the resume device-realign here rather than per-tensor per-step: on
+        resume the shadow is restored on CPU while the model is already on GPU. Every
+        entry is fp32 (built with .float()), so one _foreach group covers them all.
+        """
+        if self._lists is None:
+            device = next(pl_module.model.parameters()).device
+            keys = list(self.ema.keys())
+            for k in keys:
+                v = self.ema[k]
+                if v.device != device:
+                    self.ema[k] = v.to(device)
+            self._lists = (keys, [self.ema[k] for k in keys])
+        return self._lists
 
     def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         if not self.ema:  # fresh run (not resumed)
@@ -988,6 +1009,7 @@ class EMACallback(Callback):
                 for k, v in pl_module.model.state_dict().items()
                 if torch.is_floating_point(v)
             }
+        self._lists = None  # shadow dict may have just been (re)built
         # Provisional anchor; the authoritative one is taken in on_train_start (see there).
         self._last_step = trainer.global_step
 
@@ -1017,15 +1039,19 @@ class EMACallback(Callback):
         self._last_step = step
         if step % self.update_every != 0:
             return
+        # Multi-tensor update. The per-tensor loop this replaces issued mul_ + add_ per
+        # entry -- ~1400+ kernel launches per optimizer step at this size (~708 float
+        # state_dict entries, more with fla_gdn2), which is launch-bound rather than
+        # bandwidth-bound and cost ~7-19 ms/step. _foreach_ collapses that into a handful
+        # of multi-tensor-apply kernels. Arithmetic is unchanged: same decay, same
+        # cadence, still ema = decay*ema + (1-decay)*param, in place.
+        keys, ema_list = self._ema_lists(pl_module)
         sd = pl_module.model.state_dict()
-        for key, ema_v in self.ema.items():
-            target = sd[key].detach().float()
-            if ema_v.device != target.device:
-                # On resume the EMA shadow is restored on CPU while the live model is
-                # already on GPU; realign once (later steps are a cheap device compare).
-                ema_v = ema_v.to(target.device)
-                self.ema[key] = ema_v
-            ema_v.mul_(self.decay).add_(target, alpha=1.0 - self.decay)
+        # .float() is a no-op under bf16-mixed (master params are already fp32) and an
+        # explicit upcast if a config ever holds true low-precision params.
+        targets = [sd[k].detach().float() for k in keys]
+        torch._foreach_mul_(ema_list, self.decay)
+        torch._foreach_add_(ema_list, targets, alpha=1.0 - self.decay)
 
     def on_save_checkpoint(self, trainer, pl_module, checkpoint) -> None:
         checkpoint["ema"] = self.ema
@@ -1041,6 +1067,7 @@ class EMACallback(Callback):
                 print(f"[ema] migrated {n} legacy GLUMBConv entr{'y' if n == 1 else 'ies'}",
                       flush=True)
             self.ema = ema
+            self._lists = None  # shadow replaced; the cached tensor list is now stale
 
 
 class StepUnitProgressBar(TQDMProgressBar):

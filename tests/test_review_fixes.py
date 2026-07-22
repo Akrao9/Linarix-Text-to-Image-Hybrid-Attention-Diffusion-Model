@@ -272,6 +272,65 @@ def test_ema_resume_does_not_spend_an_update_on_prior_weights() -> None:
     assert cb.ema["weight"].flatten()[0].item() == 0.0
 
 
+def test_ema_foreach_matches_per_tensor_reference() -> None:
+    """The multi-tensor update must be arithmetically identical to the per-tensor loop
+    it replaced (same decay, same in-place ema = decay*ema + (1-decay)*param)."""
+    import train
+
+    torch.manual_seed(0)
+    module = _FakeModule(0.0)
+    # Several differently-shaped tensors, as a real state_dict has.
+    module.model = nn.Sequential(nn.Linear(4, 6), nn.LayerNorm(6), nn.Linear(6, 3))
+    trainer = _FakeTrainer()
+
+    cb = train.EMACallback(decay=0.9)
+    cb.on_fit_start(trainer, module)
+    cb.on_train_start(trainer, module)
+
+    reference = {k: v.detach().clone().float() for k, v in module.model.state_dict().items()}
+
+    for _ in range(5):
+        with torch.no_grad():  # perturb the "trained" weights between updates
+            for p in module.model.parameters():
+                p.add_(torch.randn_like(p) * 0.1)
+        trainer.global_step += 1
+        cb.on_train_batch_end(trainer, module, None, None, 0)
+        # per-tensor reference, exactly the pre-foreach formulation
+        sd = module.model.state_dict()
+        for k, ref in reference.items():
+            ref.mul_(0.9).add_(sd[k].detach().float(), alpha=0.1)
+
+    for k, ref in reference.items():
+        assert torch.allclose(cb.ema[k], ref, atol=1e-7, rtol=1e-6), k
+
+
+def test_ema_cached_lists_invalidated_on_checkpoint_load() -> None:
+    """on_load_checkpoint swaps in a NEW shadow dict; if the cached tensor list were not
+    dropped, updates would keep writing into the old tensors while checkpoints saved the
+    new (never-updated) ones."""
+    import train
+
+    module = _FakeModule(0.0)
+    trainer = _FakeTrainer()
+    cb = train.EMACallback(decay=0.5)
+    cb.on_fit_start(trainer, module)
+    cb.on_train_start(trainer, module)
+
+    trainer.global_step += 1
+    cb.on_train_batch_end(trainer, module, None, None, 0)  # builds the cache
+    assert cb._lists is not None
+
+    restored = {k: torch.full_like(v, 5.0) for k, v in cb.ema.items()}
+    cb.on_load_checkpoint(trainer, module, {"ema": restored})
+    assert cb._lists is None  # invalidated
+
+    module.set(1.0)
+    trainer.global_step += 1
+    cb.on_train_batch_end(trainer, module, None, None, 0)
+    # The update must have landed on the RESTORED shadow: 0.5*5 + 0.5*1 = 3.0
+    assert cb.ema["weight"].flatten()[0].item() == pytest.approx(3.0, rel=1e-6)
+
+
 def test_ema_anchor_survives_lightning_restore_ordering() -> None:
     """Lightning restores the loop state (and thus global_step) in
     restore_training_state(), which runs AFTER the on_fit_start hooks. A resumed run
