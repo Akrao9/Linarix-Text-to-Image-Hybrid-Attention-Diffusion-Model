@@ -2189,7 +2189,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mixer-type", default="fla_gdn2",
                    choices=["mamba3", "fla_gated_deltanet", "fla_gdn2", "fla_linear", "fla_gla",
                             "fla_delta_net", "fla_hgrn2", "fla_based", "mlp", "fallback"])
-    p.add_argument("--fla-mode", default="chunk", choices=["chunk", "fused_chunk"])
+    p.add_argument("--fla-mode", default="chunk",
+                   choices=["chunk", "fused_chunk", "fused_recurrent"],
+                   help="FLA kernel mode. Not every mixer accepts every value and the model "
+                        "validates the pair: fla_linear/fla_gla take all three, "
+                        "fla_gated_deltanet takes chunk/fused_recurrent, and fla_gdn2 takes "
+                        "chunk only (FLA asserts chunk-only on the training path).")
     p.add_argument("--fla-feature-map", default="relu")
     p.add_argument("--fla-bidirectional", action=bo, default=True)
     p.add_argument("--use-short-conv", action="store_true")
@@ -2764,7 +2769,14 @@ def main() -> None:
             dirpath=args.checkpoint_dir,
             every_n_train_steps=args.save_every_steps,
             save_top_k=-1,
-            save_last=True,
+            # "link" symlinks last.ckpt at the step file instead of serializing the whole
+            # state a SECOND time. At this size one checkpoint is ~15 GB (fp32 params +
+            # AdamW moments + EMA shadow), so save_last=True doubled every save into a
+            # ~30 GB synchronous stall. Safe against this repo's own bookkeeping: the
+            # pruner skips last.ckpt and keeps the newest --checkpoint-local-retain step
+            # files (so the link target always exists), and the uploader skips it too, so
+            # remote behavior is unchanged. Local filesystems only — which checkpoint_dir is.
+            save_last="link",
             filename="boomer-{step}",
         ),
         LearningRateMonitor(logging_interval="step"),

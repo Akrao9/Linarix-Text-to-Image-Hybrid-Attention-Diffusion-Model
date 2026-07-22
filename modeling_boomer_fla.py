@@ -979,9 +979,33 @@ class SanaMultiHeadCrossAttention(nn.Module):
         return self.proj(out.reshape(batch, image_tokens, channels))
 
 
+# Which fla_mode values each mixer actually accepts (from the FLA layer asserts).
+# GDN/GDN2 do NOT support 'fused_chunk', and GDN2 additionally asserts chunk-only on the
+# training path — Boomer trains the mixer it samples with, so chunk is its only safe mode.
+# Validated here so a wrong --fla-mode fails with a clear message instead of an opaque
+# assert deep in FLA (or, as before for GDN2, being silently ignored).
+FLA_SUPPORTED_MODES: dict[str, tuple[str, ...]] = {
+    "fla_linear": ("chunk", "fused_chunk", "fused_recurrent"),
+    "fla_gla": ("chunk", "fused_chunk", "fused_recurrent"),
+    "fla_gated_deltanet": ("chunk", "fused_recurrent"),
+    "fla_gdn2": ("chunk",),
+}
+
+
 class FLASelfMixer(nn.Module):
     def __init__(self, config: BoomerFLADiTConfig, *, layer_idx: int) -> None:
         super().__init__()
+        supported = FLA_SUPPORTED_MODES.get(config.mixer_type)
+        if supported is not None and config.fla_mode not in supported:
+            raise ValueError(
+                f"fla_mode={config.fla_mode!r} is not supported by mixer_type="
+                f"{config.mixer_type!r}; valid: {', '.join(supported)}"
+                + (
+                    " (GatedDeltaNet2 asserts chunk-only on the training path)"
+                    if config.mixer_type == "fla_gdn2"
+                    else ""
+                )
+            )
         try:
             import fla.layers as fla_layers
         except Exception:
@@ -1025,6 +1049,11 @@ class FLASelfMixer(nn.Module):
                     hidden_size=hidden_dim,
                     num_heads=config.num_heads,
                     head_dim=hidden_dim // config.num_heads,
+                    # GDN2 takes mode like GDN does; it was previously omitted, so
+                    # --fla-mode silently did nothing here and every run got the "chunk"
+                    # default. Passing it makes the flag mean what it says. Behaviorally
+                    # a no-op for --fla-mode chunk (the default it was already using).
+                    mode=config.fla_mode,
                     expand_v=1.0,
                     use_short_conv=config.use_short_conv,
                     conv_size=config.conv_size,
