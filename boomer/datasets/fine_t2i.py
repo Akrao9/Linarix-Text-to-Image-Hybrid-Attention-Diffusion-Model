@@ -24,6 +24,15 @@ Each image is resized short-side -> ``resolution`` and center-cropped to a
 square ``resolution`` x ``resolution`` (randomized aspect ratios collapse to the
 square canvas the DiT's RoPE grid expects). Records are ~3 MB each
 (3 x 1024^2 uint8), so train.py clamps the shuffle buffer in t2i-direct mode.
+
+Subset mixing: ``data_dir`` accepts several subfolders (a comma-separated string
+or a sequence), and ``data_dir_weights`` gives each one a relative draw
+probability -- the nano_mix / ``--monet-weights`` idea for this corpus. Unset
+weights = natural proportions, where a small subset is swamped by a large one
+(fine-t2i's ``curated`` is 168k real photographs against 1.5M synthetic
+renders, so it lands near 10% unless it is weighted up). The mix is built with
+``datasets.interleave_datasets(..., stopping_strategy="all_exhausted")`` so an
+up-weighted small subset recycles instead of ending the epoch early.
 """
 
 from __future__ import annotations
@@ -83,6 +92,39 @@ def _first_field(meta: dict[str, Any], fields: tuple[str, ...]) -> str:
         if val is not None and str(val).strip():
             return str(val).strip()
     return ""
+
+
+def _parse_sources(value: Any) -> tuple[str, ...]:
+    """Normalize ``data_dir`` to a tuple of subfolder names (empty = whole repo)."""
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return tuple(part.strip() for part in value.split(",") if part.strip())
+    return tuple(str(part).strip() for part in value if str(part).strip())
+
+
+def _parse_weights(value: Any, num_sources: int) -> tuple[float, ...] | None:
+    """Validate mixing weights against the resolved subfolder list."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = [part for part in value.split(",") if part.strip()]
+    weights = tuple(float(part) for part in value)
+    if not weights:
+        return None
+    if num_sources < 2:
+        raise ValueError(
+            "data_dir_weights needs at least two data_dir entries to mix; got "
+            f"{num_sources}"
+        )
+    if len(weights) != num_sources:
+        raise ValueError(
+            f"data_dir_weights has {len(weights)} weights for {num_sources} data_dir "
+            "entries; they must align 1:1"
+        )
+    if min(weights) < 0 or sum(weights) <= 0:
+        raise ValueError("data_dir_weights must be non-negative with a positive sum")
+    return weights
 
 
 def _to_image(value: Any) -> Image.Image | None:
@@ -196,7 +238,11 @@ class FineT2IStreamingDataset(IterableDataset):
     repo_id: str = DEFAULT_T2I_REPO
     split: str = "train"
     config_name: str | None = None
-    data_dir: str | None = None
+    # One subfolder, or several to mix: a comma-separated string or a sequence.
+    data_dir: Any = None
+    # Relative draw probabilities aligned 1:1 with the data_dir entries; None =
+    # natural proportions (each subfolder contributes in proportion to its size).
+    data_dir_weights: Any = None
     data_files: Any = None
     hf_token: str | bool | None = None
     resolution: int = 1024
@@ -212,6 +258,8 @@ class FineT2IStreamingDataset(IterableDataset):
     rank: int | None = None
     world_size: int | None = None
     _caption_rng: random.Random = field(init=False, repr=False)
+    _sources: tuple[str, ...] = field(init=False, repr=False, default=())
+    _weights: tuple[float, ...] | None = field(init=False, repr=False, default=None)
 
     def __post_init__(self) -> None:
         if self.caption_mode not in _CAPTION_MODES:
@@ -220,15 +268,22 @@ class FineT2IStreamingDataset(IterableDataset):
             )
         if not 0.0 <= self.short_prob <= 1.0:
             raise ValueError(f"short_prob must be in [0, 1], got {self.short_prob}")
+        self._sources = _parse_sources(self.data_dir)
+        self._weights = _parse_weights(self.data_dir_weights, len(self._sources))
+        if len(self._sources) > 1 and self.data_files is not None:
+            raise ValueError(
+                "data_files applies to a single stream; it cannot be combined with a "
+                "multi-entry data_dir mix"
+            )
         self._caption_rng = random.Random(self.seed)
 
-    def _load_stream(self):
+    def _load_one(self, data_dir: str | None):
         from datasets import load_dataset
 
         token = self.hf_token if isinstance(self.hf_token, str) else None
         kwargs: dict[str, Any] = {}
-        if self.data_dir is not None:
-            kwargs["data_dir"] = self.data_dir  # restrict to one subfolder of shards
+        if data_dir is not None:
+            kwargs["data_dir"] = data_dir  # restrict to one subfolder of shards
         if self.data_files is not None:
             kwargs["data_files"] = self.data_files
         return load_dataset(
@@ -238,6 +293,32 @@ class FineT2IStreamingDataset(IterableDataset):
             streaming=True,
             token=token,
             **kwargs,
+        )
+
+    def _load_stream(self, *, seed_salt: int = 0):
+        """One subfolder's stream, or a weighted row-level mix of several.
+
+        ``stopping_strategy="all_exhausted"`` keeps an up-weighted small subset
+        recycling until the largest one is spent, instead of "first_exhausted"
+        ending the pass as soon as the smallest runs dry (fine-t2i's curated set
+        is ~9x smaller than the synthetic square split, so first_exhausted would
+        cut every epoch to curated's length).
+        """
+        if len(self._sources) <= 1:
+            return self._load_one(self._sources[0] if self._sources else None)
+
+        from datasets import interleave_datasets
+
+        streams = [self._load_one(source) for source in self._sources]
+        probabilities = None
+        if self._weights is not None:
+            total = sum(self._weights)
+            probabilities = [weight / total for weight in self._weights]
+        return interleave_datasets(
+            streams,
+            probabilities=probabilities,
+            seed=self.seed + seed_salt,
+            stopping_strategy="all_exhausted",
         )
 
     def _sharded_stream(self):
@@ -250,13 +331,15 @@ class FineT2IStreamingDataset(IterableDataset):
         are fewer shards than workers, so guard on ``n_shards`` and fall back to
         row-stride sharding (islice) when the file split is unsafe.
         """
-        ds = self._load_stream()
+        worker = get_worker_info()
+        salt = worker.id if worker is not None else 0
+        # Salt the mix RNG per worker so two workers do not draw the same subset
+        # sequence from the weighted interleave.
+        ds = self._load_stream(seed_salt=salt)
         if self.world_size and self.world_size > 1:
             from datasets.distributed import split_dataset_by_node
 
             ds = split_dataset_by_node(ds, rank=self.rank or 0, world_size=self.world_size)
-        worker = get_worker_info()
-        salt = worker.id if worker is not None else 0
         if self.shuffle_buffer > 0 and hasattr(ds, "shuffle"):
             ds = ds.shuffle(seed=self.seed + salt, buffer_size=self.shuffle_buffer)
         if worker is not None and worker.num_workers > 1:

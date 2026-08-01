@@ -741,6 +741,7 @@ class BoomerData(pl.LightningDataModule):
         t2i_repo: str = DEFAULT_T2I_REPO,
         t2i_config: str | None = None,
         t2i_data_dir: str | None = None,
+        t2i_weights: str | None = None,
         t2i_split: str = "train",
         t2i_resolution: int = 1024,
         t2i_caption_mode: str = "sample",
@@ -762,6 +763,7 @@ class BoomerData(pl.LightningDataModule):
         self.t2i_repo = t2i_repo
         self.t2i_config = t2i_config
         self.t2i_data_dir = t2i_data_dir
+        self.t2i_weights = t2i_weights
         self.t2i_split = t2i_split
         self.t2i_resolution = t2i_resolution
         self.t2i_caption_mode = t2i_caption_mode
@@ -828,6 +830,7 @@ class BoomerData(pl.LightningDataModule):
                 repo_id=self.t2i_repo,
                 config_name=self.t2i_config,
                 data_dir=self.t2i_data_dir,
+                data_dir_weights=self.t2i_weights,
                 split=self.t2i_split,
                 hf_token=self.hf_token,
                 resolution=self.t2i_resolution,
@@ -1621,6 +1624,7 @@ class CheckpointUploadCallback(Callback):
         self._q: queue.Queue = queue.Queue()
         self._uploaded: set[str] = set()       # filenames confirmed on the remote
         self._enqueued: set[str] = set()        # filenames already handed to the worker
+        self._inflight: str | None = None       # filename the worker is copying RIGHT NOW
         self._lock = threading.Lock()
         self._worker: threading.Thread | None = None
         self._stop = threading.Event()
@@ -1651,6 +1655,11 @@ class CheckpointUploadCallback(Callback):
                 path = self._q.get(timeout=1.0)
             except queue.Empty:
                 continue
+            # Publish the in-flight name so finalize_uploads() can tell "not uploaded
+            # yet" from "being uploaded right now" and never write the same destination
+            # concurrently with this thread.
+            with self._lock:
+                self._inflight = Path(path).name
             try:
                 self._upload_one(Path(path))
                 with self._lock:
@@ -1665,6 +1674,8 @@ class CheckpointUploadCallback(Callback):
                     self._enqueued.discard(Path(path).name)
                 print(f"[ckpt-upload] FAILED {Path(path).name} (will retry): {exc}", flush=True)
             finally:
+                with self._lock:
+                    self._inflight = None
                 self._q.task_done()
 
     def _upload_one(self, local: Path) -> None:
@@ -1844,25 +1855,66 @@ class CheckpointUploadCallback(Callback):
         self._stop.set()
         self._worker.join(timeout=30.0)
 
-    def finalize_uploads(self, trainer) -> None:
+    def finalize_uploads(self, trainer, *, worker_grace: float = 900.0) -> None:
         """Synchronously ensure every local step checkpoint is on the remote.
 
         Safe to call from the main thread after fit(). Lightning's on_fit_end async drain
         can be pre-empted by the DataLoader-teardown crash (the final checkpoint is saved
         locally but its Drive copy is killed mid-flight), and the os._exit() fast-path would
         kill the worker thread too — so this is the reliable last flush before exit.
+
+        ``worker_grace`` is deliberately long: one checkpoint is ~15 GB, and a Drive /
+        rclone copy of that routinely runs for many minutes. The old 120 s timeout
+        returned while the worker was STILL copying (it is a daemon thread, so nothing
+        stopped it), and because a file only enters ``_uploaded`` AFTER its copy returns,
+        the synchronous pass below then wrote the same destination concurrently — two
+        writers on one path, i.e. a truncated/corrupt remote checkpoint, and most likely
+        on the newest file. If the grace still expires we skip the in-flight file rather
+        than race it: leaving it to the (still running) worker can only succeed or leave
+        it absent, never corrupt.
         """
         if getattr(trainer, "global_rank", 0) != 0:
             return
         # Stop the async worker, letting it finish any in-flight copy first.
         if self._worker is not None:
             self._stop.set()
-            self._worker.join(timeout=120.0)
-            self._worker = None
-        # Synchronously copy anything not yet confirmed on the remote (worker has exited,
-        # so no concurrent copy of the same file).
+            # Take everything still QUEUED away from the worker before waiting. _stop
+            # alone does not stop it pulling more work (its loop exits only once the
+            # queue is ALSO empty), so without this it keeps starting fresh copies past
+            # the grace and races the synchronous pass below on those files too — not
+            # just on the one in flight.
+            drained = 0
+            while True:
+                try:
+                    self._q.get_nowait()
+                except queue.Empty:
+                    break
+                self._q.task_done()
+                drained += 1
+            if drained:
+                print(f"[ckpt-upload] reclaimed {drained} queued upload(s) from the "
+                      "worker; flushing them synchronously", flush=True)
+            with self._lock:
+                pending = self._inflight
+            if pending is not None:
+                print(f"[ckpt-upload] waiting up to {worker_grace:.0f}s for the in-flight "
+                      f"copy of {pending} to finish...", flush=True)
+            self._worker.join(timeout=worker_grace)
+            if self._worker.is_alive():
+                with self._lock:
+                    stuck = self._inflight
+                print(f"[ckpt-upload] worker STILL copying {stuck or '?'} after "
+                      f"{worker_grace:.0f}s; leaving it to that thread and skipping it "
+                      "here (racing it would corrupt the remote copy)", flush=True)
+            else:
+                self._worker = None
+        # Synchronously copy anything not yet confirmed on the remote, except a file the
+        # worker thread may still be writing (see the grace note above).
         for ckpt in sorted(self._local_step_ckpts(), key=lambda p: p.stat().st_mtime):
-            if ckpt.name in self._uploaded:
+            with self._lock:
+                already_done = ckpt.name in self._uploaded
+                being_copied = ckpt.name == self._inflight
+            if already_done or being_copied:
                 continue
             try:
                 self._upload_one(ckpt)
@@ -2135,9 +2187,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--t2i-config", default=None,
                    help="dataset config name (unset = default config).")
     p.add_argument("--t2i-data-dir", default=None,
-                   help="restrict streaming to one subfolder of shards, e.g. "
+                   help="subfolder of shards to stream, e.g. "
                         "synthetic_enhanced_prompt_square_resolution (square 1024 canvases "
-                        "with enhanced prompts — no crop loss).")
+                        "with enhanced prompts — no crop loss). COMMA-SEPARATED to mix "
+                        "several, e.g. 'synthetic_enhanced_prompt_square_resolution,curated'; "
+                        "weight them with --t2i-weights. Note fine-t2i's json carries BOTH "
+                        "'prompt' and 'enhanced_prompt' per row, so the enhanced folder alone "
+                        "already feeds --t2i-caption-mode sample — the original_prompt folder "
+                        "is redundant.")
+    p.add_argument("--t2i-weights", default=None,
+                   help="comma-separated mixing weights aligned 1:1 with --t2i-data-dir "
+                        "entries (e.g. '0.75,0.25'). Unset = natural proportions, where a "
+                        "small subset is swamped: fine-t2i's curated (168k real photographs) "
+                        "lands near 10% against the 1.5M synthetic renders unless weighted up.")
     p.add_argument("--t2i-split", default="train", help="dataset split to stream.")
     p.add_argument("--t2i-resolution", type=int, default=1024,
                    help="square training resolution (short side resized, center-cropped).")
@@ -2773,6 +2835,7 @@ def main() -> None:
         t2i_repo=args.t2i_repo,
         t2i_config=args.t2i_config,
         t2i_data_dir=args.t2i_data_dir,
+        t2i_weights=args.t2i_weights,
         t2i_split=args.t2i_split,
         t2i_resolution=args.t2i_resolution,
         t2i_caption_mode=args.t2i_caption_mode,
