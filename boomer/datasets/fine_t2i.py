@@ -41,7 +41,6 @@ import io
 import json as _json
 import random
 from dataclasses import dataclass, field
-from itertools import islice
 from typing import Any, Iterator
 
 import numpy as np
@@ -322,14 +321,23 @@ class FineT2IStreamingDataset(IterableDataset):
         )
 
     def _sharded_stream(self):
-        """Build the streaming dataset and split it across DDP nodes then workers.
+        """Build the streaming dataset and split it across DDP nodes.
 
         DDP: ``split_dataset_by_node`` distributes shards per node (and falls back
         to row-contiguous splitting internally when nodes outnumber shards).
-        Workers: ``.shard`` distributes tar shards per worker so each streams only
-        its files (bandwidth-efficient) — but that CRASHES / duplicates when there
-        are fewer shards than workers, so guard on ``n_shards`` and fall back to
-        row-stride sharding (islice) when the file split is unsafe.
+
+        Workers: do NOT shard here. ``datasets`` already splits an IterableDataset
+        across DataLoader workers on its own when it is iterated inside one, so an
+        extra ``.shard(num_workers, worker_id)`` COMPOSES with that automatic split
+        and leaves each worker 1/N**2 of the rows. Measured on an 8-worker loader:
+        aggregate coverage fell to 14% of the dataset per pass (34% at 3 workers)
+        with the manual shard, versus ~100% at both worker counts without it. No
+        duplication either way — the manual split was pure loss.
+
+        Note ``.shuffle()`` collapses ``num_shards`` (independent of buffer size),
+        and ``datasets`` caps active workers at ``num_shards`` — so a non-zero
+        ``shuffle_buffer`` costs worker parallelism. Set ``--wds-shuffle-buffer 0``
+        to keep every worker busy when the loader is the bottleneck.
         """
         worker = get_worker_info()
         salt = worker.id if worker is not None else 0
@@ -342,13 +350,6 @@ class FineT2IStreamingDataset(IterableDataset):
             ds = split_dataset_by_node(ds, rank=self.rank or 0, world_size=self.world_size)
         if self.shuffle_buffer > 0 and hasattr(ds, "shuffle"):
             ds = ds.shuffle(seed=self.seed + salt, buffer_size=self.shuffle_buffer)
-        if worker is not None and worker.num_workers > 1:
-            if getattr(ds, "n_shards", 1) >= worker.num_workers:
-                ds = ds.shard(num_shards=worker.num_workers, index=worker.id)
-            else:
-                # Too few shards to split by file: each worker reads the whole stream
-                # but keeps a DISJOINT row stride, so no duplication and no crash.
-                return islice(ds, worker.id, None, worker.num_workers)
         return ds
 
     def __iter__(self) -> Iterator[T2IRecord]:
