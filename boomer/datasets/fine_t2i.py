@@ -256,6 +256,12 @@ class FineT2IStreamingDataset(IterableDataset):
     json_key: str = DEFAULT_JSON_KEY
     rank: int | None = None
     world_size: int | None = None
+    # Seconds of total silence from the streaming reader before the stream is
+    # declared stalled and rebuilt. ``datasets`` streaming has no read deadline,
+    # so a dead HTTP connection otherwise parks the worker forever (observed: 7h
+    # at 0% GPU with no error). Generous by design — a slow shard is not a stall.
+    stall_timeout_s: float = 300.0
+    stall_max_restarts: int = 8
     _caption_rng: random.Random = field(init=False, repr=False)
     _sources: tuple[str, ...] = field(init=False, repr=False, default=())
     _weights: tuple[float, ...] | None = field(init=False, repr=False, default=None)
@@ -320,7 +326,7 @@ class FineT2IStreamingDataset(IterableDataset):
             stopping_strategy="all_exhausted",
         )
 
-    def _sharded_stream(self):
+    def _sharded_stream(self, salt_bump: int = 0):
         """Build the streaming dataset and split it across DDP nodes.
 
         DDP: ``split_dataset_by_node`` distributes shards per node (and falls back
@@ -340,9 +346,10 @@ class FineT2IStreamingDataset(IterableDataset):
         to keep every worker busy when the loader is the bottleneck.
         """
         worker = get_worker_info()
-        salt = worker.id if worker is not None else 0
+        salt = (worker.id if worker is not None else 0) + salt_bump
         # Salt the mix RNG per worker so two workers do not draw the same subset
-        # sequence from the weighted interleave.
+        # sequence from the weighted interleave. ``salt_bump`` additionally moves a
+        # restarted-after-stall stream off the draw order that stalled.
         ds = self._load_stream(seed_salt=salt)
         if self.world_size and self.world_size > 1:
             from datasets.distributed import split_dataset_by_node
@@ -352,12 +359,89 @@ class FineT2IStreamingDataset(IterableDataset):
             ds = ds.shuffle(seed=self.seed + salt, buffer_size=self.shuffle_buffer)
         return ds
 
+    def _examples_with_stall_guard(self, tag: str) -> Iterator[Any]:
+        """Yield raw examples, rebuilding the stream when the reader goes silent.
+
+        ``datasets`` streaming enforces no read deadline, so a half-open HTTP
+        connection leaves the worker blocked in a socket read indefinitely. The
+        DataLoader then waits on that worker and training stops with no error, no
+        traceback and 0% GPU. ``wds_latents.py`` guards its own path for the same
+        reason (ROLLING_WDS_DOWNLOAD_TIMEOUT_S, and the HF_HUB_DOWNLOAD_TIMEOUT it
+        sets at lines 443/1104); ``fine_t2i`` had no equivalent.
+
+        A daemon thread does the reading. If nothing arrives for
+        ``stall_timeout_s`` the thread is abandoned — it stays blocked in the
+        kernel, but it is a daemon holding only its socket, and it exits on its own
+        if the read ever returns — and the stream is rebuilt with a bumped salt.
+        Rebuilding re-reads from the start of this worker's shards, which costs
+        some repetition but is acceptable for a streaming corpus with no exact
+        epoch boundary.
+        """
+        import queue as _queue
+        import threading
+
+        end_marker = object()
+        for attempt in range(self.stall_max_restarts + 1):
+            handoff: _queue.Queue = _queue.Queue(maxsize=4)
+            wanted = threading.Event()
+            wanted.set()
+
+            def _produce(sink=handoff, live=wanted, bump=attempt) -> None:
+                try:
+                    for example in self._sharded_stream(salt_bump=bump):
+                        while live.is_set():
+                            try:
+                                sink.put(example, timeout=1.0)
+                                break
+                            except _queue.Full:
+                                continue
+                        if not live.is_set():
+                            return
+                    sink.put(end_marker)
+                except BaseException as exc:  # surface in the consumer thread
+                    try:
+                        sink.put(exc, timeout=5.0)
+                    except _queue.Full:
+                        pass
+
+            reader = threading.Thread(
+                target=_produce, name=f"fine-t2i-reader-{tag}", daemon=True
+            )
+            reader.start()
+            stalled = False
+            while True:
+                try:
+                    item = handoff.get(timeout=self.stall_timeout_s)
+                except _queue.Empty:
+                    stalled = True
+                    break
+                if item is end_marker:
+                    return
+                if isinstance(item, BaseException):
+                    raise item
+                yield item
+
+            if stalled:
+                wanted.clear()
+                if attempt < self.stall_max_restarts:
+                    print(
+                        f"[t2i-direct] {tag}: no data for {self.stall_timeout_s:g}s — "
+                        f"stream stalled, rebuilding (restart {attempt + 1}/"
+                        f"{self.stall_max_restarts})",
+                        flush=True,
+                    )
+        raise RuntimeError(
+            f"[t2i-direct] {tag}: stream stalled {self.stall_max_restarts + 1} times in "
+            f"a row ({self.stall_timeout_s:g}s each) — giving up rather than hanging"
+        )
+
     def __iter__(self) -> Iterator[T2IRecord]:
         # Per-worker RNG so the short/enhanced caption pick is decorrelated across
         # workers yet reproducible given the seed + worker id.
         worker = get_worker_info()
-        rng = random.Random(self.seed + (worker.id if worker is not None else 0) + 1)
-        for example in self._sharded_stream():
+        worker_id = worker.id if worker is not None else 0
+        rng = random.Random(self.seed + worker_id + 1)
+        for example in self._examples_with_stall_guard(tag=f"worker {worker_id}"):
             record = t2i_example_to_record(
                 example,
                 resolution=self.resolution,
