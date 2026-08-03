@@ -565,6 +565,30 @@ class BoomerLit(pl.LightningModule):
         self.log("train/total_loss", loss, prog_bar=True, on_step=True, on_epoch=False, batch_size=bs)
         return loss
 
+    def on_train_start(self) -> None:
+        # Let the CLI --lr win over restored state, the way --flow-shift already does.
+        # A full --resume restores BOTH optimizer param_groups["lr"] AND the
+        # scheduler's base_lrs (they are in LambdaLR.state_dict()), so without this a
+        # changed --lr is silently ignored and the run quietly continues at the old
+        # value. base_lrs is what the warmup/decay lambda multiplies, so both must be
+        # rewritten or the scheduler would stomp the param group on its next step.
+        target = float(self.hparams.lr)
+        changed = False
+        for optim in self.trainer.optimizers:
+            for group in optim.param_groups:
+                if group.get("initial_lr") is not None and group["initial_lr"] != target:
+                    group["initial_lr"] = target
+                    changed = True
+        for config in self.trainer.lr_scheduler_configs:
+            sched = config.scheduler
+            base = getattr(sched, "base_lrs", None)
+            if base and any(value != target for value in base):
+                sched.base_lrs = [target] * len(base)
+                changed = True
+        if changed:
+            print(f"[lr] CLI --lr {target:g} overrides the resumed optimizer/scheduler "
+                  f"learning rate", flush=True)
+
     def configure_optimizers(self):
         hp = self.hparams
         optim = torch.optim.AdamW(
