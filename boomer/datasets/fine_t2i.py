@@ -40,6 +40,7 @@ from __future__ import annotations
 import io
 import json as _json
 import random
+import time
 from dataclasses import dataclass, field
 from typing import Any, Iterator
 
@@ -47,6 +48,8 @@ import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import IterableDataset, get_worker_info
+
+from boomer.datasets.wds_latents import _is_transient_stream_error
 
 DEFAULT_T2I_REPO = "ma-xu/fine-t2i"
 DEFAULT_IMAGE_KEY = "jpg"
@@ -261,7 +264,11 @@ class FineT2IStreamingDataset(IterableDataset):
     # so a dead HTTP connection otherwise parks the worker forever (observed: 7h
     # at 0% GPU with no error). Generous by design — a slow shard is not a stall.
     stall_timeout_s: float = 300.0
-    stall_max_restarts: int = 8
+    # Reconnect budget shared by stalls AND transient stream errors, mirroring
+    # monet_direct's stream_reconnect_* (wds_latents.py:1463) so both streaming
+    # paths survive the same network weather.
+    stall_max_restarts: int = 20
+    stall_reconnect_backoff: float = 5.0
     _caption_rng: random.Random = field(init=False, repr=False)
     _sources: tuple[str, ...] = field(init=False, repr=False, default=())
     _weights: tuple[float, ...] | None = field(init=False, repr=False, default=None)
@@ -408,31 +415,37 @@ class FineT2IStreamingDataset(IterableDataset):
                 target=_produce, name=f"fine-t2i-reader-{tag}", daemon=True
             )
             reader.start()
-            stalled = False
+            reason = ""
             while True:
                 try:
                     item = handoff.get(timeout=self.stall_timeout_s)
                 except _queue.Empty:
-                    stalled = True
+                    reason = f"no data for {self.stall_timeout_s:g}s (stalled)"
                     break
                 if item is end_marker:
                     return
                 if isinstance(item, BaseException):
-                    raise item
+                    # Transient network faults are retried the way monet_direct
+                    # retries them; genuine data/code errors must still surface.
+                    if not _is_transient_stream_error(item):
+                        raise item
+                    reason = f"{type(item).__name__}: {item}"
+                    break
                 yield item
 
-            if stalled:
-                wanted.clear()
-                if attempt < self.stall_max_restarts:
-                    print(
-                        f"[t2i-direct] {tag}: no data for {self.stall_timeout_s:g}s — "
-                        f"stream stalled, rebuilding (restart {attempt + 1}/"
-                        f"{self.stall_max_restarts})",
-                        flush=True,
-                    )
+            wanted.clear()
+            if attempt >= self.stall_max_restarts:
+                break
+            delay = min(self.stall_reconnect_backoff * 2.0**attempt, 60.0)
+            print(
+                f"[t2i-direct] {tag}: {reason} — rebuilding stream in {delay:.0f}s "
+                f"(restart {attempt + 1}/{self.stall_max_restarts})",
+                flush=True,
+            )
+            time.sleep(delay)
         raise RuntimeError(
-            f"[t2i-direct] {tag}: stream stalled {self.stall_max_restarts + 1} times in "
-            f"a row ({self.stall_timeout_s:g}s each) — giving up rather than hanging"
+            f"[t2i-direct] {tag}: stream failed {self.stall_max_restarts + 1} times in "
+            f"a row (last: {reason}) — giving up rather than hanging"
         )
 
     def __iter__(self) -> Iterator[T2IRecord]:
