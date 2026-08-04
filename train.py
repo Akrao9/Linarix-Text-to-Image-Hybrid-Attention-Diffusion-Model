@@ -204,6 +204,7 @@ class BoomerLit(pl.LightningModule):
         # Frozen on-the-fly DC-AE (--edit-direct pixel pairs). Same out-of-tree
         # residency rules as the text encoder box above.
         self._vae_box: list[Any] = []
+        self._vae_compiled = False
         # --fill-training: mask-type mix, parsed once (fails fast on a bad spec).
         self._fill_mask_probs = (
             parse_fill_mask_probs(hp.get("fill_mask_probs")) if hp.get("fill_training") else None
@@ -296,6 +297,25 @@ class BoomerLit(pl.LightningModule):
         if next(vae.parameters()).device != self.device:
             vae = vae.to(self.device)
             self._vae_box[0] = vae
+        # --compile-vae: the DC-AE lives outside self.model (so it stays out of
+        # state_dict/optimizer/Lightning device management), which also means --compile
+        # never reaches it -- it runs EAGER, paying full per-op Python dispatch on every
+        # conv and norm while encoding --batch-size images at --t2i-resolution every
+        # step. Profiled on the v7 1024 run: DC-AE 50% of step time vs 20% for the DiT
+        # itself, with _conv_forward and normalization.forward dominating OwnTime, which
+        # is the dispatch-overhead signature. Compile the encoder stack only: the
+        # AutoencoderDC.encode wrapper returns a dataclass and is not worth tracing.
+        if self.hparams.get("compile_vae") and not self._vae_compiled:
+            encoder = getattr(vae, "encoder", None)
+            if encoder is None:
+                print("[compile-vae] no .encoder submodule on the DC-AE; skipping",
+                      flush=True)
+            else:
+                mode = self.hparams.get("compile_mode", "default")
+                vae.encoder = torch.compile(encoder, mode=mode)
+                print(f"[compile-vae] torch.compile(mode={mode}) on the DC-AE encoder",
+                      flush=True)
+            self._vae_compiled = True
         return vae
 
     @torch.no_grad()
@@ -2606,6 +2626,12 @@ def build_parser() -> argparse.ArgumentParser:
                    default="default",
                    help="torch.compile mode. 'default' avoids aggressive Triton autotune candidates "
                         "that can exceed Blackwell's per-SM resource limits.")
+    p.add_argument("--compile-vae", action="store_true",
+                   help="torch.compile the frozen DC-AE ENCODER (default off). Only "
+                        "matters for the on-the-fly encode paths (--t2i-direct / "
+                        "--edit-direct), where the VAE runs eager and can dominate step "
+                        "time. Keep --edit-encode-chunk a divisor of --batch-size so "
+                        "every chunk has one shape and Inductor compiles one graph.")
     p.add_argument("--compile-text-encoder", action="store_true",
                    help="EXPERIMENT (default off): torch.compile the truncated Qwen BASE transformer "
                         "(dynamic=True; the CausalLM head is never run on the text path). Compiled "
@@ -2865,6 +2891,7 @@ def main() -> None:
         compile=args.compile,
         compile_mode=args.compile_mode,
         compile_text_encoder=args.compile_text_encoder,
+        compile_vae=args.compile_vae,
     )
 
     # Optionally seed the model from a checkpoint's weights without restoring the
