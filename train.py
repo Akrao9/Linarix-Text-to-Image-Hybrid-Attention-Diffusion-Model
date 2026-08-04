@@ -208,6 +208,16 @@ class BoomerLit(pl.LightningModule):
         self._fill_mask_probs = (
             parse_fill_mask_probs(hp.get("fill_mask_probs")) if hp.get("fill_training") else None
         )
+        # --sigma-buckets: running (sum, count) of the UNWEIGHTED per-sample flow MSE
+        # per fixed sigma band, flushed every --sigma-bucket-log-every steps. Kept off
+        # the state_dict (plain attrs, not buffers): they are a logging accumulator, so
+        # restoring a mid-window partial sum into a resumed run would be meaningless.
+        self._sigma_bucket_sum: torch.Tensor | None = None
+        self._sigma_bucket_cnt: torch.Tensor | None = None
+        # global_step of the last flush. Under --accumulate N, training_step runs N
+        # times per global_step, so a bare `global_step % every == 0` test fires N
+        # times: the first flush drains the window and the rest log a near-empty one.
+        self._sigma_bucket_flushed_at = -1
         if hp.get("compile"):
             self.model = torch.compile(self.model, mode=hp.get("compile_mode", "default"))
 
@@ -387,6 +397,73 @@ class BoomerLit(pl.LightningModule):
             print(f"[resume] reshaped {realigned} optimizer moment tensors to migrated "
                   "param shapes (legacy GLUMBConv checkpoint)", flush=True)
 
+    def _log_sigma_buckets(self, t: torch.Tensor, raw_per_sample: torch.Tensor, bs: int) -> None:
+        """Accumulate the UNWEIGHTED flow MSE into fixed sigma bands and flush the means
+        every ``--sigma-bucket-log-every`` steps.
+
+        Why this beats train/flow_loss as a progress signal: the aggregate loss is an
+        average over whatever sigma distribution the sampler happens to draw, so its
+        value moves whenever the WEIGHTING moves — changing --flow-shift, or crossing
+        --t-sampler-final-step — with no change in model quality. A band's mean is far
+        less sensitive to that, so these curves stay roughly comparable across the
+        512->1024 shift change and the polish switch, and they say WHICH noise regime
+        is still learning: high-sigma bands carry global composition, low-sigma bands
+        carry texture.
+
+        NOT fully invariant, and the residual matters. Reweighting also moves the
+        distribution WITHIN a band, which leaks into its mean. Measured on a synthetic
+        loss linear in t (the worst case) over --flow-shift 1.5 -> 3.0: the aggregate
+        moved 0.158, the worst band 0.019 at 5 bands and 0.006 at 10. Since real
+        progress at this stage is ~0.01-0.02 per 100k steps, at 5 bands the leak is
+        the same size as the signal — so read across a weighting change with care, and
+        raise --sigma-buckets if a finer read is needed. The tradeoff is population:
+        at 64 samples/step and a 100-step window, 5 bands leaves >=44 samples in the
+        thinnest band under shift 3.0, 10 bands leaves 5, and 20 bands leaves one band
+        empty. Hence the default of 5.
+
+        Bands are fixed equal-width slices of t in [0, 1], never quantiles, so a bin
+        means the same thing at every step. train/sigma_frac_* reports how much of the
+        batch landed in each band — the direct readout of the current weighting, and
+        the check that a band is populated enough for its mean to mean anything.
+
+        Accumulating instead of logging per-step is the point: at batch 16 a single
+        step puts ~3 samples in a band, which is pure noise. Cost is one index_add_ per
+        step and one device sync per flush.
+        """
+        nb = int(getattr(self.hparams, "sigma_buckets", 0) or 0)
+        every = int(getattr(self.hparams, "sigma_bucket_log_every", 0) or 0)
+        if nb <= 0 or every <= 0:
+            return
+        with torch.no_grad():
+            flat = raw_per_sample.detach().float().flatten()
+            idx = (t.detach().float().flatten() * nb).long().clamp_(0, nb - 1)
+            if self._sigma_bucket_sum is None or self._sigma_bucket_sum.device != flat.device:
+                self._sigma_bucket_sum = torch.zeros(nb, device=flat.device)
+                self._sigma_bucket_cnt = torch.zeros(nb, device=flat.device)
+            self._sigma_bucket_sum.index_add_(0, idx, flat)
+            self._sigma_bucket_cnt.index_add_(0, idx, torch.ones_like(flat))
+
+            step = self.global_step
+            if step == 0 or step % every != 0 or step == self._sigma_bucket_flushed_at:
+                return
+            self._sigma_bucket_flushed_at = step
+            # One transfer, then plain Python: a sync every `every` steps is free, a
+            # sync per step (indexing the GPU tensors inline) would not be.
+            sums = self._sigma_bucket_sum.cpu().tolist()
+            cnts = self._sigma_bucket_cnt.cpu().tolist()
+            total = sum(cnts)
+            for i, (s, c) in enumerate(zip(sums, cnts)):
+                lo, hi = i / nb, (i + 1) / nb
+                band = f"{lo:.2f}_{hi:.2f}"
+                if c > 0:
+                    self.log(f"train/flow_loss_sigma_{band}", s / c,
+                             on_step=True, on_epoch=False, batch_size=bs)
+                if total > 0:
+                    self.log(f"train/sigma_frac_{band}", c / total,
+                             on_step=True, on_epoch=False, batch_size=bs)
+            self._sigma_bucket_sum.zero_()
+            self._sigma_bucket_cnt.zero_()
+
     def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         hp = self.hparams
         x0 = batch.get("image_latent")
@@ -496,6 +573,9 @@ class BoomerLit(pl.LightningModule):
             repa_feat = disp_feat = None
 
         per_sample = (pred.float() - target.float()).pow(2).mean(dim=(1, 2, 3))
+        # Hold the pre-reweighting MSE for the per-sigma buckets. The reweighting below
+        # rebinds `per_sample` to a new tensor, so this keeps pointing at the raw one.
+        raw_per_sample = per_sample
         # Exactly one per-timestep reweighting (mutual exclusion enforced at startup in
         # main()); timestep_weight takes precedence if both ever slip through.
         if hp.timestep_weight:
@@ -515,6 +595,7 @@ class BoomerLit(pl.LightningModule):
         if sched is not None:
             self.log("train/lr", sched.get_last_lr()[0], on_step=True, on_epoch=False, batch_size=bs)
         self.log("train/sigma_mean", t.float().mean(), on_step=True, on_epoch=False, batch_size=bs)
+        self._log_sigma_buckets(t, raw_per_sample, bs)
         if hp.t_sampler_final:
             self.log("train/t_polish", float(polish), on_step=True, on_epoch=False, batch_size=bs)
         if self._fill_mask_probs is not None:
@@ -2408,6 +2489,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Sampler to switch to for the final polish phase (e.g. uniform).")
     p.add_argument("--t-sampler-final-step", type=int, default=80000,
                    help="global_step at which to switch to --t-sampler-final.")
+    # Per-sigma-band flow MSE. Unlike train/flow_loss, a fixed band's mean does not move
+    # when the timestep WEIGHTING moves (--flow-shift, the --t-sampler-final switch), so
+    # these curves stay comparable across those changes and show which noise regime is
+    # still improving. Accumulated across the window, since one step barely populates a band.
+    p.add_argument("--sigma-buckets", type=int, default=5,
+                   help="Equal-width sigma bands to log the unweighted flow MSE in "
+                        "(0 disables). Logged as train/flow_loss_sigma_<lo>_<hi>, with "
+                        "train/sigma_frac_<lo>_<hi> giving each band's share of samples.")
+    p.add_argument("--sigma-bucket-log-every", type=int, default=100,
+                   help="Steps between per-sigma-band flushes (accumulate in between).")
     p.add_argument("--t-bias", type=float, default=2.0)
     p.add_argument("--flow-shift", type=float, default=1.5)
     p.add_argument("--logit-mean", type=float, default=0.0)
@@ -2753,6 +2844,8 @@ def main() -> None:
         t_sampler_final_step=args.t_sampler_final_step,
         t_bias=args.t_bias,
         flow_shift=args.flow_shift,
+        sigma_buckets=args.sigma_buckets,
+        sigma_bucket_log_every=args.sigma_bucket_log_every,
         logit_mean=args.logit_mean,
         logit_std=args.logit_std,
         plateau_low=args.plateau_low,
