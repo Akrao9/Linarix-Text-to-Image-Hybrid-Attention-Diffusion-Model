@@ -55,6 +55,8 @@ DEFAULT_T2I_REPO = "ma-xu/fine-t2i"
 DEFAULT_IMAGE_KEY = "jpg"
 DEFAULT_TEXT_KEY = "txt"
 DEFAULT_JSON_KEY = "json"
+# Shard extensions worth enumerating when a restart needs an explicit file order.
+_SHARD_SUFFIXES = (".tar", ".parquet")
 # json.* fields carrying the short caption (priority order) and the enhanced one.
 SHORT_PROMPT_FIELDS = ("prompt",)
 ENHANCED_PROMPT_FIELDS = ("enhanced_prompt",)
@@ -272,6 +274,8 @@ class FineT2IStreamingDataset(IterableDataset):
     _caption_rng: random.Random = field(init=False, repr=False)
     _sources: tuple[str, ...] = field(init=False, repr=False, default=())
     _weights: tuple[float, ...] | None = field(init=False, repr=False, default=None)
+    # source subfolder -> its shard file list (one HfApi call, reused per restart).
+    _file_cache: dict = field(init=False, repr=False, default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.caption_mode not in _CAPTION_MODES:
@@ -289,15 +293,18 @@ class FineT2IStreamingDataset(IterableDataset):
             )
         self._caption_rng = random.Random(self.seed)
 
-    def _load_one(self, data_dir: str | None):
+    def _load_one(self, data_dir: str | None, data_files: Any = None):
         from datasets import load_dataset
 
         token = self.hf_token if isinstance(self.hf_token, str) else None
         kwargs: dict[str, Any] = {}
-        if data_dir is not None:
+        files = data_files if data_files is not None else self.data_files
+        if files is not None:
+            kwargs["data_files"] = files
+        if data_dir is not None and data_files is None:
+            # An explicit per-restart file list is already repo-rooted (it carries
+            # the subfolder prefix), so passing data_dir too would double it.
             kwargs["data_dir"] = data_dir  # restrict to one subfolder of shards
-        if self.data_files is not None:
-            kwargs["data_files"] = self.data_files
         return load_dataset(
             self.repo_id,
             name=self.config_name,
@@ -307,7 +314,83 @@ class FineT2IStreamingDataset(IterableDataset):
             **kwargs,
         )
 
-    def _load_stream(self, *, seed_salt: int = 0):
+    def _list_shard_files(self, source: str | None) -> list[str] | None:
+        """Every shard file under one source subfolder, sorted the way ``datasets``
+        resolves them. None if listing fails — callers then fall back to letting
+        ``load_dataset`` resolve the shards itself."""
+        try:
+            from huggingface_hub import HfApi
+
+            token = self.hf_token if isinstance(self.hf_token, str) else None
+            names = HfApi(token=token).list_repo_files(self.repo_id, repo_type="dataset")
+        except Exception as exc:  # noqa: BLE001 - degrade to the old behaviour
+            print(
+                f"[t2i-direct] shard listing failed ({type(exc).__name__}: {exc}); "
+                "restarts will replay from the head of the stream",
+                flush=True,
+            )
+            return None
+        prefix = f"{source.strip('/')}/" if source else ""
+        files = sorted(
+            name
+            for name in names
+            if name.startswith(prefix) and name.endswith(_SHARD_SUFFIXES)
+        )
+        return files or None
+
+    def _shard_files_for_restart(self, source: str | None, restart: int) -> list[str] | None:
+        """Shard order for one source on rebuild number ``restart``.
+
+        Restart 0 returns None, i.e. keeps ``load_dataset``'s own resolution, so the
+        happy path is byte-for-byte what it always was. Later restarts pass an
+        explicitly permuted file list so the rebuilt stream does not re-read the
+        rows the dead one already delivered. A bumped RNG salt cannot achieve this:
+        with ``shuffle_buffer == 0`` no ``.shuffle()`` runs at all, so every source
+        restarts at its own row 0 and only the interleave draw order changes.
+
+        The permutation is seeded by ``restart`` ONLY, never by worker id. All
+        workers must agree on the order, because ``datasets`` splits shards across
+        workers by stride (``files[worker_id::num_workers]``); per-worker orders
+        would make those strides overlap and duplicate rows.
+        """
+        if restart <= 0:
+            return None
+        if self.data_files is not None:
+            # Respect a caller-supplied list; permute it rather than the subfolder.
+            if not isinstance(self.data_files, (list, tuple)):
+                return None  # a glob or dict — leave resolution to load_dataset
+            order = list(self.data_files)
+        else:
+            if source not in self._file_cache:
+                self._file_cache[source] = self._list_shard_files(source)
+            files = self._file_cache[source]
+            if not files:
+                return None
+            order = list(files)
+        random.Random(self.seed + 100003 * restart).shuffle(order)
+        return order
+
+    def _load_one_resilient(self, source: str | None, files: Any):
+        """``_load_one`` with the explicit per-restart shard list, degrading to the
+        default resolution if ``load_dataset`` rejects that list (an unexpected
+        builder inference from bare ``.tar`` paths would otherwise raise a
+        NON-transient error and kill the worker during recovery — the one moment it
+        must not). The failed listing is poisoned so later restarts skip it."""
+        if files is None:
+            return self._load_one(source, None)
+        try:
+            return self._load_one(source, files)
+        except Exception as exc:  # noqa: BLE001 - recovery must not be fragile
+            print(
+                f"[t2i-direct] explicit shard list rejected for {source!r} "
+                f"({type(exc).__name__}: {exc}); falling back to default resolution "
+                "— this restart may replay the head of the stream",
+                flush=True,
+            )
+            self._file_cache[source] = None
+            return self._load_one(source, None)
+
+    def _load_stream(self, *, seed_salt: int = 0, restart: int = 0):
         """One subfolder's stream, or a weighted row-level mix of several.
 
         ``stopping_strategy="all_exhausted"`` keeps an up-weighted small subset
@@ -317,11 +400,17 @@ class FineT2IStreamingDataset(IterableDataset):
         cut every epoch to curated's length).
         """
         if len(self._sources) <= 1:
-            return self._load_one(self._sources[0] if self._sources else None)
+            source = self._sources[0] if self._sources else None
+            return self._load_one_resilient(
+                source, self._shard_files_for_restart(source, restart)
+            )
 
         from datasets import interleave_datasets
 
-        streams = [self._load_one(source) for source in self._sources]
+        streams = [
+            self._load_one_resilient(source, self._shard_files_for_restart(source, restart))
+            for source in self._sources
+        ]
         probabilities = None
         if self._weights is not None:
             total = sum(self._weights)
@@ -333,7 +422,7 @@ class FineT2IStreamingDataset(IterableDataset):
             stopping_strategy="all_exhausted",
         )
 
-    def _sharded_stream(self, salt_bump: int = 0):
+    def _sharded_stream(self, restart: int = 0):
         """Build the streaming dataset and split it across DDP nodes.
 
         DDP: ``split_dataset_by_node`` distributes shards per node (and falls back
@@ -353,11 +442,12 @@ class FineT2IStreamingDataset(IterableDataset):
         to keep every worker busy when the loader is the bottleneck.
         """
         worker = get_worker_info()
-        salt = (worker.id if worker is not None else 0) + salt_bump
+        salt = (worker.id if worker is not None else 0) + restart
         # Salt the mix RNG per worker so two workers do not draw the same subset
-        # sequence from the weighted interleave. ``salt_bump`` additionally moves a
-        # restarted-after-stall stream off the draw order that stalled.
-        ds = self._load_stream(seed_salt=salt)
+        # sequence from the weighted interleave. ``restart`` additionally moves a
+        # rebuilt-after-stall stream off the draw order that stalled, and permutes
+        # its shard order so it does not re-read the head it already consumed.
+        ds = self._load_stream(seed_salt=salt, restart=restart)
         if self.world_size and self.world_size > 1:
             from datasets.distributed import split_dataset_by_node
 
@@ -379,23 +469,30 @@ class FineT2IStreamingDataset(IterableDataset):
         A daemon thread does the reading. If nothing arrives for
         ``stall_timeout_s`` the thread is abandoned — it stays blocked in the
         kernel, but it is a daemon holding only its socket, and it exits on its own
-        if the read ever returns — and the stream is rebuilt with a bumped salt.
-        Rebuilding re-reads from the start of this worker's shards, which costs
-        some repetition but is acceptable for a streaming corpus with no exact
-        epoch boundary.
+        if the read ever returns — and the stream is rebuilt over a freshly
+        permuted shard order (``_shard_files_for_restart``) so it does not re-read
+        the head it already consumed.
+
+        The retry budget counts CONSECUTIVE failures and resets the moment a
+        rebuilt stream delivers a row, matching ``monet_direct``'s
+        ``reconnects = 0`` on every successful read.
         """
         import queue as _queue
         import threading
 
         end_marker = object()
-        for attempt in range(self.stall_max_restarts + 1):
+        consecutive = 0  # failures since the stream last delivered a row
+        restart = 0  # lifetime rebuilds; only ever increases, so shard order moves
+        total = 0  # rows delivered across every attempt
+        while True:
             handoff: _queue.Queue = _queue.Queue(maxsize=4)
             wanted = threading.Event()
             wanted.set()
+            delivered = 0
 
-            def _produce(sink=handoff, live=wanted, bump=attempt) -> None:
+            def _produce(sink=handoff, live=wanted, bump=restart) -> None:
                 try:
-                    for example in self._sharded_stream(salt_bump=bump):
+                    for example in self._sharded_stream(restart=bump):
                         while live.is_set():
                             try:
                                 sink.put(example, timeout=1.0)
@@ -423,6 +520,15 @@ class FineT2IStreamingDataset(IterableDataset):
                     reason = f"no data for {self.stall_timeout_s:g}s (stalled)"
                     break
                 if item is end_marker:
+                    if total == 0:
+                        # monet_direct refuses to spin an empty epoch loop
+                        # (monet_direct.py:551); a worker that silently yields
+                        # nothing is data loss, not an exhausted corpus.
+                        raise RuntimeError(
+                            f"[t2i-direct] {tag}: stream ended having yielded 0 rows "
+                            f"from {self.repo_id} (data_dir={self.data_dir!r}) — "
+                            "wrong subfolder, or every row filtered out?"
+                        )
                     return
                 if isinstance(item, BaseException):
                     # Transient network faults are retried the way monet_direct
@@ -431,22 +537,37 @@ class FineT2IStreamingDataset(IterableDataset):
                         raise item
                     reason = f"{type(item).__name__}: {item}"
                     break
+                delivered += 1
+                total += 1
                 yield item
 
             wanted.clear()
-            if attempt >= self.stall_max_restarts:
-                break
-            delay = min(self.stall_reconnect_backoff * 2.0**attempt, 60.0)
+            # monet_direct clears its reconnect budget on every successful read
+            # (monet_direct.py:500). Mirror that: the budget counts CONSECUTIVE
+            # failures, not failures over the lifetime of the run. Counting the
+            # lifetime kills a multi-day job on its 21st unrelated blip even though
+            # all twenty earlier ones recovered fully — and compounds the backoff
+            # to the 60s cap for incidents days apart.
+            consecutive = 0 if delivered > 0 else consecutive + 1
+            restart += 1
+            if consecutive > self.stall_max_restarts:
+                raise RuntimeError(
+                    f"[t2i-direct] {tag}: stream failed {consecutive} times in a row "
+                    f"with no data in between (last: {reason}) — giving up rather "
+                    "than hanging"
+                )
+            delay = min(self.stall_reconnect_backoff * 2.0 ** max(0, consecutive - 1), 60.0)
+            budget = (
+                f"consecutive failure {consecutive}/{self.stall_max_restarts}"
+                if consecutive
+                else f"budget reset by {delivered} delivered row(s)"
+            )
             print(
-                f"[t2i-direct] {tag}: {reason} — rebuilding stream in {delay:.0f}s "
-                f"(restart {attempt + 1}/{self.stall_max_restarts})",
+                f"[t2i-direct] {tag}: {reason} after {delivered} row(s) — rebuilding "
+                f"stream in {delay:.0f}s ({budget}, lifetime restart {restart})",
                 flush=True,
             )
             time.sleep(delay)
-        raise RuntimeError(
-            f"[t2i-direct] {tag}: stream failed {self.stall_max_restarts + 1} times in "
-            f"a row (last: {reason}) — giving up rather than hanging"
-        )
 
     def __iter__(self) -> Iterator[T2IRecord]:
         # Per-worker RNG so the short/enhanced caption pick is decorrelated across
