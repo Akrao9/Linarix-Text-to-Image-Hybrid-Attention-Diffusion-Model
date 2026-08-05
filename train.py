@@ -205,6 +205,7 @@ class BoomerLit(pl.LightningModule):
         # residency rules as the text encoder box above.
         self._vae_box: list[Any] = []
         self._vae_compiled = False
+        self._vae_eager_encoder: Any = None
         # --fill-training: mask-type mix, parsed once (fails fast on a bad spec).
         self._fill_mask_probs = (
             parse_fill_mask_probs(hp.get("fill_mask_probs")) if hp.get("fill_training") else None
@@ -312,11 +313,27 @@ class BoomerLit(pl.LightningModule):
                       flush=True)
             else:
                 mode = self.hparams.get("compile_mode", "default")
+                # Keep the eager module so a compiled-graph failure can fall back
+                # instead of killing the run, mirroring the text encoder's
+                # _eager_base_model. diffusers has open reports of torch.compile
+                # failing on this model family (huggingface/diffusers#10937,
+                # #11864) -- both on the @apply_forward_hook-decorated .encode
+                # rather than the raw .encoder compiled here, but a frozen
+                # preprocessing step is not worth a hard crash either way.
+                self._vae_eager_encoder = encoder
                 vae.encoder = torch.compile(encoder, mode=mode)
                 print(f"[compile-vae] torch.compile(mode={mode}) on the DC-AE encoder",
                       flush=True)
             self._vae_compiled = True
         return vae
+
+    def _encode_pixel_chunks(self, vae, pixels, *, chunk: int, dtype) -> torch.Tensor:
+        parts = []
+        for part in pixels.split(chunk):
+            images = part.to(device=self.device, dtype=dtype, non_blocking=True)
+            images = images / 127.5 - 1.0
+            parts.append(extract_latent(vae.encode(images)))
+        return torch.cat(parts, dim=0)
 
     @torch.no_grad()
     def encode_pixels(self, pixels: torch.Tensor) -> torch.Tensor:
@@ -334,12 +351,19 @@ class BoomerLit(pl.LightningModule):
         dtype = next(vae.parameters()).dtype
         chunk = max(1, int(getattr(hp, "edit_encode_chunk", 8)))
         scale = vae_scaling_factor(vae, getattr(hp, "edit_scaling_factor", DEFAULT_SCALING_FACTOR))
-        parts = []
-        for part in pixels.split(chunk):
-            images = part.to(device=self.device, dtype=dtype, non_blocking=True)
-            images = images / 127.5 - 1.0
-            parts.append(extract_latent(vae.encode(images)))
-        return torch.cat(parts, dim=0) * scale
+        try:
+            return self._encode_pixel_chunks(vae, pixels, chunk=chunk, dtype=dtype) * scale
+        except Exception as exc:  # noqa: BLE001 - --compile-vae fallback, see below
+            if self._vae_eager_encoder is None:
+                raise
+            # Drop the compiled encoder permanently and redo this batch eagerly. The
+            # latents are numerically the same either way, so the run continues with
+            # nothing worse than the speed it had before --compile-vae.
+            print(f"[compile-vae] compiled DC-AE encoder failed ({type(exc).__name__}: "
+                  f"{exc}); falling back to eager for the rest of the run", flush=True)
+            vae.encoder = self._vae_eager_encoder
+            self._vae_eager_encoder = None
+            return self._encode_pixel_chunks(vae, pixels, chunk=chunk, dtype=dtype) * scale
 
     def configure_model(self) -> None:
         """--fsdp2 (Lightning ModelParallelStrategy): shard every DiT block, then the
