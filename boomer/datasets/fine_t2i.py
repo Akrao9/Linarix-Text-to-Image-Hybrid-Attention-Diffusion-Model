@@ -266,10 +266,23 @@ class FineT2IStreamingDataset(IterableDataset):
     # so a dead HTTP connection otherwise parks the worker forever (observed: 7h
     # at 0% GPU with no error). Generous by design — a slow shard is not a stall.
     stall_timeout_s: float = 300.0
+    # Socket-level read deadline, the mechanism monet_direct relies on: it inherits
+    # ParquetStreamingLatentCacheDataset, which sets HF_HUB_DOWNLOAD_TIMEOUT
+    # (wds_latents.py:1496), so a half-open connection raises ReadTimeout in SECONDS,
+    # is classified transient, and costs one skipped shard. fine_t2i only referenced
+    # that env var in a comment and never set it, so its reads blocked forever and the
+    # only backstop was the 300s watchdog below -- whose remedy is a full stream
+    # rebuild, orders of magnitude more expensive than skipping a shard. Setting this
+    # is what keeps the watchdog a last resort instead of the primary mechanism.
+    download_timeout_s: float = 60.0
     # Reconnect budget shared by stalls AND transient stream errors, mirroring
     # monet_direct's stream_reconnect_* (wds_latents.py:1463) so both streaming
     # paths survive the same network weather.
-    stall_max_restarts: int = 20
+    # 20 was too tight: a single Hub outage burned the budget and killed a 6-hour run
+    # even though 11 of 12 workers were healthy (PyTorch has no way to continue with a
+    # dead worker). At the 600s cap this is ~8h of trying before giving up, which is the
+    # right trade when the alternative is losing the run.
+    stall_max_restarts: int = 40
     stall_reconnect_backoff: float = 5.0
     _caption_rng: random.Random = field(init=False, repr=False)
     _sources: tuple[str, ...] = field(init=False, repr=False, default=())
@@ -294,8 +307,15 @@ class FineT2IStreamingDataset(IterableDataset):
         self._caption_rng = random.Random(self.seed)
 
     def _load_one(self, data_dir: str | None, data_files: Any = None):
+        import os
+
         from datasets import load_dataset
 
+        # Set inside the worker process, not __post_init__: with spawn the dataset is
+        # re-created per worker, and this must be in the env of whichever process
+        # actually opens the sockets. setdefault so an explicit env still wins.
+        if self.download_timeout_s > 0:
+            os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", str(int(self.download_timeout_s)))
         token = self.hf_token if isinstance(self.hf_token, str) else None
         kwargs: dict[str, Any] = {}
         files = data_files if data_files is not None else self.data_files
@@ -556,7 +576,15 @@ class FineT2IStreamingDataset(IterableDataset):
                     f"with no data in between (last: {reason}) — giving up rather "
                     "than hanging"
                 )
-            delay = min(self.stall_reconnect_backoff * 2.0 ** max(0, consecutive - 1), 60.0)
+            # Cap at 600s, not 60s: the failure this recovers from is usually Hub-side
+            # rate limiting, which clears in minutes. Retrying every 60s prolongs it.
+            delay = min(self.stall_reconnect_backoff * 2.0 ** max(0, consecutive - 1), 600.0)
+            # Jitter, because every worker stalls on the same outage and would otherwise
+            # rebuild in lockstep -- 12 simultaneous re-resolutions is a thundering herd
+            # that causes the rate limiting that causes the next stall. monet_direct is
+            # inherently staggered (each worker is mid-shard at a different offset), so
+            # it never needed this.
+            delay *= random.uniform(0.5, 1.5)
             budget = (
                 f"consecutive failure {consecutive}/{self.stall_max_restarts}"
                 if consecutive
