@@ -205,7 +205,12 @@ class BoomerLit(pl.LightningModule):
         # residency rules as the text encoder box above.
         self._vae_box: list[Any] = []
         self._vae_compiled = False
-        self._vae_eager_encoder: Any = None
+        # Plain list, NOT a bare attribute: assigning an nn.Module to self registers it
+        # as a submodule, which puts the whole frozen DC-AE encoder into state_dict and
+        # then into every checkpoint -- and makes those checkpoints fail to load with
+        # "Unexpected key(s) in state_dict: _vae_eager_encoder.*". Same out-of-tree
+        # residency rule as _vae_box / _text_encoder_box above, for the same reason.
+        self._vae_eager_box: list[Any] = []
         # --fill-training: mask-type mix, parsed once (fails fast on a bad spec).
         self._fill_mask_probs = (
             parse_fill_mask_probs(hp.get("fill_mask_probs")) if hp.get("fill_training") else None
@@ -320,7 +325,7 @@ class BoomerLit(pl.LightningModule):
                 # #11864) -- both on the @apply_forward_hook-decorated .encode
                 # rather than the raw .encoder compiled here, but a frozen
                 # preprocessing step is not worth a hard crash either way.
-                self._vae_eager_encoder = encoder
+                self._vae_eager_box.append(encoder)
                 vae.encoder = torch.compile(encoder, mode=mode)
                 print(f"[compile-vae] torch.compile(mode={mode}) on the DC-AE encoder",
                       flush=True)
@@ -354,15 +359,14 @@ class BoomerLit(pl.LightningModule):
         try:
             return self._encode_pixel_chunks(vae, pixels, chunk=chunk, dtype=dtype) * scale
         except Exception as exc:  # noqa: BLE001 - --compile-vae fallback, see below
-            if self._vae_eager_encoder is None:
+            if not self._vae_eager_box:
                 raise
             # Drop the compiled encoder permanently and redo this batch eagerly. The
             # latents are numerically the same either way, so the run continues with
             # nothing worse than the speed it had before --compile-vae.
             print(f"[compile-vae] compiled DC-AE encoder failed ({type(exc).__name__}: "
                   f"{exc}); falling back to eager for the rest of the run", flush=True)
-            vae.encoder = self._vae_eager_encoder
-            self._vae_eager_encoder = None
+            vae.encoder = self._vae_eager_box.pop()
             return self._encode_pixel_chunks(vae, pixels, chunk=chunk, dtype=dtype) * scale
 
     def configure_model(self) -> None:
@@ -412,6 +416,21 @@ class BoomerLit(pl.LightningModule):
         }
 
     def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        # An early --compile-vae build stashed the eager DC-AE encoder as a bare
+        # attribute, which registered it as a submodule and baked the whole frozen
+        # encoder into state_dict. Those checkpoints are otherwise fine but refuse to
+        # load ("Unexpected key(s) in state_dict: _vae_eager_encoder.*"), so drop the
+        # keys here. Purely a compatibility shim for checkpoints already on disk;
+        # current builds keep the encoder in _vae_eager_box and never write them.
+        state = checkpoint.get("state_dict")
+        if state:
+            stale = [k for k in state if k.startswith("_vae_eager_encoder.")]
+            for key in stale:
+                del state[key]
+            if stale:
+                print(f"[resume] dropped {len(stale)} stale _vae_eager_encoder.* keys "
+                      "(frozen DC-AE wrongly saved into an older checkpoint)", flush=True)
+
         # Adam moments saved by the legacy Conv2d GLUMBConv are 4D (O, I, 1, 1); the
         # migrated Linear params are 2D. Optimizer.load_state_dict casts dtype/device
         # but never reshapes, so realign same-numel moment tensors to the current
