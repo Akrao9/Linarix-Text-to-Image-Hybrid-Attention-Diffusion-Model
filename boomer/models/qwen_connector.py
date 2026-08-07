@@ -50,6 +50,13 @@ class QwenConnectorConfig:
     connector_heads: int = 12
     connector_mlp_ratio: float = 4.0
     readout_layer: int = -1  # which Qwen hidden_states layer to resample (-1 = last)
+    # v8 fixed multi-layer fusion: read SEVERAL hidden_states layers (e.g. (9, 18, 27)),
+    # non-affine-RMSNorm each per token, and concatenate on the feature dim — the readout
+    # becomes [B, L, len(layers) * hidden]. Overrides readout_layer when set. The stack is
+    # truncated to max(layers) and the encoder's own final norm is neutralized, so every
+    # selected layer is the RAW block output normalized identically by us — immune to the
+    # transformers-version final-norm drift that bit the single-layer readout.
+    readout_layers: tuple[int, ...] | None = None
     freeze_encoder: bool = True
     instruction: str | None = DEFAULT_INSTRUCTION
     max_text_tokens: int = 512
@@ -63,6 +70,13 @@ class QwenConnectorConfig:
 
 def _resolve_dtype(dtype: str) -> torch.dtype:
     return {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[dtype.lower()]
+
+
+def _rms_norm_fp32(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Non-affine RMSNorm with fp32 accumulation (Llama casting convention)."""
+    x_fp32 = x.float()
+    normed = x_fp32 * torch.rsqrt(x_fp32.square().mean(dim=-1, keepdim=True) + eps)
+    return normed.to(dtype=x.dtype)
 
 
 class QwenReferenceEncoder(nn.Module):
@@ -99,6 +113,9 @@ class QwenReferenceEncoder(nn.Module):
         # stack and the final norm is an Identity, so last_hidden_state is bit-identical
         # to hidden_states[readout_layer] and output_hidden_states becomes unnecessary.
         self._truncated_to_last = False
+        # Multi-layer fusion readout (config.readout_layers): needs hidden_states even
+        # on the base-model path, and the readout is a concat rather than one entry.
+        self._multi_readout = False
 
     # -- lazy load -----------------------------------------------------------
     def load(self) -> None:
@@ -173,7 +190,10 @@ class QwenReferenceEncoder(nn.Module):
         )
         # Drop every transformer layer above the readout layer: hidden_states[readout]
         # is unchanged by layers that run after it, so computing them is pure waste.
-        self._truncate_to_readout(model)
+        if self.config.readout_layers:
+            self._truncate_to_layer_list(model)
+        else:
+            self._truncate_to_readout(model)
         # Prefer the base transformer for forward() so the lm_head is never run.
         self._base_model = self._find_base_with_layers(model)
         # Capture the genuine final norm so a final-layer readout can be normed even on
@@ -237,6 +257,52 @@ class QwenReferenceEncoder(nn.Module):
         self._truncated_to_last = True
         print(f"[qwen] truncated encoder to {r_abs}/{n} layers (readout={r_abs}); upper layers + lm_head skipped.")
 
+    def _truncate_to_layer_list(self, model: nn.Module) -> None:
+        """Multi-layer fusion readout: truncate to max(readout_layers), neutralize the
+        final norm so EVERY selected hidden_states entry is the raw block output (we
+        apply our own non-affine RMSNorm per layer at readout), and mark the readout
+        as multi so forward() always requests hidden_states."""
+        holder = self._find_base_with_layers(model)
+        n = len(holder.layers) if holder is not None else 0
+        raw = tuple(self.config.readout_layers or ())
+        if holder is None:
+            raise RuntimeError(
+                "readout_layers needs the base transformer's layer stack, which could "
+                f"not be located on {type(model).__name__}"
+            )
+        resolved = []
+        for r in raw:
+            r_abs = r if r >= 0 else (n + 1 + r)
+            if not (1 <= r_abs <= n):
+                raise ValueError(
+                    f"readout_layers entry {r} resolves to {r_abs}, outside [1, {n}] "
+                    f"for a {n}-layer encoder"
+                )
+            resolved.append(r_abs)
+        resolved = sorted(set(resolved))
+        self.config.readout_layers = tuple(resolved)
+        self._multi_readout = True
+        self._readout_is_final = False  # our per-layer RMSNorm replaces the final norm
+        max_layer = resolved[-1]
+        if max_layer < n:
+            holder.layers = nn.ModuleList(list(holder.layers)[:max_layer])
+        for norm_attr in ("norm", "final_layernorm", "ln_f"):
+            if hasattr(holder, norm_attr) and getattr(holder, norm_attr) is not None:
+                setattr(holder, norm_attr, nn.Identity())
+                break
+        cfg = getattr(model, "config", None)
+        for cfg_obj in (cfg, getattr(cfg, "text_config", None)):
+            if cfg_obj is not None and hasattr(cfg_obj, "num_hidden_layers"):
+                try:
+                    cfg_obj.num_hidden_layers = max_layer
+                except Exception:
+                    pass
+        print(
+            f"[qwen] multi-layer readout {tuple(resolved)}: truncated encoder to "
+            f"{max_layer}/{n} layers; per-layer non-affine RMSNorm + concat "
+            f"({len(resolved)}x hidden)."
+        )
+
     @property
     def _base_is_compiled(self) -> bool:
         return (
@@ -277,6 +343,15 @@ class QwenReferenceEncoder(nn.Module):
             flush=True,
         )
         return True
+
+    @property
+    def readout_dim(self) -> int | None:
+        """Feature dim of the readout: hidden_size, times len(readout_layers) under
+        multi-layer fusion. None until load() has resolved hidden_size."""
+        if not self.hidden_size:
+            return None
+        count = len(self.config.readout_layers) if self.config.readout_layers else 1
+        return self.hidden_size * count
 
     @property
     def model(self) -> nn.Module:
@@ -358,7 +433,9 @@ class QwenReferenceEncoder(nn.Module):
         # The full model returns CausalLM output with no last_hidden_state, so that
         # runner always needs the flag (including the fallback retry below).
         base_runner = runner is not model
-        want_hidden = not (base_runner and (self._truncated_to_last or self._readout_is_final))
+        want_hidden = self._multi_readout or not (
+            base_runner and (self._truncated_to_last or self._readout_is_final)
+        )
         try:
             out = runner(**inputs, output_hidden_states=want_hidden, use_cache=False, return_dict=True)
         except Exception as exc:
@@ -382,7 +459,16 @@ class QwenReferenceEncoder(nn.Module):
                 out = model(**inputs, output_hidden_states=True, use_cache=False, return_dict=True)
             else:
                 raise
-        if not want_hidden:
+        if self._multi_readout:
+            # v8 fixed multi-layer fusion: per-layer non-affine RMSNorm (fp32 math),
+            # then feature-dim concat, shallow -> deep. Every entry is a raw block
+            # output (final norm neutralized at load), so the three layers get
+            # identical normalization treatment.
+            hidden_states = torch.cat(
+                [_rms_norm_fp32(out.hidden_states[i]) for i in self.config.readout_layers],
+                dim=-1,
+            )
+        elif not want_hidden:
             # Base-model path where last_hidden_state IS the readout: truncated (final
             # norm neutralized) or a genuine final-layer readout (post-final-norm).
             hidden_states = out.last_hidden_state

@@ -65,7 +65,7 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -231,9 +231,11 @@ class BoomerLit(pl.LightningModule):
     def _resident_text_encoder(self) -> QwenReferenceEncoder:
         if not self._text_encoder_box:
             hp = self.hparams
+            readout_layers = parse_int_tuple(hp.get("text_encoder_layers"))
             cfg = QwenConnectorConfig(
                 qwen_model_id=hp.text_encoder_id,
                 readout_layer=hp.text_encoder_layer,
+                readout_layers=readout_layers,
                 instruction=(
                     QwenConnectorConfig.instruction if hp.text_encoder_instruction else None
                 ),
@@ -242,9 +244,14 @@ class BoomerLit(pl.LightningModule):
             )
             encoder = QwenReferenceEncoder(cfg, hf_token=self._hf_token)
             encoder.load()
+            layer_desc = (
+                f"layers={readout_layers} (fused, dim={encoder.readout_dim})"
+                if readout_layers
+                else f"layer={hp.text_encoder_layer}"
+            )
             print(
                 f"[text-encoder] {hp.text_encoder_id} resident (hidden={encoder.hidden_size}, "
-                f"layer={hp.text_encoder_layer}, max_length={hp.text_encoder_max_length})",
+                f"{layer_desc}, max_length={hp.text_encoder_max_length})",
                 flush=True,
             )
             self._text_encoder_box.append(encoder)
@@ -666,6 +673,20 @@ class BoomerLit(pl.LightningModule):
             # sanity signal that the mask distribution is what --fill-mask-probs asked for.
             self.log("train/fill_coverage", fill_mask.float().mean(),
                      on_step=True, on_epoch=False, batch_size=bs)
+        # v8 Block AttnRes telemetry: mean depth-attention weight per (site, slot). Slot 0
+        # is the token embedding, the last slot is the current stream ("latest"). Mass
+        # staying ~1 on the last slot = AttnRes has degenerated to its identity init; mass
+        # spreading to earlier slots = it is earning its parameters. last_weights refreshes
+        # on EAGER forwards only (torch.compile skips the attribute mutation), so under
+        # --compile these logs are simply absent.
+        attnres = getattr(self.model, "block_attnres", None)
+        if attnres is not None:
+            for site, w in enumerate(attnres.last_weights):
+                if w is None:
+                    continue
+                for slot in range(w.numel()):
+                    self.log(f"attnres/site{site}_slot{slot}", w[slot],
+                             on_step=True, on_epoch=False, batch_size=bs)
 
         if repa_feat is not None:
             cos = F.cosine_similarity(
@@ -2138,6 +2159,17 @@ def text_encoder_hidden_size(model_id: str, hf_token: str | bool | None) -> int:
     return int(hidden)
 
 
+def parse_int_tuple(csv: str | Sequence[int] | None) -> tuple[int, ...] | None:
+    """'7,11,15,21' -> (7, 11, 15, 21); None/empty -> None. Tolerates an
+    already-parsed tuple/list (hparams checkpoint round-trips)."""
+    if not csv:
+        return None
+    if isinstance(csv, (tuple, list)):
+        return tuple(int(v) for v in csv) or None
+    values = tuple(int(v) for v in csv.split(",") if v.strip())
+    return values or None
+
+
 def build_config(args: argparse.Namespace, record: Any) -> BoomerFLADiTConfig:
     # With --skip-peek, record is None and dims come from the explicit flags (no shard
     # download at startup). Otherwise dims are read from one peeked cache record.
@@ -2200,6 +2232,13 @@ def build_config(args: argparse.Namespace, record: Any) -> BoomerFLADiTConfig:
         repa_dim=args.repa_dim,
         repa_layer=args.repa_layer,
         dispersive_layer=args.dispersive_layer,
+        refresh_layers=parse_int_tuple(args.refresh_layers),
+        refresh_no_mixer=args.refresh_no_mixer,
+        block_attnres=args.block_attnres,
+        attnres_group_ends=(
+            (parse_int_tuple(args.attnres_group_ends) or ()) if args.block_attnres else ()
+        ),
+        attnres_latest_bias=args.attnres_latest_bias,
     )
 
 
@@ -2401,6 +2440,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--text-encoder-layer", type=int, default=-2,
                    help="hidden_states readout layer (-2 = second-to-last, raw/un-normed; "
                         "layers above it are dropped so they are never computed).")
+    p.add_argument("--text-encoder-layers", default=None,
+                   help="v8 fixed multi-layer fusion: csv of hidden_states layers (e.g. "
+                        "'9,18,27'). Each is non-affine-RMSNormed per token and concatenated on "
+                        "the feature dim, so text_dim becomes len(layers) x hidden. Overrides "
+                        "--text-encoder-layer; the stack is truncated to the deepest entry.")
     p.add_argument("--text-encoder-max-length", type=int, default=300,
                    help="fixed token length for on-the-fly encoding; becomes text_seq_len.")
     p.add_argument("--text-encoder-instruction", action=bo, default=True,
@@ -2472,6 +2516,27 @@ def build_parser() -> argparse.ArgumentParser:
                         "block — one MMDiT-style attention over [text; image] replaces the "
                         "image-only full attention + that block's cross-attn, and text is updated "
                         "through its own out-proj + FFN (SD3-style renegotiation).")
+    p.add_argument("--refresh-layers", default=None,
+                   help="v8: explicit joint-refresh block indices (encoder-absolute, zero-based "
+                        "csv, e.g. '7,11,15,21'). Overrides the --image-attn-every cadence AND "
+                        "the trailing-candidate demotion, so the final encoder block can be a "
+                        "refresh block. Implies joint refresh at exactly these depths.")
+    p.add_argument("--refresh-no-mixer", action=bo, default=False,
+                   help="v8 substitutive refresh: refresh blocks drop the GDN2/FLA mixer — joint "
+                        "attention replaces it instead of supplementing it (GLUMBConv stays).")
+    p.add_argument("--block-attnres", action=bo, default=False,
+                   help="v8: Kimi Block AttnRes (arXiv 2603.15031) over encoder residual groups. "
+                        "Snapshots the image stream after each --attnres-group-ends block; the "
+                        "next group starts from a learned per-token softmax mixture over "
+                        "[token embedding, snapshots]. Latest-biased function-preserving init.")
+    p.add_argument("--attnres-group-ends", default="3,7,11,15",
+                   help="csv of encoder block indices closing each AttnRes group (the last group "
+                        "needs no boundary). v8 layout: 3,7,11,15 -> groups 0-3/4-7/8-11/12-15/16-21.")
+    p.add_argument("--attnres-latest-bias", type=float, default=4.0,
+                   help="initial depth-attention logit bias on the newest slot. 4.0 puts ~92%% of "
+                        "the softmax mass on the current stream at init (approximately the "
+                        "ordinary residual pathway) while keeping usable gradients; the paper's "
+                        "uniform-average init is 0.")
     p.add_argument("--ddt-decoder-depth", type=int, default=0,
                    help="v7: DDT split (arXiv 2504.05741) — the last N of --depth blocks become a "
                         "velocity decoder (full softmax attention + GLUMBConv, conditioned "
@@ -2852,15 +2917,21 @@ def main() -> None:
         # --edit-direct / --t2i-direct have no latents to peek (pixels; dims from flags).
         args.text_seq_len = args.text_encoder_max_length
         args.text_dim = text_encoder_hidden_size(args.text_encoder_id, hf_token)
+        fusion_layers = parse_int_tuple(args.text_encoder_layers)
+        if fusion_layers:
+            # v8 multi-layer fusion: the readout concatenates len(layers) RMSNormed
+            # hidden states, so the DiT's text_dim grows by the same factor.
+            args.text_dim *= len(fusion_layers)
         tag = (
             "monet-direct" if args.monet_direct
             else "edit-direct" if args.edit_direct
             else "t2i-direct" if args.t2i_direct
             else "captions-only"
         )
+        layer_desc = f"layers {fusion_layers}" if fusion_layers else f"layer {args.text_encoder_layer}"
         print(
             f"[{tag}] on-the-fly text: {args.text_encoder_id} "
-            f"(layer {args.text_encoder_layer}) -> text=({args.text_seq_len},{args.text_dim})",
+            f"({layer_desc}) -> text=({args.text_seq_len},{args.text_dim})",
             flush=True,
         )
     if args.monet_direct or args.edit_direct or args.t2i_direct:

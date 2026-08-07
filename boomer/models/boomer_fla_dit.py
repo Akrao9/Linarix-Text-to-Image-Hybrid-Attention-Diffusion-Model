@@ -118,6 +118,26 @@ class BoomerFLADiTConfig:
     # no external target (unlike REPA), so it works on the existing cache. The loss weight
     # is a training hyperparameter; this only selects which block's features to expose.
     dispersive_layer: int = -1  # block whose hidden state to disperse; -1 => depth // 2
+    # v8: explicit joint-refresh placement (encoder-absolute, zero-based). Overrides the
+    # image_attention_every cadence selector AND its trailing-candidate demotion, so the
+    # final encoder block CAN be a refresh block (the v8 layout ends in one: z leaves the
+    # encoder through exact global mixing). None = keep the v6 cadence machinery.
+    refresh_layers: tuple[int, ...] | None = None
+    # v8: substitutive refresh — joint refresh blocks drop the GDN2/FLA mixer entirely,
+    # so attention REPLACES the linear mixer at those depths instead of supplementing it.
+    # The 9-way modulation layout is kept (msa rows simply unused), preserving shared-adaLN
+    # compatibility with BoomerFLABlock. False = v6/v7 additive form (mixer + attention).
+    refresh_no_mixer: bool = False
+    # v8: Kimi Block AttnRes (arXiv 2603.15031) across encoder residual groups. The image
+    # stream is snapshotted after each block index in attnres_group_ends; the next group
+    # starts from a learned per-token softmax mixture over [token embedding, snapshots].
+    # Init is function-preserving-biased: pseudo-queries start at zero and a per-slot bias
+    # puts ~e^latest_bias of the softmax mass on the newest state, so training starts from
+    # (approximately) the ordinary residual pathway rather than the paper's uniform average.
+    # Encoder-only; text tokens are never stored in the bank; the decoder is untouched.
+    block_attnres: bool = False
+    attnres_group_ends: tuple[int, ...] = ()
+    attnres_latest_bias: float = 4.0
 
 
 def maybe_add_sibling_fla_repo() -> None:
@@ -1370,11 +1390,16 @@ class BoomerFLAJointRefreshBlock(JointTextImageAttentionMixin, nn.Module):
     """v6 joint refresh block: GDN2 spine + one MMDiT-style [text; image] attention.
 
     Takes the slots the full-image-attention BoomerFLABlocks occupied (every
-    image_attention_every-th post-prefix block). The FLA mixer and GLUMBConv stay the
-    image-token spine, but the image-only attention and the separate text cross-attn
-    are replaced by joint attention whose text half is written back through its own
-    out-projection and FFN — so text re-negotiates against the evolving image state
-    at every refresh instead of staying frozen after the dual-stream prefix.
+    image_attention_every-th post-prefix block, or the explicit refresh_layers list).
+    The FLA mixer and GLUMBConv stay the image-token spine, but the image-only
+    attention and the separate text cross-attn are replaced by joint attention whose
+    text half is written back through its own out-projection and FFN — so text
+    re-negotiates against the evolving image state at every refresh instead of
+    staying frozen after the dual-stream prefix.
+
+    v8 (config.refresh_no_mixer): the FLA mixer is dropped entirely — joint attention
+    IS the token mixer at refresh depths. GLUMBConv stays; the 9-way modulation layout
+    is kept with its msa rows unused, preserving shared-adaLN compatibility.
 
     Modulation reuses the single-stream 9-way layout (the cross rows now modulate the
     joint attention), so shared-adaLN blocks consume the same shared_mod projection as
@@ -1394,11 +1419,19 @@ class BoomerFLAJointRefreshBlock(JointTextImageAttentionMixin, nn.Module):
         self.hidden_dim = hidden_dim
         self.parallel_block = config.parallel_block
 
-        self.norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
-        if config.mixer_type in {"torch", "fallback"}:
-            self.self_attn = TorchSelfAttention(hidden_dim, config.num_heads)
+        # v8 substitutive form: no GDN2/FLA mixer at refresh depths — the joint attention
+        # IS the token mixer here. Modulation stays the 9-way layout (msa rows unused),
+        # so shared-adaLN blocks still consume the same shared_mod projection.
+        self.no_mixer = config.refresh_no_mixer
+        if self.no_mixer:
+            self.norm1 = None
+            self.self_attn = None
         else:
-            self.self_attn = FLASelfMixer(config, layer_idx=layer_idx)
+            self.norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
+            if config.mixer_type in {"torch", "fallback"}:
+                self.self_attn = TorchSelfAttention(hidden_dim, config.num_heads)
+            else:
+                self.self_attn = FLASelfMixer(config, layer_idx=layer_idx)
         self.norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
         self.mlp = GLUMBConv(hidden_dim, config.mlp_ratio)
 
@@ -1430,7 +1463,7 @@ class BoomerFLAJointRefreshBlock(JointTextImageAttentionMixin, nn.Module):
         self.scale_shift_table = nn.Parameter(torch.zeros(9, hidden_dim))
         self.text_scale_shift_table = nn.Parameter(torch.zeros(6, hidden_dim))
 
-        self.sandwich_mixer = make_sandwich_norm(config)
+        self.sandwich_mixer = None if self.no_mixer else make_sandwich_norm(config)
         self.sandwich_joint = make_sandwich_norm(config)
         self.sandwich_mlp = make_sandwich_norm(config)
         self.text_sandwich_attn = make_sandwich_norm(config)
@@ -1507,17 +1540,16 @@ class BoomerFLAJointRefreshBlock(JointTextImageAttentionMixin, nn.Module):
                 image_coord_ids,
                 text_coord_ids,
             )
-            x = image_base + (
-                gate_msa
-                * self.sandwich_mixer(
-                    self._mixer(modulate(self.norm1(image_base), shift_msa, scale_msa), mixer_perm, mixer_perm_inv)
-                )
-                + gate_joint * self.sandwich_joint(image_attn)
-                + gate_mlp
-                * self.sandwich_mlp(
-                    self.mlp(modulate(self.norm2(image_base), shift_mlp, scale_mlp), height=height, width=width)
-                )
+            image_update = gate_joint * self.sandwich_joint(image_attn) + gate_mlp * self.sandwich_mlp(
+                self.mlp(modulate(self.norm2(image_base), shift_mlp, scale_mlp), height=height, width=width)
             )
+            if not self.no_mixer:
+                image_update = image_update + gate_msa * self.sandwich_mixer(
+                    self._mixer(
+                        modulate(self.norm1(image_base), shift_msa, scale_msa), mixer_perm, mixer_perm_inv
+                    )
+                )
+            x = image_base + image_update
             text_tokens = text_base + (
                 text_gate_attn * self.text_sandwich_attn(text_attn)
                 + text_gate_mlp
@@ -1527,9 +1559,10 @@ class BoomerFLAJointRefreshBlock(JointTextImageAttentionMixin, nn.Module):
             )
             return x, text_tokens
 
-        x = x + gate_msa * self.sandwich_mixer(
-            self._mixer(modulate(self.norm1(x), shift_msa, scale_msa), mixer_perm, mixer_perm_inv)
-        )
+        if not self.no_mixer:
+            x = x + gate_msa * self.sandwich_mixer(
+                self._mixer(modulate(self.norm1(x), shift_msa, scale_msa), mixer_perm, mixer_perm_inv)
+            )
         image_attn, text_attn = self._joint_attention(
             modulate(self.joint_norm(x), shift_joint, scale_joint),
             modulate(self.text_norm1(text_tokens), text_shift_attn, text_scale_attn),
@@ -1670,6 +1703,65 @@ class BoomerFLADDTDecoderBlock(nn.Module):
         return y
 
 
+class BlockAttnRes(nn.Module):
+    """Kimi Block AttnRes (arXiv 2603.15031) over encoder residual-group snapshots.
+
+    Follows the official pseudocode: per retrieval site, stack the stored states
+    [N, B, T, D], RMS-normalize the KEYS only (values stay raw), score each state with
+    a single learned pseudo-query vector, softmax over depth PER TOKEN, and return the
+    weighted mixture. Departures from the paper, both deliberate (v8 plan):
+
+    * Retrieval runs once per residual GROUP boundary (4 sites for the 22-block
+      encoder), not before every sublayer — the states are cumulative stream
+      snapshots, so a mixture concentrated on the newest slot IS the ordinary
+      residual pathway.
+    * Init is latest-biased instead of uniform: pseudo-queries start at zero and a
+      per-slot logit bias puts most of the softmax mass on the newest state, so the
+      model starts (approximately) function-preserving rather than averaging the
+      stream down by 1/N. Softmax and scoring run in fp32.
+
+    Site k mixes k + 2 slots: [token embedding b0, snapshot 1, ..., snapshot k+1],
+    where the last slot is the stream that just crossed the boundary.
+    """
+
+    def __init__(self, hidden_dim: int, num_sites: int, latest_bias: float) -> None:
+        super().__init__()
+        if num_sites < 1:
+            raise ValueError(f"BlockAttnRes needs at least one site, got {num_sites}")
+        self.queries = nn.ParameterList(
+            nn.Parameter(torch.zeros(hidden_dim)) for _ in range(num_sites)
+        )
+        biases = []
+        for site in range(num_sites):
+            bias = torch.zeros(site + 2)
+            bias[-1] = latest_bias
+            biases.append(nn.Parameter(bias))
+        self.slot_biases = nn.ParameterList(biases)
+        # Telemetry: mean depth-attention weights per site, refreshed on eager forwards
+        # (skipped inside torch.compile graphs — attribute mutation would specialize).
+        # Plain attribute, deliberately outside state_dict.
+        self.last_weights: list[torch.Tensor | None] = [None] * num_sites
+
+    def forward(self, site: int, states: list[torch.Tensor]) -> torch.Tensor:
+        expected = site + 2
+        if len(states) != expected:
+            raise ValueError(f"site {site} expects {expected} states, got {len(states)}")
+        values = torch.stack(states)  # [N, B, T, D]
+        # Keys only are normalized (official recipe); fp32 before squaring, same
+        # convention as AttentionRMSNorm.
+        v32 = values.float()
+        keys = v32 * torch.rsqrt(v32.square().mean(dim=-1, keepdim=True) + 1e-6)
+        logits = torch.einsum("d,nbtd->nbt", self.queries[site].float(), keys)
+        logits = logits + self.slot_biases[site].float().view(-1, 1, 1)
+        weights = logits.softmax(dim=0)  # fp32 softmax over depth, per token
+        mixed = torch.einsum("nbt,nbtd->btd", weights, v32).to(values.dtype)
+        if not torch.compiler.is_compiling():
+            # Stays on-device: a .cpu() here would sync the stream every step. Loggers
+            # that want host values pay that cost at their own cadence.
+            self.last_weights[site] = weights.detach().mean(dim=(1, 2))
+        return mixed
+
+
 class BoomerFLADiT(nn.Module):
     """Boomer DiT with FLA mixers, optional full image attention, and GLUMBConv FFNs."""
 
@@ -1699,7 +1791,11 @@ class BoomerFLADiT(nn.Module):
             )
         if config.cross_attention_every < 1:
             raise ValueError(f"cross_attention_every must be >= 1, got {config.cross_attention_every}")
-        if config.joint_refresh_attention and config.image_attention_every <= 0:
+        if (
+            config.joint_refresh_attention
+            and config.refresh_layers is None
+            and config.image_attention_every <= 0
+        ):
             raise ValueError("joint_refresh_attention reuses the image_attention_every cadence; set it > 0")
         if config.rope_ntk_factor <= 0.0:
             raise ValueError(f"rope_ntk_factor must be positive, got {config.rope_ntk_factor}")
@@ -1734,8 +1830,21 @@ class BoomerFLADiT(nn.Module):
         # if some LATER block reads text again (another refresh block, or a cross-attn
         # block). The final candidate usually has no such reader, so its slot keeps the
         # classic image-attention block instead of carrying dead text-update weights.
+        #
+        # v8: refresh_layers pins the placement explicitly and skips BOTH the cadence
+        # rule and the demotion walk — the v8 layout deliberately ends the encoder in a
+        # refresh block (its text write-back is dead, but z leaving through exact joint
+        # global mixing is the point).
         refresh_indices: set[int] = set()
-        if config.joint_refresh_attention:
+        if config.refresh_layers is not None:
+            for i in config.refresh_layers:
+                if not (config.dual_stream_depth <= i < encoder_depth):
+                    raise ValueError(
+                        f"refresh_layers entry {i} must lie in [{config.dual_stream_depth}, "
+                        f"{encoder_depth}) (post-dual-stream encoder blocks)"
+                    )
+            refresh_indices = set(config.refresh_layers)
+        elif config.joint_refresh_attention:
             reader_after = False
             for i in reversed(range(config.dual_stream_depth, encoder_depth)):
                 if (i + 1) % config.image_attention_every == 0 and reader_after:
@@ -1793,6 +1902,27 @@ class BoomerFLADiT(nn.Module):
         # self.blocks is the condition encoder (== the whole model when DDT is off).
         self.blocks = nn.ModuleList([make_block(i) for i in range(encoder_depth)])
         self.encoder_depth = encoder_depth
+        # v8 Block AttnRes: one retrieval site per group boundary. Snapshot the image
+        # stream after each attnres_group_ends block; the next block starts from the
+        # site's softmax mixture over [token embedding, snapshots so far]. Optional
+        # module (no state-dict keys when off), same convention as decoder_blocks.
+        self.block_attnres: BlockAttnRes | None = None
+        self._attnres_group_ends: tuple[int, ...] = ()
+        if config.block_attnres:
+            ends = tuple(config.attnres_group_ends)
+            if not ends:
+                raise ValueError("block_attnres=True needs non-empty attnres_group_ends")
+            if list(ends) != sorted(set(ends)):
+                raise ValueError(f"attnres_group_ends must be strictly increasing, got {ends}")
+            if ends[0] < 0 or ends[-1] >= encoder_depth - 1:
+                raise ValueError(
+                    f"attnres_group_ends {ends} must lie in [0, {encoder_depth - 1}) — each "
+                    "boundary needs at least one encoder block after it to feed"
+                )
+            self._attnres_group_ends = ends
+            self.block_attnres = BlockAttnRes(
+                hidden_dim, num_sites=len(ends), latest_bias=config.attnres_latest_bias
+            )
         # v7 DDT velocity decoder: empty ModuleList (no state-dict keys) when off, so a
         # ddt_decoder_depth=0 model is key-for-key identical to pre-v7 checkpoints.
         self.decoder_blocks = nn.ModuleList(
@@ -2173,6 +2303,10 @@ class BoomerFLADiT(nn.Module):
         want_dispersive = return_dispersive
         repa_feat: torch.Tensor | None = None
         dispersive_feat: torch.Tensor | None = None
+        # v8 Block AttnRes: the bank opens with the token embedding (paper: "blocks
+        # already include token embedding"). Image stream only — text is never stored.
+        attnres_bank: list[torch.Tensor] = [x] if self.block_attnres is not None else []
+        attnres_site = 0
         for layer_idx, block in enumerate(self.blocks):
             if getattr(block, "joint_refresh", False):
                 # Joint refresh block: returns (x, text_tokens); needs both the mixer
@@ -2257,6 +2391,15 @@ class BoomerFLADiT(nn.Module):
                 # Pool image tokens -> per-sample feature; dispersion is computed in the
                 # loss. No projector: the regularizer acts on the raw hidden state.
                 dispersive_feat = x.mean(dim=1)
+            # Group boundary: snapshot the stream (it becomes the site's "latest" slot,
+            # where the latest-biased init concentrates the softmax), then hand the next
+            # group the retrieved mixture. Runs AFTER the REPA/dispersive captures so
+            # those keep seeing the plain block output. Outside the checkpointed block
+            # calls on purpose: the bank entries are outer-loop tensors either way.
+            if self.block_attnres is not None and layer_idx in self._attnres_group_ends:
+                attnres_bank.append(x)
+                x = self.block_attnres(attnres_site, attnres_bank)
+                attnres_site += 1
         if self.decoder_x_embedder is not None:
             # v7 DDT: the encoder output z is the semantic state carrier. _ddt_decode
             # re-embeds the noisy latent and runs the 6 decoder blocks under s=silu(t+z).
