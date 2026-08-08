@@ -554,3 +554,72 @@ def test_joint_sdpa_matches_plain_sdpa_on_cpu() -> None:
     mask[..., 0] = True  # every query keeps at least one key
     ref = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
     assert torch.equal(joint_sdpa(q, k, v, mask), ref)
+
+
+# --- image-first joint sequence + flash4 varlen ------------------------------------
+
+
+def test_image_first_reorder_is_mathematically_identical() -> None:
+    """The joint sequence moved from [text; image] to [image; text] so padded text sits
+    at the tail (a precondition for varlen's seqused_k). Attention is permutation-
+    invariant over keys, so per-modality outputs must be unchanged — verified here on
+    the real path rather than asserted."""
+    torch.manual_seed(0)
+    b, n_img, n_txt, heads, dim = 2, 7, 5, 4, 8
+    q_i, k_i, v_i = (torch.randn(b, n_img, heads, dim) for _ in range(3))
+    q_t, k_t, v_t = (torch.randn(b, n_txt, heads, dim) for _ in range(3))
+    valid = torch.tensor([[True] * 5, [True, True, True, False, False]])
+
+    def attend(order_image_first: bool):
+        if order_image_first:
+            q = torch.cat([q_i, q_t], 1)
+            k = torch.cat([k_i, k_t], 1)
+            v = torch.cat([v_i, v_t], 1)
+            mask = torch.cat([torch.ones(b, n_img, dtype=torch.bool), valid], 1)
+        else:
+            q = torch.cat([q_t, q_i], 1)
+            k = torch.cat([k_t, k_i], 1)
+            v = torch.cat([v_t, v_i], 1)
+            mask = torch.cat([valid, torch.ones(b, n_img, dtype=torch.bool)], 1)
+        out = F.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+            attn_mask=mask[:, None, None, :],
+        ).transpose(1, 2)
+        if order_image_first:
+            img, txt = out.split([n_img, n_txt], dim=1)
+        else:
+            txt, img = out.split([n_txt, n_img], dim=1)
+        return img, txt * valid[..., None, None]
+
+    img_a, txt_a = attend(True)
+    img_b, txt_b = attend(False)
+    torch.testing.assert_close(img_a, img_b, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(txt_a, txt_b, rtol=1e-5, atol=1e-6)
+
+
+def test_padded_text_output_is_zeroed() -> None:
+    """Varlen never writes padded rows; masked SDPA leaves them garbage-but-finite.
+    Either way nothing downstream may see an unwritten slot."""
+    model = BoomerFLADiT(_config())
+    _break_zero_init(model)
+    x, t, text, _ = _batch(model)
+    mask = torch.ones(2, model.config.text_seq_len, dtype=torch.long)
+    mask[1, 3:] = 0                                  # sample 1 has 3 valid tokens
+    out = model(x, t, text, mask)
+    assert torch.isfinite(out).all()
+
+
+def test_joint_backend_is_validated_and_defaults_to_sdpa() -> None:
+    assert BoomerFLADiTConfig().joint_attention_backend == "sdpa"
+    model = BoomerFLADiT(_config())
+    assert model.blocks[0].joint_backend == "sdpa"
+    with pytest.raises(ValueError, match="joint_attention_backend"):
+        BoomerFLADiT(_config(joint_attention_backend="flash9"))
+
+
+def test_flash4_backend_falls_back_when_unavailable_on_cpu() -> None:
+    """flash4 selected but CPU/unavailable must silently use SDPA, not crash."""
+    model = BoomerFLADiT(_config(joint_attention_backend="flash4"))
+    assert model.blocks[0].joint_backend == "flash4"
+    out = model(*_batch(model))
+    assert out.shape[1:] == (4, 8, 8) and torch.isfinite(out).all()

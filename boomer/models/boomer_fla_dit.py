@@ -46,6 +46,14 @@ class BoomerFLADiTConfig:
     conv_size: int = 4
     image_attention_every: int = 0
     image_attention_backend: str = "sdpa"
+    # Backend for the JOINT [image; text] sites (dual-stream prefix + refresh blocks).
+    # "sdpa" uses an explicitly-selected SDPA kernel with a bool key-padding mask.
+    # "flash4" uses FlashAttention-4/CuTe's varlen API with seqused_k, which needs valid
+    # tokens as a prefix — hence the image-first sequence order (attention is
+    # permutation-invariant over keys, so the order itself changes nothing). Measured
+    # 2.0x on sm_120 at B=56 S=576 fwd+bwd; verify with tools/attn_backend_probe.py on
+    # the exact runtime before enabling, since FA4/CuTe targets sm_100.
+    joint_attention_backend: str = "sdpa"
     image_attention_qk_rmsnorm: bool = True
     image_attention_rope: bool = False
     image_rope_theta: float = 10000.0
@@ -1275,6 +1283,56 @@ class BoomerFLABlock(nn.Module):
         return x
 
 
+_FLASH4_VARLEN = None
+_FLASH4_CHECKED = False
+
+
+def _flash4_varlen_func():
+    global _FLASH4_VARLEN, _FLASH4_CHECKED
+    if not _FLASH4_CHECKED:
+        _FLASH4_CHECKED = True
+        maybe_add_sibling_flash_attention_repo()
+        try:
+            from flash_attn.cute.interface import flash_attn_varlen_func
+
+            _FLASH4_VARLEN = flash_attn_varlen_func
+        except Exception:
+            _FLASH4_VARLEN = None
+    return _FLASH4_VARLEN
+
+
+def _flash4_varlen_joint(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    text_valid: torch.Tensor,
+    num_image: int,
+) -> torch.Tensor | None:
+    """FlashAttention-4 varlen over an IMAGE-FIRST joint sequence.
+
+    ``seqused_k`` counts a valid PREFIX per sample, which is why the sequence must be
+    [image; text]: image tokens are always valid and text is right-padded, so
+    valid == num_image + caption_len is exactly a prefix. No unpacking or repacking —
+    the padded batch layout is passed through as-is.
+
+    Returns None when FA4 is unavailable so the caller falls back to SDPA. Measured 2.0x
+    over masked SDPA at B=56 S=576 on sm_120 (tools/attn_backend_probe.py).
+    """
+    fn = _flash4_varlen_func()
+    if fn is None:
+        return None
+    seqused = (num_image + text_valid.sum(dim=1)).to(torch.int32)
+    seqlen = q.shape[1]
+    out = fn(
+        q, k, v,
+        seqused_q=seqused,
+        seqused_k=seqused,
+        max_seqlen_q=seqlen,
+        max_seqlen_k=seqlen,
+    )
+    return out[0] if isinstance(out, tuple) else out
+
+
 _JOINT_SDPA_BACKEND: str | None = None
 
 
@@ -1385,41 +1443,57 @@ class JointTextImageAttentionMixin:
             self.text_q_norm,
             self.text_k_norm,
         )
-        q = torch.cat([text_q, image_q], dim=1)
-        k = torch.cat([text_k, image_k], dim=1)
-        v = torch.cat([text_v, image_v], dim=1)
+        # IMAGE-FIRST sequence order. Attention is permutation-invariant over keys, so
+        # this is mathematically identical to the historical [text; image] order — but it
+        # puts the padded text at the TAIL, which is what FlashAttention's varlen API
+        # requires (seqused_k counts a valid PREFIX). Text is right-padded by
+        # encode_qwen_text_fixed, so valid = all image + first L text is exactly a prefix.
+        q = torch.cat([image_q, text_q], dim=1)
+        k = torch.cat([image_k, text_k], dim=1)
+        v = torch.cat([image_v, text_v], dim=1)
         if coord_rope is not None:
             if coord_rope_tables is not None:
                 # Precomputed once per forward: every joint block sees the same
-                # [text; image] layout, so the trig is shared across all 8 sites.
+                # [image; text] layout, so the trig is shared across all 8 sites.
                 q, k = coord_rope.apply_prepared(q, k, coord_rope_tables)
             else:
                 if image_coord_ids is None or text_coord_ids is None:
                     raise ValueError("coordinate ids are required when multimodal coord RoPE is enabled")
-                coord_ids = torch.cat([text_coord_ids, image_coord_ids], dim=1)
+                coord_ids = torch.cat([image_coord_ids, text_coord_ids], dim=1)
                 q, k = coord_rope.apply(q, k, coord_ids)
 
-        # Bool SDPA mask (True = attend): image tokens always attend; padded text is masked.
-        image_attend = torch.ones(
-            image_tokens.shape[0],
-            image_tokens.shape[1],
-            device=image_tokens.device,
-            dtype=torch.bool,
-        )
-        attend_mask = torch.cat([~text_key_padding_mask.bool(), image_attend], dim=1)
-        # Kept unconditional: testing `attend_mask.all()` to drop the mask (and make
-        # FlashAttention eligible) costs a device sync per block — 8 per forward, plus a
-        # graph break under --compile — for a case variable-length captions rarely hit.
-        # Varlen/packed text is the real fix if the mask ever becomes the bottleneck.
-        attn_bias = attend_mask[:, None, None, :]
-        out = joint_sdpa(
-            q.transpose(1, 2),
-            k.transpose(1, 2),
-            v.transpose(1, 2),
-            attn_bias,
-        )
-        out = out.transpose(1, 2).reshape(image_tokens.shape[0], text_tokens.shape[1] + image_tokens.shape[1], -1)
-        text_out, image_out = out.split([text_tokens.shape[1], image_tokens.shape[1]], dim=1)
+        text_valid = ~text_key_padding_mask.bool()
+        num_image = image_tokens.shape[1]
+        num_text = text_tokens.shape[1]
+        if getattr(self, "joint_backend", "sdpa") == "flash4" and q.is_cuda and q.dtype in (
+            torch.bfloat16, torch.float16
+        ):
+            out = _flash4_varlen_joint(q, k, v, text_valid, num_image)
+        else:
+            out = None
+        if out is None:
+            # Bool SDPA mask (True = attend): image tokens always attend; padded text is masked.
+            image_attend = torch.ones(
+                image_tokens.shape[0], num_image, device=image_tokens.device, dtype=torch.bool,
+            )
+            attend_mask = torch.cat([image_attend, text_valid], dim=1)
+            # Testing `attend_mask.all()` to drop the mask entirely (making dense flash
+            # eligible) costs a device sync per block — 8 per forward, plus a graph break
+            # under --compile — for a case variable-length captions rarely hit. The
+            # flash4 varlen path above is the real answer to the mask.
+            out = joint_sdpa(
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                attend_mask[:, None, None, :],
+            ).transpose(1, 2)
+        out = out.reshape(image_tokens.shape[0], num_image + num_text, -1)
+        image_out, text_out = out.split([num_image, num_text], dim=1)
+        # Padded text positions carry undefined attention output (varlen never writes
+        # them; masked SDPA leaves them as garbage-but-finite). Zero them so nothing
+        # downstream — text FFN, the next block's queries, a loss reduction — can pick
+        # up a NaN from an unwritten slot.
+        text_out = text_out * text_valid[..., None].to(text_out.dtype)
         return self.image_out_proj(image_out), self.text_out_proj(text_out)
 
 
@@ -1437,6 +1511,7 @@ class BoomerFLADualStreamBlock(JointTextImageAttentionMixin, nn.Module):
         self.head_dim = hidden_dim // config.num_heads
         self.hidden_dim = hidden_dim
         self.parallel_block = config.parallel_block
+        self.joint_backend = config.joint_attention_backend
 
         self.image_mod = (
             None if config.shared_adaln else nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
@@ -1581,6 +1656,7 @@ class BoomerFLAJointRefreshBlock(JointTextImageAttentionMixin, nn.Module):
         self.head_dim = hidden_dim // config.num_heads
         self.hidden_dim = hidden_dim
         self.parallel_block = config.parallel_block
+        self.joint_backend = config.joint_attention_backend
 
         # v8 substitutive form: no GDN2/FLA mixer at refresh depths — the joint attention
         # IS the token mixer here. Modulation stays the 9-way layout (msa rows unused),
@@ -2096,6 +2172,11 @@ class BoomerFLADiT(nn.Module):
             and config.image_attention_every <= 0
         ):
             raise ValueError("joint_refresh_attention reuses the image_attention_every cadence; set it > 0")
+        if config.joint_attention_backend not in {"sdpa", "flash4"}:
+            raise ValueError(
+                f"joint_attention_backend must be 'sdpa' or 'flash4', "
+                f"got {config.joint_attention_backend!r}"
+            )
         if config.rope_ntk_factor <= 0.0:
             raise ValueError(f"rope_ntk_factor must be positive, got {config.rope_ntk_factor}")
         self.config = config
@@ -2616,7 +2697,7 @@ class BoomerFLADiT(nn.Module):
             # prefix + refresh blocks) rotates the same [text; image] layout. x is the
             # embedded image stream, so its dtype is the one q/k will carry.
             coord_rope_tables = self.coord_embedder.prepare(
-                torch.cat([text_coord_ids, image_coord_ids], dim=1),
+                torch.cat([image_coord_ids, text_coord_ids], dim=1),  # image-first: see _joint_attention
                 dtype=x.dtype,
                 device=x.device,
             )

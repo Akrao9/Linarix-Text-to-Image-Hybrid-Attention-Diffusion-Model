@@ -2255,6 +2255,7 @@ def build_config(args: argparse.Namespace, record: Any) -> BoomerFLADiTConfig:
         cross_attention_backend=args.cross_attn_backend,
         cross_attention_qk_norm=args.cross_attn_qk_norm,
         cross_attention_every=args.cross_attn_every,
+        joint_attention_backend=args.joint_attn_backend,
         shared_adaln=args.shared_adaln,
         fourier_timestep_embed=args.fourier_timestep_embed,
         hilbert_mixer_order=args.hilbert_mixer_order,
@@ -2540,6 +2541,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "cross-attention entirely, leaving joint attention (dual-stream prefix + "
                         "refresh blocks) as the only text pathway — unlike MMDiT, which keeps text "
                         "in the attended sequence in EVERY block, so validate prompt adherence.")
+    p.add_argument("--joint-attn-backend", default="sdpa", choices=["sdpa", "flash4"],
+                   help="Backend for the JOINT [image; text] sites (dual-stream prefix + "
+                        "refresh blocks) — separate from --image-attn-backend, which routes "
+                        "the DDT decoder's self-attention. flash4 uses FlashAttention-4/CuTe "
+                        "varlen with seqused_k (2.0x over masked SDPA at B=56 S=576 on "
+                        "sm_120). Run tools/attn_backend_probe.py on the exact runtime first: "
+                        "FA4/CuTe targets sm_100, and it falls back to SDPA if unavailable.")
     p.add_argument("--shared-adaln", action=bo, default=False,
                    help="PixArt-alpha adaLN-single: one shared timestep-modulation projection for "
                         "all blocks (per-block scale_shift_table keeps layer variation). Saves ~27%% "
