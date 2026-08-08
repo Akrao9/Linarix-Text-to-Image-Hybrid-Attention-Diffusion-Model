@@ -51,6 +51,21 @@ def _config(**overrides) -> BoomerFLADiTConfig:
     return BoomerFLADiTConfig(**base)
 
 
+def _break_zero_init(model: BoomerFLADiT, std: float = 0.05) -> None:
+    """Perturb every all-zero parameter so forward/backward carry real signal.
+
+    adaLN-Zero leaves the head, the shared modulation projections, the DDT cond_mod
+    projections and the refresh out-projections at zero, so a freshly built model
+    outputs exactly 0.0 and every gradient norm is 0 — any comparison against it is
+    vacuous. This also un-zeros the AttnRes pseudo-queries, which moves routing off
+    the uniform average and onto the real softmax path.
+    """
+    with torch.no_grad():
+        for param in model.parameters():
+            if torch.count_nonzero(param) == 0:
+                param.normal_(std=std)
+
+
 def _batch(model: BoomerFLADiT, batch: int = 2):
     cfg = model.config
     return (
@@ -197,23 +212,56 @@ def test_blocks_return_their_bare_update(parallel: bool) -> None:
 
 
 def test_gradient_checkpointing_matches_the_plain_path() -> None:
+    """Numerical parity, not just graph connectivity: the AttnRes bank is rebuilt from
+    recomputed block updates inside the checkpointed segments, so a mis-threaded
+    return_update would show up as a value mismatch here."""
+    torch.manual_seed(0)
     model = BoomerFLADiT(_config())
+    _break_zero_init(model)
     ckpt = BoomerFLADiT(_config(gradient_checkpointing=True))
     ckpt.load_state_dict(model.state_dict())
     model.train()
     ckpt.train()
+
     batch = _batch(model)
-    torch.manual_seed(0)
     a = model(*batch)
-    torch.manual_seed(0)
     b = ckpt(*batch)
-    assert torch.allclose(a, b, atol=1e-5)
+    assert a.abs().max() > 1e-3, "zero-init head would make this comparison vacuous"
+    torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-6)
+
+    a.square().mean().backward()
     b.square().mean().backward()
-    assert all(
-        q.grad is not None
-        for q, n in zip(ckpt.block_attnres.queries, ckpt.block_attnres.slot_counts)
-        if n > 1
-    )
+    # Parameters legitimately outside the loss graph, pinned so a future change cannot
+    # quietly widen the dead-weight surface:
+    #   * null_text_embedding — used by apply_condition_dropout, not by forward
+    #   * the LAST encoder block's text half — it is a refresh block by design and
+    #     nothing downstream reads text again (v8 accepts this: z leaving through
+    #     exact joint global mixing is the point)
+    #   * AttnRes site 0 — single source, bypasses routing entirely
+    dead_text = f"blocks.{model.encoder_depth - 1}.text"
+    expected_dead = {"caption_embedder.null_text_embedding", "block_attnres.queries.0"}
+
+    grads = dict(ckpt.named_parameters())
+    compared, dead = 0, set()
+    for name, param in model.named_parameters():
+        other = grads[name]
+        assert (param.grad is None) == (other.grad is None), name
+        if param.grad is None or param.grad.abs().max() == 0:
+            dead.add(name)
+            if param.grad is not None:
+                # even a dead branch must agree between the two paths
+                assert other.grad.abs().max() == 0, name
+            continue
+        torch.testing.assert_close(param.grad, other.grad, rtol=1e-4, atol=1e-6, msg=name)
+        compared += 1
+    assert compared > 200, compared
+    assert {n for n in dead if not n.startswith(dead_text)} == expected_dead, sorted(dead)
+
+    # every routing query carries real (non-zero) gradient, final z norm included
+    for q, n in zip(ckpt.block_attnres.queries, ckpt.block_attnres.slot_counts):
+        if n > 1:
+            assert q.grad is not None and q.grad.abs().max() > 0
+    assert ckpt.block_attnres.out_norm_weights[str(ckpt.encoder_depth)].grad.abs().max() > 0
 
 
 def test_slot_counts_follow_the_delta_group_schedule() -> None:
