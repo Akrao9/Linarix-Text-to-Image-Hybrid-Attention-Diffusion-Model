@@ -122,7 +122,8 @@ def test_stream_iteration_through_mocked_datasets(monkeypatch) -> None:
 
     ds = FineT2IStreamingDataset(resolution=32, shuffle_buffer=0, caption_mode="short")
     # Bypass the real HF stream: _load_stream returns our in-memory examples.
-    monkeypatch.setattr(ds, "_load_stream", lambda: list(examples))
+    # Signature must track the real one (seed_salt/restart are passed by _sharded_stream).
+    monkeypatch.setattr(ds, "_load_stream", lambda **_: list(examples))
 
     records = list(islice(iter(ds), 5))
     assert len(records) == 5
@@ -132,9 +133,19 @@ def test_stream_iteration_through_mocked_datasets(monkeypatch) -> None:
         assert r.pixels.dtype == torch.uint8
 
 
-def test_worker_shard_fallback_is_disjoint(monkeypatch) -> None:
-    """With too few shards to split by file (a plain list has none), workers must
-    still get DISJOINT rows via the row-stride fallback — no duplication, no crash."""
+def test_dataset_does_not_shard_by_worker_itself(monkeypatch) -> None:
+    """The dataset must NOT split rows across DataLoader workers on its own.
+
+    `datasets` already splits an IterableDataset across workers when it is iterated
+    inside one, so a manual `.shard(num_workers, worker_id)` COMPOSES with that and
+    leaves each worker 1/N**2 of the rows — measured at 14% aggregate coverage on an
+    8-worker loader (see `_sharded_stream`). The manual split was removed for that
+    reason; this pins the removal so it cannot be reintroduced as a "fix".
+
+    Iterating a mocked plain list bypasses the `datasets` machinery entirely, so every
+    worker seeing every row is exactly the expected result: it proves the dataset added
+    no splitting of its own.
+    """
     from types import SimpleNamespace
 
     import boomer.datasets.fine_t2i as m
@@ -143,17 +154,16 @@ def test_worker_shard_fallback_is_disjoint(monkeypatch) -> None:
 
     def run_worker(worker_id, num_workers):
         ds = FineT2IStreamingDataset(resolution=16, shuffle_buffer=0, caption_mode="short")
-        monkeypatch.setattr(ds, "_load_stream", lambda: list(examples))
+        monkeypatch.setattr(ds, "_load_stream", lambda **_: list(examples))
         monkeypatch.setattr(
             m, "get_worker_info",
             lambda: SimpleNamespace(id=worker_id, num_workers=num_workers),
         )
         return [r.caption for r in ds]
 
-    w0 = run_worker(0, 2)
-    w1 = run_worker(1, 2)
-    assert set(w0).isdisjoint(w1)  # no row seen by two workers
-    assert sorted(w0 + w1) == sorted(f"cap {i}" for i in range(10))  # every row covered
+    every_row = sorted(f"cap {i}" for i in range(10))
+    assert sorted(run_worker(0, 2)) == every_row
+    assert sorted(run_worker(1, 2)) == every_row
 
 
 def test_dataset_validation() -> None:
