@@ -131,6 +131,7 @@ def test_cuda_without_fused_kernel_raises() -> None:
 
     class FakeCudaSource:
         is_cuda = True
+        dtype = torch.bfloat16   # the dtype guard runs first and reads this
 
     with pytest.raises(RuntimeError, match="fused_attnres"):
         attn(0, [FakeCudaSource(), FakeCudaSource()])
@@ -410,3 +411,43 @@ def test_every_text_encoder_arg_is_forwarded_to_boomerlit() -> None:
         f"parsed but never forwarded to BoomerLit: {sorted(missing)} — "
         "the resident encoder will fall back to its default for these"
     )
+
+
+# --- the bank must be single-dtype under autocast ----------------------------------
+
+
+def test_bank_sources_share_one_dtype_under_autocast() -> None:
+    """FLA's pointer table needs one dtype across sources. Under autocast the token
+    embedding is bf16 but raw block updates are fp32 — every gate is an fp32
+    scale_shift_table parameter added to a bf16 modulation, which promotes the product.
+    Unbanked, that reached Triton as 'invalid operands of type pointer<fp32> and
+    pointer<bf16>' after a full data-pipeline startup.
+    """
+    model = BoomerFLADiT(_config())
+    seen: list[tuple[int, set]] = []
+    real = BlockAttnRes.forward
+
+    def spy(self, site, sources):
+        seen.append((site, {s.dtype for s in sources}))
+        return real(self, site, sources)
+
+    BlockAttnRes.forward = spy
+    try:
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            model(*_batch(model))
+    finally:
+        BlockAttnRes.forward = real
+
+    assert len(seen) == model.encoder_depth + 1, len(seen)
+    mixed = [(site, sorted(str(d) for d in dt)) for site, dt in seen if len(dt) > 1]
+    assert not mixed, f"mixed-dtype bank at sites: {mixed}"
+    assert all(dt == {torch.bfloat16} for _, dt in seen), (
+        f"bank must hold the activation dtype: {[(s, sorted(map(str, d))) for s, d in seen]}"
+    )
+
+
+def test_mixed_dtype_sources_raise_a_named_error() -> None:
+    attn = BlockAttnRes(hidden_dim=8, slot_counts=[2])
+    sources = [torch.randn(2, 4, 8), torch.randn(2, 4, 8, dtype=torch.bfloat16)]
+    with pytest.raises(TypeError, match="must share one dtype"):
+        attn(0, sources)

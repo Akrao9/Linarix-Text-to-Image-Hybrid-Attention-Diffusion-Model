@@ -1988,6 +1988,19 @@ class BlockAttnRes(nn.Module):
                 return src
             dim = src.shape[-1]
             return F.rms_norm(src.float(), (dim,), out_norm.float(), self.eps).to(src.dtype)
+        # FLA's pointer table resolves sources with one tl.where chain seeded from res[0],
+        # so every source must share a dtype. Mixing them fails deep inside Triton
+        # ("invalid operands of type pointer<fp32> and pointer<bf16>") naming no source;
+        # torch.stack on the naive path would instead promote silently, so CPU and CUDA
+        # would disagree. Under autocast the bank is bf16 while raw block updates are
+        # fp32 (fp32 gate params promote them) — BoomerFLADiT.forward downcasts them.
+        dtypes = {s.dtype for s in sources}
+        if len(dtypes) > 1:
+            raise TypeError(
+                f"AttnRes site {site}: all sources must share one dtype, got "
+                f"{sorted(str(d) for d in dtypes)}. Cast block updates to the token "
+                "embedding's dtype before banking them."
+            )
         if sources[0].is_cuda:
             fused = self._fused_op()
             if fused is None:
@@ -2598,6 +2611,16 @@ class BoomerFLADiT(nn.Module):
         # end. The update is never recovered by (output - input): that bf16 stream-scale
         # subtraction cancels away the small contributions the bank exists to keep.
         want_delta = self.block_attnres is not None
+        # The bank holds activations, so it holds them in the ACTIVATION dtype (bf16
+        # under autocast), taken from the token embedding. Block updates arrive as fp32:
+        # every gate is an fp32 scale_shift_table parameter added to a bf16 modulation,
+        # which promotes the product. Storing that unchanged would give the bank mixed
+        # dtypes, and FLA's pointer table (a single tl.where chain over res[i]) requires
+        # one dtype across sources. Downcasting the update is cheap in precision — it was
+        # computed by bf16 matmuls, so this costs bf16 rounding (~0.4%), NOT the
+        # stream-scale cancellation that made (out - in) unusable — and it halves the
+        # bank's footprint, which matters at nine live sources.
+        attnres_dtype = x.dtype if want_delta else None
         attnres_completed: list[torch.Tensor] = [x] if want_delta else []
         attnres_partial: torch.Tensor | None = None
         attnres_delta: torch.Tensor | None = None
@@ -2708,8 +2731,9 @@ class BoomerFLADiT(nn.Module):
                 # accumulating at a group end would misfile this block's delta; the
                 # reference folds first only because its boundary test looks at the
                 # NEXT index.
+                delta = attnres_delta.to(attnres_dtype)
                 attnres_partial = (
-                    attnres_delta if attnres_partial is None else attnres_partial + attnres_delta
+                    delta if attnres_partial is None else attnres_partial + delta
                 )
                 if layer_idx in self._attnres_fold_ends:
                     attnres_completed.append(attnres_partial)
