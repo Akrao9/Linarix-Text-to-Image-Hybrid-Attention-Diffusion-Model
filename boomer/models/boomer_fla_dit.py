@@ -1496,11 +1496,12 @@ class JointTextImageAttentionMixin:
             ).transpose(1, 2)
         out = out.reshape(image_tokens.shape[0], num_image + num_text, -1)
         image_out, text_out = out.split([num_image, num_text], dim=1)
-        # Padded text positions carry undefined attention output (varlen never writes
-        # them; masked SDPA leaves them as garbage-but-finite). Zero them so nothing
-        # downstream — text FFN, the next block's queries, a loss reduction — can pick
-        # up a NaN from an unwritten slot.
-        text_out = text_out * text_valid[..., None].to(text_out.dtype)
+        # Padded text positions carry undefined attention output: varlen never writes
+        # rows past seqused_q, so they hold UNINITIALIZED memory, and masked SDPA leaves
+        # them garbage. Must be torch.where, not a multiply by the mask: NaN * 0 == NaN,
+        # so multiplying propagates exactly the uninitialized-NaN case this defends
+        # against (observed as NaN loss, then a downstream illegal memory access).
+        text_out = torch.where(text_valid[..., None], text_out, 0.0)
         return self.image_out_proj(image_out), self.text_out_proj(text_out)
 
 

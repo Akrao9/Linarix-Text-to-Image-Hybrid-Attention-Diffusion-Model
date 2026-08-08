@@ -623,3 +623,34 @@ def test_flash4_backend_falls_back_when_unavailable_on_cpu() -> None:
     assert model.blocks[0].joint_backend == "flash4"
     out = model(*_batch(model))
     assert out.shape[1:] == (4, 8, 8) and torch.isfinite(out).all()
+
+
+def test_nan_in_padded_text_rows_is_cleared_not_multiplied() -> None:
+    """FA4 varlen leaves rows past seqused_q UNINITIALIZED. Clearing them with
+    `out * mask` fails on exactly the case it defends against, because NaN * 0 == NaN
+    — which showed up as a NaN loss and then a downstream illegal memory access.
+    """
+    import boomer.models.boomer_fla_dit as M
+
+    model = BoomerFLADiT(_config())
+    _break_zero_init(model)
+    x, t, text, _ = _batch(model)
+    mask = torch.ones(2, model.config.text_seq_len, dtype=torch.long)
+    mask[:, 4:] = 0                       # rows 4+ are padding in both samples
+
+    real = M.joint_sdpa
+    # joint_sdpa sees the whole IMAGE-FIRST sequence [B, H, image+text, D]; only the
+    # padded tail of the text half stands in for unwritten varlen rows.
+    n_img = (model.config.latent_size // model.config.patch_size) ** 2
+
+    def poison(q, k, v, attn_mask):
+        out = real(q, k, v, attn_mask)
+        out[:, :, n_img + 4:, :] = float("nan")
+        return out
+
+    M.joint_sdpa = poison
+    try:
+        out = model(x, t, text, mask)
+    finally:
+        M.joint_sdpa = real
+    assert torch.isfinite(out).all(), "NaN from padded text rows reached the output"
