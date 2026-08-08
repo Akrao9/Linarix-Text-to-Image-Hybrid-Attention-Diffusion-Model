@@ -133,6 +133,43 @@ def validate_condition_args(parser: argparse.ArgumentParser, args: argparse.Name
         parser.error(f"--condition-cache does not exist or is not a file: {args.condition_cache}")
 
 
+def resolve_encoder_schedule(
+    model: torch.nn.Module, args: argparse.Namespace, sampler_kwargs: dict[str, Any]
+) -> list[int] | None:
+    """Turn --encoder-schedule into explicit step indices, solving first if asked."""
+    spec = args.encoder_schedule
+    if not spec:
+        return None
+    from boomer.encoder_schedule import calibrate_encoder_schedule, uniform_schedule
+
+    if spec.startswith("solve:"):
+        budget = int(spec.split(":", 1)[1])
+        # Calibrate on the SAME settings the real sample will use, minus the text
+        # tensors, which the function takes positionally.
+        calib = dict(sampler_kwargs)
+        text_embedding = calib.pop("text_embedding")
+        attention_mask = calib.pop("attention_mask")
+        calib.pop("steps")
+        schedule, similarity = calibrate_encoder_schedule(
+            model, text_embedding, attention_mask,
+            steps=args.steps, num_recompute=budget, return_similarity=True, **calib,
+        )
+        stride = uniform_schedule(args.steps, budget)
+        print(f"[encoder-schedule] solved for {budget}/{args.steps} recomputes: {schedule}")
+        print(f"[encoder-schedule] uniform stride would be:                  {stride}")
+        print(f"[encoder-schedule] adjacent-step z similarity: "
+              f"min {similarity.diagonal(1).min():.4f} max {similarity.diagonal(1).max():.4f} "
+              f"(low = z still moving, high = safe to reuse)")
+        print(f"[encoder-schedule] reuse across runs with --encoder-schedule "
+              f"{','.join(str(s) for s in schedule)}")
+        return schedule
+
+    schedule = [int(part) for part in spec.split(",") if part.strip()]
+    if not schedule:
+        raise SystemExit("--encoder-schedule got an empty list")
+    return schedule
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Sample a Boomer latent denoiser checkpoint and decode with AutoencoderDC.")
     parser.add_argument("--checkpoint", required=True)
@@ -204,6 +241,15 @@ def main() -> None:
              "step). 1 = off (full model every step). A/B this against 1 on the SAME seed to "
              "judge the speed/quality trade at a given checkpoint. DDT checkpoints only.",
     )
+    parser.add_argument(
+        "--encoder-schedule", type=str, default=None,
+        help="DDT encoder sharing with a SOLVED schedule instead of a fixed stride: "
+             "either a comma-separated list of step indices (must include 0), or "
+             "'solve:N' to calibrate on this prompt and solve for N recomputes. z drifts "
+             "fast early and slowly late, so the solved schedule is irregular and beats "
+             "--encoder-reuse-steps at equal cost. 'solve:' costs one extra full sample; "
+             "reuse the printed list across runs. Overrides --encoder-reuse-steps.",
+    )
     args = parser.parse_args()
     validate_condition_args(parser, args)
     if args.cfg_scale < 0.0:
@@ -265,8 +311,7 @@ def main() -> None:
     else:
         text_embedding, attention_mask, caption = load_condition_from_prompt(args, cache_config)
 
-    latent = sample_latent(
-        model=model,
+    sampler_kwargs = dict(
         text_embedding=text_embedding,
         attention_mask=attention_mask,
         steps=args.steps,
@@ -280,7 +325,13 @@ def main() -> None:
         stork_derivative_order=args.stork_derivative_order,
         stork_substeps=args.stork_substeps,
         cfg_interval=(args.cfg_interval_low, args.cfg_interval_high),
+    )
+    encoder_schedule = resolve_encoder_schedule(model, args, sampler_kwargs)
+    latent = sample_latent(
+        model=model,
         encoder_reuse_steps=args.encoder_reuse_steps,
+        encoder_refresh_steps=encoder_schedule,
+        **sampler_kwargs,
     )
     latent = denormalize_latent(latent, latent_mean, latent_std)
 

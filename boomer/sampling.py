@@ -9,6 +9,8 @@ from drifting.
 
 from __future__ import annotations
 
+from typing import Iterable
+
 import torch
 
 from boomer.sana_flow import make_inference_sigmas
@@ -26,13 +28,34 @@ class EncoderStateCache:
     The cached z is keyed by batch size: CFG batches cond/uncond together, and the batch
     can change at a cfg_interval boundary (2 -> 1), so a shape mismatch forces a refresh
     rather than feeding a stale-shaped z.
+
+    ``refresh_steps`` overrides the stride with an explicit set of step indices, which is
+    what `boomer.encoder_schedule` solves for: z drifts fast early and slowly late, so a
+    uniform stride spends its recomputes in the wrong places.
+
+    ``record`` appends every freshly computed z to ``history`` — the calibration pass that
+    the schedule solver measures.
     """
 
-    def __init__(self, reuse_steps: int) -> None:
+    def __init__(
+        self,
+        reuse_steps: int = 1,
+        refresh_steps: Iterable[int] | None = None,
+        record: list[torch.Tensor] | None = None,
+    ) -> None:
         self.reuse_steps = max(1, reuse_steps)
+        self.refresh_steps = None if refresh_steps is None else frozenset(refresh_steps)
+        if self.refresh_steps is not None and 0 not in self.refresh_steps:
+            raise ValueError(
+                f"refresh_steps must include step 0 — there is no earlier state to reuse "
+                f"at the first step. Got {sorted(self.refresh_steps)[:8]}..."
+            )
+        self.history = record
         self.z: torch.Tensor | None = None
 
     def refresh_at(self, step_index: int) -> bool:
+        if self.refresh_steps is not None:
+            return step_index in self.refresh_steps
         return self.reuse_steps == 1 or step_index % self.reuse_steps == 0
 
 
@@ -70,6 +93,15 @@ def predict_velocity(
             latent_b, timestep_b, text_b, mask_b, **extra_b, return_encoder_state=True
         )
         encoder_cache.z = z
+        if encoder_cache.history is not None:
+            # Record only the CONDITIONAL rows. The batch here is [uncond, cond] under
+            # CFG and [null, source, source+text] under dual guidance, and it drops to
+            # one row outside cfg_interval -- so the conditional tail is the only slice
+            # with a shape that is stable across the whole trajectory, which the
+            # similarity matrix requires. Held on CPU in fp32: the calibration keeps one
+            # state per step and the solver wants precision, not speed.
+            base = latent.shape[0]
+            encoder_cache.history.append(z[-base:].detach().float().cpu())
         return out
 
     # Guidance interval (Kynkäänniemi et al. 2024, "Applying Guidance in a Limited
@@ -154,19 +186,36 @@ def sample_latent(
     cond_input: torch.Tensor | None = None,
     image_cfg_scale: float = 0.0,
     encoder_reuse_steps: int = 1,
+    encoder_refresh_steps: Iterable[int] | None = None,
+    record_encoder_states: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     generator = torch.Generator(device=device).manual_seed(seed)
     config = model.config
     # Encoder amortization: reuse the DDT condition-encoder output across adjacent steps.
     # Only valid on a DDT model (dense models have no separable encoder output).
+    #
+    # encoder_refresh_steps is the solved, irregular form of encoder_reuse_steps' fixed
+    # stride (see boomer.encoder_schedule); it wins when both are given.
+    # record_encoder_states collects the per-step z that the solver measures, and forces
+    # a cache even at reuse_steps=1 -- refreshing every step, so the trajectory recorded
+    # is the un-amortized one.
     encoder_cache: EncoderStateCache | None = None
-    if encoder_reuse_steps > 1:
+    want_cache = (
+        encoder_reuse_steps > 1
+        or encoder_refresh_steps is not None
+        or record_encoder_states is not None
+    )
+    if want_cache:
         if getattr(config, "ddt_decoder_depth", 0) <= 0:
             raise ValueError(
-                "encoder_reuse_steps > 1 needs a DDT model (ddt_decoder_depth > 0); "
+                "encoder amortization needs a DDT model (ddt_decoder_depth > 0); "
                 "a dense model recomputes the full stack every step."
             )
-        encoder_cache = EncoderStateCache(encoder_reuse_steps)
+        encoder_cache = EncoderStateCache(
+            reuse_steps=encoder_reuse_steps,
+            refresh_steps=encoder_refresh_steps,
+            record=record_encoder_states,
+        )
     latent = torch.randn(
         1,
         config.latent_channels,
