@@ -474,29 +474,65 @@ class MultimodalCoordinateRoPE(nn.Module):
     def _apply_cos_sin(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         return x * cos + self._rotate_half(x) * sin
 
+    def prepare(
+        self,
+        ids: torch.Tensor,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Per-axis (cos, sin) tables for one token layout, computed ONCE per forward.
+
+        The tables depend only on the coordinate ids, not on q/k, and every joint block
+        (dual-stream prefix + refresh blocks) sees the same [text; image] layout — so
+        rebuilding them per block repeated the same trig 8 times and allocated 8 sets of
+        transient angle/cos/sin tensors. FLUX computes its rotary embedding once and
+        threads it through the block stack; this is the same move. Numerically identical
+        to the old per-block path: same inputs, same ops, same dtype.
+        """
+        if ids.shape[-1] != len(self.axes_dim):
+            raise ValueError(f"expected ids (..., {len(self.axes_dim)}), got {tuple(ids.shape)}")
+        # token_type 1 = image (see image_ids/text_ids): only image tokens get NTK freqs.
+        image_token_mask = (ids[..., 0] == 1) if self.ntk_factor != 1.0 else None
+        return [
+            self._axis_cos_sin(ids[..., index], index, image_token_mask,
+                               dtype=dtype, device=device)
+            for index in range(len(self.axes_dim))
+        ]
+
+    def apply_prepared(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        prepared: list[tuple[torch.Tensor, torch.Tensor]],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rotate q/k with tables from :meth:`prepare`."""
+        if q.shape[-1] != self.head_dim or k.shape[-1] != self.head_dim:
+            raise ValueError(f"expected head_dim={self.head_dim}, got q={q.shape[-1]} k={k.shape[-1]}")
+        if len(prepared) != len(self.axes_dim):
+            raise ValueError(f"expected {len(self.axes_dim)} prepared axes, got {len(prepared)}")
+        q_out, k_out = [], []
+        for (cos, sin), q_axis, k_axis in zip(
+            prepared, q.split(self.axes_dim, dim=-1), k.split(self.axes_dim, dim=-1), strict=True
+        ):
+            if cos.dtype != q.dtype:  # autocast can change dtype between prepare and use
+                cos, sin = cos.to(q.dtype), sin.to(q.dtype)
+            q_out.append(self._apply_cos_sin(q_axis, cos, sin))
+            k_out.append(self._apply_cos_sin(k_axis, cos, sin))
+        return torch.cat(q_out, dim=-1), torch.cat(k_out, dim=-1)
+
     def apply(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
         ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if q.shape[-1] != self.head_dim or k.shape[-1] != self.head_dim:
-            raise ValueError(f"expected head_dim={self.head_dim}, got q={q.shape[-1]} k={k.shape[-1]}")
-        if ids.shape[:2] != q.shape[:2] or ids.shape[-1] != len(self.axes_dim):
+        """Single-shot form: prepare + apply. Kept for callers outside the block stack
+        (and for parity tests against apply_prepared)."""
+        if ids.shape[:2] != q.shape[:2]:
             raise ValueError(f"expected ids shape (B, T, {len(self.axes_dim)}), got {tuple(ids.shape)}")
-        # token_type 1 = image (see image_ids/text_ids): only image tokens get NTK freqs.
-        image_token_mask = (ids[..., 0] == 1) if self.ntk_factor != 1.0 else None
-        q_chunks = q.split(self.axes_dim, dim=-1)
-        k_chunks = k.split(self.axes_dim, dim=-1)
-        q_out = []
-        k_out = []
-        for index, (q_axis, k_axis) in enumerate(zip(q_chunks, k_chunks, strict=True)):
-            cos, sin = self._axis_cos_sin(
-                ids[..., index], index, image_token_mask, dtype=q.dtype, device=q.device
-            )
-            q_out.append(self._apply_cos_sin(q_axis, cos, sin))
-            k_out.append(self._apply_cos_sin(k_axis, cos, sin))
-        return torch.cat(q_out, dim=-1), torch.cat(k_out, dim=-1)
+        prepared = self.prepare(ids, dtype=q.dtype, device=q.device)
+        return self.apply_prepared(q, k, prepared)
 
 
 class RoPE2D(nn.Module):
@@ -1239,6 +1275,71 @@ class BoomerFLABlock(nn.Module):
         return x
 
 
+_JOINT_SDPA_BACKEND: str | None = None
+
+
+def joint_sdpa_backend() -> str | None:
+    """Which SDPA backend the joint-attention sites resolved to, or None before the
+    first call. Trainers log this once so a silent fall back to `math` is visible."""
+    return _JOINT_SDPA_BACKEND
+
+
+def joint_sdpa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attn_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Explicit-backend SDPA for the joint [text; image] sites.
+
+    ``--image-attn-backend`` routes FullImageSelfAttention only; the 8 joint sites
+    (dual-stream prefix + refresh blocks) call SDPA directly and take whatever PyTorch's
+    implicit priority picks. That is normally fine — with a bool key-padding mask
+    FlashAttention is ineligible (it takes no arbitrary mask) and the efficient kernel
+    wins — but the choice is invisible, and the `math` fallback materializes
+    [B, heads, S, S] AND keeps it for backward, which at S = text + image tokens would
+    dwarf every other activation. So resolve the backend once, explicitly, remember it
+    for logging, and make a math fallback loud rather than silent.
+    """
+    global _JOINT_SDPA_BACKEND
+    if not q.is_cuda:
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+    except ImportError:  # older torch: implicit dispatch only
+        if _JOINT_SDPA_BACKEND is None:
+            _JOINT_SDPA_BACKEND = "implicit"
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+
+    # Flash takes no arbitrary attn_mask, so it is only a candidate when unmasked.
+    candidates = [] if attn_mask is not None else [("flash", SDPBackend.FLASH_ATTENTION)]
+    candidates += [("efficient", SDPBackend.EFFICIENT_ATTENTION), ("math", SDPBackend.MATH)]
+    if _JOINT_SDPA_BACKEND is not None:
+        chosen = dict(candidates).get(_JOINT_SDPA_BACKEND)
+        if chosen is not None:
+            with sdpa_kernel(chosen):
+                return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+    for name, backend in candidates:
+        try:
+            with sdpa_kernel(backend):
+                out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        except (RuntimeError, NotImplementedError):
+            continue
+        _JOINT_SDPA_BACKEND = name
+        if name == "math":
+            import warnings
+
+            warnings.warn(
+                "joint attention fell back to the SDPA math backend: it materializes "
+                f"[B, heads, {q.shape[-2]}, {q.shape[-2]}] and retains it for backward. "
+                "Expect a large memory increase.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        return out
+    raise RuntimeError("no usable SDPA backend for joint attention")
+
+
 class JointTextImageAttentionMixin:
     """MMDiT-style joint attention over [text; image] with per-modality QKV/projections.
 
@@ -1270,6 +1371,7 @@ class JointTextImageAttentionMixin:
         coord_rope: MultimodalCoordinateRoPE | None,
         image_coord_ids: torch.Tensor | None,
         text_coord_ids: torch.Tensor | None,
+        coord_rope_tables: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         image_q, image_k, image_v = self._qkv(
             image_tokens,
@@ -1287,10 +1389,15 @@ class JointTextImageAttentionMixin:
         k = torch.cat([text_k, image_k], dim=1)
         v = torch.cat([text_v, image_v], dim=1)
         if coord_rope is not None:
-            if image_coord_ids is None or text_coord_ids is None:
-                raise ValueError("coordinate ids are required when multimodal coord RoPE is enabled")
-            coord_ids = torch.cat([text_coord_ids, image_coord_ids], dim=1)
-            q, k = coord_rope.apply(q, k, coord_ids)
+            if coord_rope_tables is not None:
+                # Precomputed once per forward: every joint block sees the same
+                # [text; image] layout, so the trig is shared across all 8 sites.
+                q, k = coord_rope.apply_prepared(q, k, coord_rope_tables)
+            else:
+                if image_coord_ids is None or text_coord_ids is None:
+                    raise ValueError("coordinate ids are required when multimodal coord RoPE is enabled")
+                coord_ids = torch.cat([text_coord_ids, image_coord_ids], dim=1)
+                q, k = coord_rope.apply(q, k, coord_ids)
 
         # Bool SDPA mask (True = attend): image tokens always attend; padded text is masked.
         image_attend = torch.ones(
@@ -1300,14 +1407,16 @@ class JointTextImageAttentionMixin:
             dtype=torch.bool,
         )
         attend_mask = torch.cat([~text_key_padding_mask.bool(), image_attend], dim=1)
+        # Kept unconditional: testing `attend_mask.all()` to drop the mask (and make
+        # FlashAttention eligible) costs a device sync per block — 8 per forward, plus a
+        # graph break under --compile — for a case variable-length captions rarely hit.
+        # Varlen/packed text is the real fix if the mask ever becomes the bottleneck.
         attn_bias = attend_mask[:, None, None, :]
-        out = F.scaled_dot_product_attention(
+        out = joint_sdpa(
             q.transpose(1, 2),
             k.transpose(1, 2),
             v.transpose(1, 2),
-            attn_mask=attn_bias,
-            dropout_p=0.0,
-            is_causal=False,
+            attn_bias,
         )
         out = out.transpose(1, 2).reshape(image_tokens.shape[0], text_tokens.shape[1] + image_tokens.shape[1], -1)
         text_out, image_out = out.split([text_tokens.shape[1], image_tokens.shape[1]], dim=1)
@@ -1371,6 +1480,7 @@ class BoomerFLADualStreamBlock(JointTextImageAttentionMixin, nn.Module):
         coord_rope: MultimodalCoordinateRoPE | None = None,
         image_coord_ids: torch.Tensor | None = None,
         text_coord_ids: torch.Tensor | None = None,
+        coord_rope_tables: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         image_t_mod: torch.Tensor | None = None,
         text_t_mod: torch.Tensor | None = None,
         return_update: bool = False,
@@ -1402,6 +1512,7 @@ class BoomerFLADualStreamBlock(JointTextImageAttentionMixin, nn.Module):
             coord_rope,
             image_coord_ids,
             text_coord_ids,
+            coord_rope_tables,
         )
         image_attn = self.image_sandwich_attn(image_attn)
         text_attn = self.text_sandwich_attn(text_attn)
@@ -1545,6 +1656,7 @@ class BoomerFLAJointRefreshBlock(JointTextImageAttentionMixin, nn.Module):
         coord_rope: MultimodalCoordinateRoPE | None = None,
         image_coord_ids: torch.Tensor | None = None,
         text_coord_ids: torch.Tensor | None = None,
+        coord_rope_tables: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         t_mod: torch.Tensor | None = None,
         text_t_mod: torch.Tensor | None = None,
         mixer_perm: torch.Tensor | None = None,
@@ -1592,6 +1704,7 @@ class BoomerFLAJointRefreshBlock(JointTextImageAttentionMixin, nn.Module):
                 coord_rope,
                 image_coord_ids,
                 text_coord_ids,
+                coord_rope_tables,
             )
             image_update = gate_joint * self.sandwich_joint(image_attn) + gate_mlp * self.sandwich_mlp(
                 self.mlp(modulate(self.norm2(image_base), shift_mlp, scale_mlp), height=height, width=width)
@@ -1628,6 +1741,7 @@ class BoomerFLAJointRefreshBlock(JointTextImageAttentionMixin, nn.Module):
             coord_rope,
             image_coord_ids,
             text_coord_ids,
+            coord_rope_tables,
         )
         u = gate_joint * self.sandwich_joint(image_attn)
         x = x + u
@@ -2489,6 +2603,7 @@ class BoomerFLADiT(nn.Module):
             x = x + self.pos_embed
         image_coord_ids = None
         text_coord_ids = None
+        coord_rope_tables = None
         if self.coord_embedder is not None:
             image_coord_ids = self.coord_embedder.image_ids(
                 batch,
@@ -2497,6 +2612,14 @@ class BoomerFLADiT(nn.Module):
                 device=x.device,
             )
             text_coord_ids = self.coord_embedder.text_ids(batch, text_tokens.shape[1], device=text_tokens.device)
+            # One trig pass for the whole block stack: every joint site (dual-stream
+            # prefix + refresh blocks) rotates the same [text; image] layout. x is the
+            # embedded image stream, so its dtype is the one q/k will carry.
+            coord_rope_tables = self.coord_embedder.prepare(
+                torch.cat([text_coord_ids, image_coord_ids], dim=1),
+                dtype=x.dtype,
+                device=x.device,
+            )
         # Bool SDPA mask (True = attend); built once and reused by every cross-attn block.
         text_attn_bias = ~text_key_padding_mask[:, None, None, :]
         t_emb = self.t_embedder(timesteps)
@@ -2554,10 +2677,12 @@ class BoomerFLADiT(nn.Module):
                 if use_ckpt:
                     def _refresh_fn(x, tt, te, mk, bi, tm, ttm,
                                     _blk=block, h=_h, w=_w, cr=_cr, ii=_ii, ti=_ti,
-                                    mp=mixer_perm, mpi=mixer_perm_inv, ru=want_delta):
+                                    mp=mixer_perm, mpi=mixer_perm_inv, ru=want_delta,
+                                    rt=coord_rope_tables):
                         return _blk(x, tt, te, mk, bi,
                                     height=h, width=w, coord_rope=cr,
                                     image_coord_ids=ii, text_coord_ids=ti,
+                                    coord_rope_tables=rt,
                                     t_mod=tm, text_t_mod=ttm,
                                     mixer_perm=mp, mixer_perm_inv=mpi,
                                     return_update=ru)
@@ -2572,6 +2697,7 @@ class BoomerFLADiT(nn.Module):
                         height=token_height, width=token_width,
                         coord_rope=self.coord_embedder,
                         image_coord_ids=image_coord_ids, text_coord_ids=text_coord_ids,
+                        coord_rope_tables=coord_rope_tables,
                         t_mod=t_mod, text_t_mod=dual_text_t_mod,
                         mixer_perm=mixer_perm, mixer_perm_inv=mixer_perm_inv,
                         return_update=want_delta,
@@ -2589,10 +2715,11 @@ class BoomerFLADiT(nn.Module):
                 if use_ckpt:
                     def _dual_fn(x, tt, te, mk, bi, im, tm,
                                  _blk=block, h=_h, w=_w, cr=_cr, ii=_ii, ti=_ti,
-                                 ru=want_delta):
+                                 ru=want_delta, rt=coord_rope_tables):
                         return _blk(x, tt, te, mk, bi,
                                     height=h, width=w, coord_rope=cr,
                                     image_coord_ids=ii, text_coord_ids=ti,
+                                    coord_rope_tables=rt,
                                     image_t_mod=im, text_t_mod=tm,
                                     return_update=ru)
                     res = _ckpt(_dual_fn, x, text_tokens, t_emb,
@@ -2606,6 +2733,7 @@ class BoomerFLADiT(nn.Module):
                         height=token_height, width=token_width,
                         coord_rope=self.coord_embedder,
                         image_coord_ids=image_coord_ids, text_coord_ids=text_coord_ids,
+                        coord_rope_tables=coord_rope_tables,
                         image_t_mod=dual_image_t_mod, text_t_mod=dual_text_t_mod,
                         return_update=want_delta,
                     )

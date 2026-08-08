@@ -112,6 +112,7 @@ from boomer.models.qwen_connector import (  # noqa: E402
 )
 from boomer.models.boomer_fla_dit import (  # noqa: E402
     BoomerFLADiTConfig,
+    joint_sdpa_backend,
     migrate_glumbconv_state_dict,
 )
 from boomer.models.factory import create_model  # noqa: E402
@@ -228,6 +229,7 @@ class BoomerLit(pl.LightningModule):
         # Same accumulation trap for AttnRes telemetry: without this guard, a logging
         # step would collect weights and submit all 116 scalars once per microbatch.
         self._attnres_collected_at = -1
+        self._joint_backend_logged = False
         if hp.get("compile"):
             self.model = torch.compile(self.model, mode=hp.get("compile_mode", "default"))
 
@@ -700,6 +702,15 @@ class BoomerLit(pl.LightningModule):
             # sanity signal that the mask distribution is what --fill-mask-probs asked for.
             self.log("train/fill_coverage", fill_mask.float().mean(),
                      on_step=True, on_epoch=False, batch_size=bs)
+        # Report which SDPA kernel the 8 joint-attention sites resolved to, once. The
+        # math backend materializes [B, heads, S, S] and keeps it for backward, so a
+        # silent fall back to it is a large memory regression; joint_sdpa also warns.
+        if not self._joint_backend_logged:
+            backend = joint_sdpa_backend()
+            if backend is not None:
+                self._joint_backend_logged = True
+                print(f"[attn] joint attention SDPA backend: {backend}", flush=True)
+
         # v8 Block AttnRes telemetry: mean depth-attention weight per (site, slot). Sites
         # 0..encoder_depth-1 are per-block retrievals; the last site is the final z
         # aggregation. Slot 0 is the token embedding, middle slots are completed group

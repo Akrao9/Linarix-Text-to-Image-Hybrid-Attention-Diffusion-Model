@@ -496,3 +496,61 @@ def test_cross_attn_every_zero_rejected_without_a_joint_pathway() -> None:
 def test_negative_cross_attn_every_still_rejected() -> None:
     with pytest.raises(ValueError, match="must be >= 0"):
         BoomerFLADiT(_config(cross_attention_every=-1))
+
+
+# --- FLUX-derived: shared RoPE tables and explicit attention dispatch --------------
+
+
+@pytest.mark.parametrize("ntk", [1.0, 2.0])
+def test_prepared_rope_is_bit_identical_to_per_block(ntk: float) -> None:
+    from boomer.models.boomer_fla_dit import MultimodalCoordinateRoPE
+
+    rope = MultimodalCoordinateRoPE(64, image_size=16, text_seq_len=8, ntk_factor=ntk)
+    ids = torch.cat([rope.text_ids(2, 8, device="cpu"),
+                     rope.image_ids(2, height=4, width=4, device="cpu")], dim=1)
+    q = torch.randn(2, ids.shape[1], 3, 64)
+    k = torch.randn(2, ids.shape[1], 3, 64)
+    q_ref, k_ref = rope.apply(q, k, ids)
+    q_new, k_new = rope.apply_prepared(q, k, rope.prepare(ids, dtype=q.dtype, device=q.device))
+    # bit-identical, not merely close: same inputs, same ops, just hoisted
+    assert torch.equal(q_ref, q_new) and torch.equal(k_ref, k_new)
+
+
+def test_model_output_unchanged_by_rope_hoisting() -> None:
+    import boomer.models.boomer_fla_dit as M
+
+    model = BoomerFLADiT(_config(multimodal_coord_ids=True))
+    _break_zero_init(model)
+    batch = _batch(model)
+    with_tables = model(*batch)
+
+    real = M.JointTextImageAttentionMixin._joint_attention
+
+    def drop_tables(self, img, txt, kpm, cr, ii, ti, tables=None):
+        return real(self, img, txt, kpm, cr, ii, ti, None)   # force per-block recompute
+
+    M.JointTextImageAttentionMixin._joint_attention = drop_tables
+    try:
+        per_block = model(*batch)
+    finally:
+        M.JointTextImageAttentionMixin._joint_attention = real
+    assert torch.equal(with_tables, per_block)
+
+
+def test_prepare_validates_axis_count() -> None:
+    from boomer.models.boomer_fla_dit import MultimodalCoordinateRoPE
+
+    rope = MultimodalCoordinateRoPE(64, image_size=16, text_seq_len=8)
+    with pytest.raises(ValueError, match="expected ids"):
+        rope.prepare(torch.zeros(2, 5, 2, dtype=torch.long), dtype=torch.float32,
+                     device=torch.device("cpu"))
+
+
+def test_joint_sdpa_matches_plain_sdpa_on_cpu() -> None:
+    from boomer.models.boomer_fla_dit import joint_sdpa
+
+    q, k, v = (torch.randn(2, 4, 16, 32) for _ in range(3))
+    mask = torch.rand(2, 1, 1, 16) > 0.3
+    mask[..., 0] = True  # every query keeps at least one key
+    ref = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+    assert torch.equal(joint_sdpa(q, k, v, mask), ref)
