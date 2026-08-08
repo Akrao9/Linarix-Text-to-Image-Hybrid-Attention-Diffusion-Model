@@ -113,9 +113,11 @@ class QwenReferenceEncoder(nn.Module):
         # stack and the final norm is an Identity, so last_hidden_state is bit-identical
         # to hidden_states[readout_layer] and output_hidden_states becomes unnecessary.
         self._truncated_to_last = False
-        # Multi-layer fusion readout (config.readout_layers): needs hidden_states even
-        # on the base-model path, and the readout is a concat rather than one entry.
+        # Multi-layer fusion readout (config.readout_layers): the selected layers are
+        # captured by forward hooks (see _register_multi_readout_hooks) rather than via
+        # output_hidden_states, so only the layers we actually read are retained.
         self._multi_readout = False
+        self._multi_capture: dict[int, torch.Tensor] = {}
 
     # -- lazy load -----------------------------------------------------------
     def load(self) -> None:
@@ -297,11 +299,34 @@ class QwenReferenceEncoder(nn.Module):
                     cfg_obj.num_hidden_layers = max_layer
                 except Exception:
                     pass
+        self._register_multi_readout_hooks(holder)
         print(
             f"[qwen] multi-layer readout {tuple(resolved)}: truncated encoder to "
             f"{max_layer}/{n} layers; per-layer non-affine RMSNorm + concat "
-            f"({len(resolved)}x hidden)."
+            f"({len(resolved)}x hidden), captured by forward hooks."
         )
+
+    def _register_multi_readout_hooks(self, holder: nn.Module) -> None:
+        """Capture exactly the selected layer outputs with forward hooks.
+
+        The alternative, output_hidden_states=True, makes HF retain EVERY layer output
+        simultaneously — 28 tensors for a 27-layer truncated stack when we read 3. At
+        B=56 with a batch-longest L that is over a gigabyte of transient activation for
+        nothing (the single-layer path avoids the flag for exactly this reason; see
+        forward()). Hooks are registered on the TRUNCATED layer list, so call this after
+        the stack is trimmed. hidden_states[k] is the output of layers[k-1] (entry 0 is
+        the embedding), hence the -1.
+        """
+        self._multi_capture = {}
+
+        def make_hook(layer_no: int):
+            def hook(module: nn.Module, args: Any, output: Any) -> None:
+                self._multi_capture[layer_no] = output[0] if isinstance(output, tuple) else output
+
+            return hook
+
+        for layer_no in self.config.readout_layers or ():
+            holder.layers[layer_no - 1].register_forward_hook(make_hook(layer_no))
 
     @property
     def _base_is_compiled(self) -> bool:
@@ -433,9 +458,15 @@ class QwenReferenceEncoder(nn.Module):
         # The full model returns CausalLM output with no last_hidden_state, so that
         # runner always needs the flag (including the fallback retry below).
         base_runner = runner is not model
-        want_hidden = self._multi_readout or not (
+        # Multi-layer fusion captures its layers by hook, so it never needs the flag —
+        # on either runner, and regardless of which one the fallback lands on.
+        want_hidden = not self._multi_readout and not (
             base_runner and (self._truncated_to_last or self._readout_is_final)
         )
+        if self._multi_readout:
+            # Drop last step's tensors before the forward so a failure can't leave stale
+            # states around, and so the old batch's activations are freed first.
+            self._multi_capture.clear()
         try:
             out = runner(**inputs, output_hidden_states=want_hidden, use_cache=False, return_dict=True)
         except Exception as exc:
@@ -464,10 +495,17 @@ class QwenReferenceEncoder(nn.Module):
             # then feature-dim concat, shallow -> deep. Every entry is a raw block
             # output (final norm neutralized at load), so the three layers get
             # identical normalization treatment.
+            missing = [i for i in self.config.readout_layers if i not in self._multi_capture]
+            if missing:
+                raise RuntimeError(
+                    f"multi-layer readout hooks did not fire for layers {missing}; "
+                    "the encoder's layer stack was replaced after load()"
+                )
             hidden_states = torch.cat(
-                [_rms_norm_fp32(out.hidden_states[i]) for i in self.config.readout_layers],
+                [_rms_norm_fp32(self._multi_capture[i]) for i in self.config.readout_layers],
                 dim=-1,
             )
+            self._multi_capture.clear()  # release the per-layer refs; the concat owns the data
         elif not want_hidden:
             # Base-model path where last_hidden_state IS the readout: truncated (final
             # norm neutralized) or a genuine final-layer readout (post-final-norm).
