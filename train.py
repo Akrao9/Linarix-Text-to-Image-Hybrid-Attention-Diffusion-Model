@@ -247,6 +247,17 @@ class BoomerLit(pl.LightningModule):
             )
             encoder = QwenReferenceEncoder(cfg, hf_token=self._hf_token)
             encoder.load()
+            # The DiT's text_dim is fixed at construction (main() multiplies it by
+            # len(readout_layers)); the encoder's width is decided here. A disagreement
+            # otherwise surfaces as an opaque broadcast error inside the first
+            # apply_condition_dropout, one full data-pipeline startup later.
+            if encoder.readout_dim != self.config.text_dim:
+                raise SystemExit(
+                    f"text encoder emits dim {encoder.readout_dim} but the DiT was built "
+                    f"for text_dim={self.config.text_dim}. readout_layers={readout_layers}, "
+                    f"readout_layer={hp.text_encoder_layer}, hidden={encoder.hidden_size}. "
+                    "Check that --text-encoder-layers reached BoomerLit's hparams."
+                )
             layer_desc = (
                 f"layers={readout_layers} (fused, dim={encoder.readout_dim})"
                 if readout_layers
@@ -2985,6 +2996,10 @@ def main() -> None:
         fsdp2=args.fsdp2,
         text_encoder_id=args.text_encoder_id,
         text_encoder_layer=args.text_encoder_layer,
+        # v8 multi-layer fusion. main() already multiplied args.text_dim by
+        # len(layers) to size the DiT, so omitting this silently builds a
+        # single-layer encoder against a DiT expecting the concatenated width.
+        text_encoder_layers=args.text_encoder_layers,
         text_encoder_max_length=args.text_encoder_max_length,
         text_encoder_instruction=args.text_encoder_instruction,
         lr=args.lr,

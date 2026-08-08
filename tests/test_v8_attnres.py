@@ -370,3 +370,43 @@ def test_telemetry_collects_once_per_optimizer_step_under_accumulation() -> None
     module.training_step(batch, 0)
     assert not any(n.startswith("attnres/") for n in logged)
     assert not module.model.block_attnres.collect_weights
+
+
+# --- CLI args must actually reach the LightningModule ------------------------------
+
+
+def test_every_text_encoder_arg_is_forwarded_to_boomerlit() -> None:
+    """--text-encoder-layers was parsed, used to size the DiT's text_dim, and then not
+    passed to BoomerLit — so the resident encoder silently built the single-layer path
+    at 2560 against a DiT expecting 7680. Nothing failed until the first batch.
+
+    Any argparse dest in this family that main() does not forward is the same bug.
+    """
+    import ast
+
+    tree = ast.parse((ROOT / "train.py").read_text())
+
+    parsed: set[str] = set()
+    forwarded: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        # p.add_argument("--text-encoder-...")
+        if isinstance(fn, ast.Attribute) and fn.attr == "add_argument":
+            for arg in node.args:
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    if arg.value.startswith("--text-encoder-"):
+                        parsed.add(arg.value[2:].replace("-", "_"))
+        # BoomerLit(..., text_encoder_x=args.text_encoder_x, ...)
+        if isinstance(fn, ast.Name) and fn.id == "BoomerLit":
+            for kw in node.keywords:
+                if kw.arg and kw.arg.startswith("text_encoder_"):
+                    forwarded.add(kw.arg)
+
+    assert "text_encoder_layers" in parsed, "flag disappeared from the parser"
+    missing = parsed - forwarded
+    assert not missing, (
+        f"parsed but never forwarded to BoomerLit: {sorted(missing)} — "
+        "the resident encoder will fall back to its default for these"
+    )
