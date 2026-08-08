@@ -168,6 +168,14 @@ class BoomerFLADiTConfig:
     # behavior). PixArt-Sigma-style thinning: text tokens are static after the dual-stream
     # prefix, so per-block cross-attention is partly redundant. Blocks without cross-attn
     # keep the 9-way modulation layout; their cross rows are simply unused.
+    #
+    # 0 disables cross-attention entirely: text then reaches the image stream ONLY through
+    # joint attention — the dual-stream prefix and any joint refresh blocks. Note this is
+    # NOT the MMDiT arrangement it resembles: SD3/FLUX keep text in the attended sequence
+    # in EVERY block, whereas here 14 of 22 encoder blocks would see no text at all, and
+    # the DDT decoder never sees text (only z). Influence still propagates through the
+    # residual stream and the AttnRes bank, but it is not re-injected. Expect this to bear
+    # on prompt adherence; validate before committing a long run to it.
     cross_attention_every: int = 1
     # PixArt-alpha adaLN-single: one shared SiLU+Linear timestep projection for all blocks
     # instead of a ~7M-param projection per block; the per-block scale_shift_table (which
@@ -1166,7 +1174,10 @@ class BoomerFLABlock(nn.Module):
             )
             self.image_attn_scale_shift_table = nn.Parameter(torch.zeros(3, hidden_dim))
             self.sandwich_image_attn = make_sandwich_norm(config)
-        self.use_cross_attention = (layer_idx + 1) % config.cross_attention_every == 0
+        self.use_cross_attention = (
+            config.cross_attention_every > 0
+            and (layer_idx + 1) % config.cross_attention_every == 0
+        )
         if not self.use_cross_attention:
             self.cross_attn = None
         else:
@@ -2061,8 +2072,21 @@ class BoomerFLADiT(nn.Module):
                 f"dual_stream_depth={config.dual_stream_depth} exceeds the encoder depth "
                 f"{encoder_depth} (depth={config.depth} - ddt_decoder_depth={config.ddt_decoder_depth})"
             )
-        if config.cross_attention_every < 1:
-            raise ValueError(f"cross_attention_every must be >= 1, got {config.cross_attention_every}")
+        if config.cross_attention_every < 0:
+            raise ValueError(
+                f"cross_attention_every must be >= 0 (0 = no cross-attention), "
+                f"got {config.cross_attention_every}"
+            )
+        if config.cross_attention_every == 0 and not (
+            config.dual_stream_depth > 0 or config.joint_refresh_attention or config.refresh_layers
+        ):
+            # Every text pathway would be gone: no cross-attn, no joint attention anywhere.
+            # The model would be unconditional and the caption embedder would get no gradient.
+            raise ValueError(
+                "cross_attention_every=0 removes the only text pathway unless the model has "
+                "a dual-stream prefix or joint refresh blocks; set dual_stream_depth > 0 or "
+                "enable refresh blocks"
+            )
         if (
             config.joint_refresh_attention
             and config.refresh_layers is None
@@ -2124,7 +2148,10 @@ class BoomerFLADiT(nn.Module):
                     reads_text = True
                 else:
                     # A plain (or demoted) block reads text iff it cross-attends.
-                    reads_text = (i + 1) % config.cross_attention_every == 0
+                    reads_text = (
+                        config.cross_attention_every > 0
+                        and (i + 1) % config.cross_attention_every == 0
+                    )
                 reader_after = reader_after or reads_text
         self._joint_refresh_indices = refresh_indices
 

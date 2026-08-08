@@ -2525,7 +2525,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Sana-style Q/K RMSNorm inside text cross-attention.")
     p.add_argument("--cross-attn-every", type=int, default=1,
                    help="Cross-attend to text every Nth single-stream block (1 = every block). "
-                        "PixArt-Sigma-style thinning; pilot-ablate before a long run.")
+                        "PixArt-Sigma-style thinning; pilot-ablate before a long run. 0 removes "
+                        "cross-attention entirely, leaving joint attention (dual-stream prefix + "
+                        "refresh blocks) as the only text pathway — unlike MMDiT, which keeps text "
+                        "in the attended sequence in EVERY block, so validate prompt adherence.")
     p.add_argument("--shared-adaln", action=bo, default=False,
                    help="PixArt-alpha adaLN-single: one shared timestep-modulation projection for "
                         "all blocks (per-block scale_shift_table keeps layer variation). Saves ~27%% "

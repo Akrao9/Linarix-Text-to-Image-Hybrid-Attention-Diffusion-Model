@@ -451,3 +451,48 @@ def test_mixed_dtype_sources_raise_a_named_error() -> None:
     sources = [torch.randn(2, 4, 8), torch.randn(2, 4, 8, dtype=torch.bfloat16)]
     with pytest.raises(TypeError, match="must share one dtype"):
         attn(0, sources)
+
+
+# --- cross_attention_every=0: joint attention as the only text pathway -------------
+
+
+def test_cross_attn_every_zero_removes_all_cross_attention() -> None:
+    """Text then reaches the image stream only through joint attention (dual-stream
+    prefix + refresh blocks). Unlike MMDiT, plain blocks see no text at all."""
+    model = BoomerFLADiT(_config(cross_attention_every=0))
+    for i, blk in enumerate(model.blocks):
+        assert not getattr(blk, "use_cross_attention", False), f"block {i} kept cross-attn"
+        assert getattr(blk, "cross_attn", None) is None, f"block {i} kept cross_attn weights"
+    assert not any("cross_attn" in k for k in model.state_dict())
+    out = model(*_batch(model))
+    assert out.shape[1:] == (4, 8, 8) and torch.isfinite(out).all()
+
+
+def test_cross_attn_every_zero_still_conditions_on_text() -> None:
+    """The dual-stream prefix and refresh blocks must keep text in the graph, or the run
+    would silently train an unconditional model."""
+    model = BoomerFLADiT(_config(cross_attention_every=0))
+    _break_zero_init(model)
+    x, t, text, mask = _batch(model)
+    text = text.clone().requires_grad_(True)
+    model(x, t, text, mask).square().mean().backward()
+    assert text.grad is not None and text.grad.abs().max() > 0, "text is disconnected"
+    assert model.caption_embedder.y_proj[0].weight.grad.abs().max() > 0
+
+    # and the output actually moves when the caption changes
+    with torch.no_grad():
+        a = model(x, t, text, mask)
+        b = model(x, t, torch.randn_like(text), mask)
+    assert (a - b).abs().max() > 1e-4, "output is invariant to the caption"
+
+
+def test_cross_attn_every_zero_rejected_without_a_joint_pathway() -> None:
+    with pytest.raises(ValueError, match="only text pathway"):
+        BoomerFLADiT(_config(cross_attention_every=0, dual_stream_depth=0,
+                             joint_refresh_attention=False, refresh_layers=None,
+                             block_attnres=False, attnres_group_ends=()))
+
+
+def test_negative_cross_attn_every_still_rejected() -> None:
+    with pytest.raises(ValueError, match="must be >= 0"):
+        BoomerFLADiT(_config(cross_attention_every=-1))
