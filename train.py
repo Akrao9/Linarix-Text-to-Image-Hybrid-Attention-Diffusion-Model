@@ -677,13 +677,15 @@ class BoomerLit(pl.LightningModule):
         # is the token embedding, the last slot is the current stream ("latest"). Mass
         # staying ~1 on the last slot = AttnRes has degenerated to its identity init; mass
         # spreading to earlier slots = it is earning its parameters. last_weights refreshes
-        # on EAGER forwards only (torch.compile skips the attribute mutation), so under
-        # --compile these logs are simply absent.
+        # on EAGER forwards only (torch.compile skips the attribute mutation); under
+        # --compile fall back to softmax(slot_bias) — exact at init (queries start at
+        # zero) and the token-independent part of the depth attention thereafter, so the
+        # attribution channel survives compiled runs.
         attnres = getattr(self.model, "block_attnres", None)
         if attnres is not None:
             for site, w in enumerate(attnres.last_weights):
                 if w is None:
-                    continue
+                    w = attnres.slot_biases[site].detach().float().softmax(0)
                 for slot in range(w.numel()):
                     self.log(f"attnres/site{site}_slot{slot}", w[slot],
                              on_step=True, on_epoch=False, batch_size=bs)
