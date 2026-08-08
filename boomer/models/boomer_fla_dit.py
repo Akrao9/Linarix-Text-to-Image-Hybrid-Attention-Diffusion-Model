@@ -51,8 +51,16 @@ class BoomerFLADiTConfig:
     # "flash4" uses FlashAttention-4/CuTe's varlen API with seqused_k, which needs valid
     # tokens as a prefix — hence the image-first sequence order (attention is
     # permutation-invariant over keys, so the order itself changes nothing). Measured
-    # 2.0x on sm_120 at B=56 S=576 fwd+bwd; verify with tools/attn_backend_probe.py on
-    # the exact runtime before enabling, since FA4/CuTe targets sm_100.
+    # 2.0x on sm_120 at B=56 S=576 fwd+bwd in ISOLATION -- but see the warning below.
+    #
+    # KNOWN BAD on sm_120 (RTX PRO 6000 Blackwell, 2026-08-08): inside the model it
+    # produces `CUDA error: an illegal memory access was encountered` during backward
+    # under gradient checkpointing, reported asynchronously against whatever kernel
+    # syncs next (GDN2's g_proj, modulate, ...) rather than against FA4. The standalone
+    # probe passes, so the corruption needs the checkpoint-recompute path -- FA4/CuTe
+    # targets sm_100 datacenter Blackwell, and sm_120 is a different target. The same
+    # run with "sdpa" is clean. Do not enable on sm_120 without reproducing a full
+    # backward under --gradient-checkpointing, not just tools/attn_backend_probe.py.
     joint_attention_backend: str = "sdpa"
     image_attention_qk_rmsnorm: bool = True
     image_attention_rope: bool = False

@@ -2546,8 +2546,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "refresh blocks) — separate from --image-attn-backend, which routes "
                         "the DDT decoder's self-attention. flash4 uses FlashAttention-4/CuTe "
                         "varlen with seqused_k (2.0x over masked SDPA at B=56 S=576 on "
-                        "sm_120). Run tools/attn_backend_probe.py on the exact runtime first: "
-                        "FA4/CuTe targets sm_100, and it falls back to SDPA if unavailable.")
+                        "sm_120) in isolation. KNOWN BAD on sm_120 inside the model: illegal "
+                        "memory access during backward under gradient checkpointing, while the "
+                        "standalone probe passes. Leave at sdpa unless a full checkpointed "
+                        "backward has been verified on your exact GPU + torch.")
     p.add_argument("--shared-adaln", action=bo, default=False,
                    help="PixArt-alpha adaLN-single: one shared timestep-modulation projection for "
                         "all blocks (per-block scale_shift_table keeps layer variation). Saves ~27%% "
