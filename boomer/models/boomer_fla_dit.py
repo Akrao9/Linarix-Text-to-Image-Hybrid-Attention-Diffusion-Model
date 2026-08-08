@@ -1318,9 +1318,14 @@ def _flash4_varlen_joint(
     Returns None when FA4 is unavailable so the caller falls back to SDPA. Measured 2.0x
     over masked SDPA at B=56 S=576 on sm_120 (tools/attn_backend_probe.py).
     """
+    global _JOINT_SDPA_BACKEND
     fn = _flash4_varlen_func()
     if fn is None:
         return None
+    # Report the EFFECTIVE joint backend: a silent fall back to SDPA (wrong torch for
+    # the compiled FA4 extension, non-CUDA, fp32) must be visible in the log, not
+    # inferred from the absence of a line.
+    _JOINT_SDPA_BACKEND = "flash4-varlen"
     seqused = (num_image + text_valid.sum(dim=1)).to(torch.int32)
     seqlen = q.shape[1]
     out = fn(
@@ -1337,8 +1342,10 @@ _JOINT_SDPA_BACKEND: str | None = None
 
 
 def joint_sdpa_backend() -> str | None:
-    """Which SDPA backend the joint-attention sites resolved to, or None before the
-    first call. Trainers log this once so a silent fall back to `math` is visible."""
+    """Which backend the joint-attention sites actually used — "flash4-varlen", or the
+    resolved SDPA kernel name — or None before the first call. Trainers log this once,
+    so both a silent fall back from flash4 and a fall back to the `math` kernel are
+    visible rather than inferred."""
     return _JOINT_SDPA_BACKEND
 
 
@@ -1372,7 +1379,7 @@ def joint_sdpa(
     # Flash takes no arbitrary attn_mask, so it is only a candidate when unmasked.
     candidates = [] if attn_mask is not None else [("flash", SDPBackend.FLASH_ATTENTION)]
     candidates += [("efficient", SDPBackend.EFFICIENT_ATTENTION), ("math", SDPBackend.MATH)]
-    if _JOINT_SDPA_BACKEND is not None:
+    if _JOINT_SDPA_BACKEND is not None and _JOINT_SDPA_BACKEND != "flash4-varlen":
         chosen = dict(candidates).get(_JOINT_SDPA_BACKEND)
         if chosen is not None:
             with sdpa_kernel(chosen):
