@@ -1,8 +1,10 @@
-"""CPU regression coverage for boomer.optim.CAME8Bit.
+"""CPU regression coverage for boomer.optim: CAME8Bit and MuonWithAuxAdamW.
 
-The optimizer is only worth running if three things hold: the quantiser round-trips
-without eating the signal, the state really is smaller than AdamW's, and a checkpoint
-resumes to the identical trajectory. Everything here is CPU-only and fast.
+An alternative optimizer is only worth running if it round-trips through a checkpoint,
+really is smaller than AdamW, and survives the harness it will run under. For CAME that
+means the quantiser must not eat the signal; for Muon it means the hybrid must satisfy
+BOTH Lightning's structural protocol and LambdaLR's isinstance check, and its two
+learning rates must survive a resume. Everything here is CPU-only and fast.
 """
 
 from __future__ import annotations
@@ -298,6 +300,8 @@ def _hparams(**overrides):
         optimizer="came8bit", lr=1e-4, came_lr=2e-5, weight_decay=0.0,
         beta1=0.9, beta2=0.95, fused_adamw=True,
         came_block_size=2048, came_min_8bit_size=16384,
+        muon_lr=None, muon_aux_lr=None, muon_weight_decay=0.1,
+        muon_momentum=0.95, muon_ns_steps=5, muon_adjust_lr_fn="match_rms_adamw",
         warmup_steps=0, lr_scheduler="constant", min_lr_ratio=0.1, max_steps=100,
     )
     base.update(overrides)
@@ -311,7 +315,13 @@ class _TinyLit:
         import torch.nn as _nn
 
         self.hparams = hparams
-        self.model = _nn.Sequential(_nn.Linear(64, 64), _nn.Linear(64, 64))
+        self.model = _nn.Sequential(_nn.Linear(64, 64), _nn.LayerNorm(64))
+
+    def _cli_lr_for_group(self, group):
+        # on_train_start calls this on self; borrow the real implementation.
+        import train
+
+        return train.BoomerLit._cli_lr_for_group(self, group)
 
 
 def test_configure_optimizers_builds_came8bit():
@@ -356,7 +366,8 @@ def test_on_train_start_does_not_push_adamw_lr_into_came_groups():
     optim = train.BoomerLit.configure_optimizers(lit)["optimizer"]
     for group in optim.param_groups:
         group["initial_lr"] = 999.0
-    sched = SimpleNamespace(base_lrs=[999.0])
+    # mirrors LambdaLR, which carries .optimizer and a base_lrs aligned to its groups
+    sched = SimpleNamespace(base_lrs=[999.0] * len(optim.param_groups), optimizer=optim)
     lit.trainer = SimpleNamespace(
         optimizers=[optim],
         lr_scheduler_configs=[SimpleNamespace(scheduler=sched)],
@@ -365,3 +376,273 @@ def test_on_train_start_does_not_push_adamw_lr_into_came_groups():
 
     assert optim.param_groups[0]["initial_lr"] == 2e-5
     assert sched.base_lrs == [2e-5]
+
+
+# --- Muon ----------------------------------------------------------------------
+
+
+def _muon_available():
+    return hasattr(torch.optim, "Muon")
+
+
+muon_required = pytest.mark.skipif(not _muon_available(), reason="torch.optim.Muon needs torch>=2.9")
+
+
+def _split_model():
+    return nn.Sequential(
+        nn.Linear(64, 64),          # 2D weight + 1D bias
+        nn.LayerNorm(64),           # 1D weight + 1D bias
+        nn.Conv2d(4, 4, 3),         # 4D
+    )
+
+
+def test_split_sends_only_2d_hidden_weights_to_muon():
+    from boomer.optim import split_muon_parameters
+
+    model = _split_model()
+    muon, aux = split_muon_parameters(model)
+    assert all(p.ndim == 2 for p in muon), "Muon rejects anything but 2D"
+    assert {p.ndim for p in aux} <= {1, 3, 4}
+    assert len(muon) == 1  # only the Linear weight
+
+
+def test_split_excludes_embeddings_and_heads():
+    """Input embeddings and output heads must stay on AdamW.
+
+    They map hidden space to a semantically fixed space (latents, the text readout,
+    the DINO target), where orthogonalising away scale is not the right prior.
+    """
+    from boomer.optim import MUON_EXCLUDE_PREFIXES, split_muon_parameters
+
+    class Named(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.x_embedder = nn.Linear(8, 16, bias=False)
+            self.out_proj = nn.Linear(16, 8, bias=False)
+            self.repa_proj = nn.Linear(16, 16, bias=False)
+            self.blocks = nn.Linear(16, 16, bias=False)  # a hidden weight
+
+    muon, aux = split_muon_parameters(Named())
+    assert len(muon) == 1 and muon[0].shape == (16, 16)
+    assert len(aux) == 3
+    for prefix in ("x_embedder", "out_proj", "repa_proj"):
+        assert prefix in MUON_EXCLUDE_PREFIXES
+
+
+@muon_required
+def test_torch_muon_rejects_non_2d_which_is_why_the_split_exists():
+    with pytest.raises(ValueError, match="2D"):
+        opt = torch.optim.Muon([nn.Parameter(torch.randn(16))], lr=1e-3)
+        opt.param_groups[0]["params"][0].grad = torch.randn(16)
+        opt.step()
+
+
+@muon_required
+def test_hybrid_satisfies_lightning_optimizable_protocol():
+    """Lightning structurally types optimizers; the wrapper is not an Optimizer subclass."""
+    from lightning.fabric.utilities.types import Optimizable
+
+    from boomer.optim import MuonWithAuxAdamW
+
+    opt = MuonWithAuxAdamW(_split_model(), lr=1e-3, aux_lr=1e-4)
+    assert isinstance(opt, Optimizable)
+
+
+@muon_required
+def test_hybrid_param_groups_are_the_live_dicts_not_copies():
+    """An LR scheduler mutates group['lr']; it must reach the real optimizer."""
+    from boomer.optim import MuonWithAuxAdamW
+
+    opt = MuonWithAuxAdamW(_split_model(), lr=1e-3, aux_lr=1e-4)
+    for group in opt.param_groups:
+        group["lr"] = 0.5
+    assert all(g["lr"] == 0.5 for g in opt._muon.param_groups)
+    assert all(g["lr"] == 0.5 for g in opt._aux.param_groups)
+
+
+@muon_required
+def test_hybrid_tags_roles_and_keeps_two_rates():
+    from boomer.optim import MuonWithAuxAdamW
+
+    opt = MuonWithAuxAdamW(_split_model(), lr=2e-2, aux_lr=1e-4)
+    roles = {g["boomer_role"] for g in opt.param_groups}
+    assert roles == {"muon", "aux"}
+    assert {g["lr"] for g in opt.param_groups if g["boomer_role"] == "muon"} == {2e-2}
+    assert {g["lr"] for g in opt.param_groups if g["boomer_role"] == "aux"} == {1e-4}
+
+
+@muon_required
+def test_hybrid_steps_every_parameter():
+    """Both halves must actually move — a silent no-op on one group would be invisible."""
+    from boomer.optim import MuonWithAuxAdamW
+
+    torch.manual_seed(0)
+    model = _split_model()
+    opt = MuonWithAuxAdamW(model, lr=1e-2, aux_lr=1e-3)
+    before = [p.detach().clone() for p in model.parameters()]
+    for p in model.parameters():
+        p.grad = torch.randn_like(p)
+    opt.step()
+    for name, old, new in zip(
+        [n for n, _ in model.named_parameters()], before, model.parameters()
+    ):
+        assert not torch.equal(old, new), f"{name} did not move"
+        assert torch.isfinite(new).all()
+
+
+@muon_required
+def test_hybrid_converges_on_a_quadratic():
+    from boomer.optim import MuonWithAuxAdamW
+
+    torch.manual_seed(0)
+    model = nn.Sequential(nn.Linear(64, 64), nn.LayerNorm(64), nn.Linear(64, 64))
+    inputs, target = torch.randn(32, 64), torch.randn(32, 64)
+    opt = MuonWithAuxAdamW(model, lr=1e-2, aux_lr=1e-3)
+    losses = []
+    for _ in range(60):
+        opt.zero_grad()
+        loss = ((model(inputs) - target) ** 2).mean()
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    assert losses[-1] < losses[0] * 0.5, f"{losses[0]:.4f} -> {losses[-1]:.4f}"
+
+
+@muon_required
+def test_hybrid_state_dict_round_trips():
+    from boomer.optim import MuonWithAuxAdamW
+
+    torch.manual_seed(0)
+    inputs, target = torch.randn(8, 64), torch.randn(8, 64)
+
+    def run(resume_at):
+        torch.manual_seed(1)
+        model = nn.Sequential(nn.Linear(64, 64), nn.LayerNorm(64))
+        opt = MuonWithAuxAdamW(model, lr=1e-2, aux_lr=1e-3)
+        for step in range(8):
+            if resume_at is not None and step == resume_at:
+                snapshot = copy.deepcopy(opt.state_dict())
+                weights = [p.detach().clone() for p in model.parameters()]
+                model = nn.Sequential(nn.Linear(64, 64), nn.LayerNorm(64))
+                with torch.no_grad():
+                    for p, w in zip(model.parameters(), weights):
+                        p.copy_(w)
+                opt = MuonWithAuxAdamW(model, lr=1e-2, aux_lr=1e-3)
+                opt.load_state_dict(snapshot)
+            opt.zero_grad()
+            ((model(inputs) - target) ** 2).mean().backward()
+            opt.step()
+        return [p.detach().clone() for p in model.parameters()]
+
+    for a, b in zip(run(None), run(4)):
+        assert torch.equal(a, b)
+
+
+@muon_required
+def test_hybrid_state_is_about_half_of_adamw():
+    from boomer.optim import adamw_state_bytes, muon_state_bytes
+
+    model = nn.Sequential(nn.Linear(1024, 1024, bias=False), nn.Linear(1024, 1024, bias=False))
+    assert muon_state_bytes(model) == pytest.approx(adamw_state_bytes(model) / 2, rel=0.01)
+
+
+@muon_required
+def test_hybrid_refuses_a_model_with_no_2d_weights():
+    from boomer.optim import MuonWithAuxAdamW
+
+    with pytest.raises(ValueError, match="no Muon-eligible"):
+        MuonWithAuxAdamW(nn.LayerNorm(8), lr=1e-3, aux_lr=1e-3)
+
+
+@muon_required
+def test_configure_optimizers_builds_muon_and_defaults_lr_to_cli_lr():
+    import train
+
+    lit = _TinyLit(_hparams(optimizer="muon", muon_lr=None, muon_aux_lr=None))
+    optim = train.BoomerLit.configure_optimizers(lit)["optimizer"]
+    from boomer.optim import MuonWithAuxAdamW
+
+    assert isinstance(optim, MuonWithAuxAdamW)
+    # match_rms_adamw makes the AdamW rate transfer, so --lr is the right default
+    assert all(g["lr"] == 1e-4 for g in optim.param_groups)
+    assert optim.defaults["weight_decay"] == 0.1, "Muon needs decoupled weight decay"
+
+
+@muon_required
+def test_on_train_start_restores_both_muon_rates_separately():
+    """The resume-time LR override must not collapse Muon's two rates into one."""
+    import train
+    from types import SimpleNamespace
+
+    lit = _TinyLit(_hparams(optimizer="muon", muon_lr=2e-2, muon_aux_lr=1e-4))
+    optim = train.BoomerLit.configure_optimizers(lit)["optimizer"]
+    for group in optim.param_groups:
+        group["initial_lr"] = 999.0
+    sched = SimpleNamespace(base_lrs=[999.0] * len(optim.param_groups), optimizer=optim)
+    lit.trainer = SimpleNamespace(
+        optimizers=[optim], lr_scheduler_configs=[SimpleNamespace(scheduler=sched)]
+    )
+    train.BoomerLit.on_train_start(lit)
+
+    for group in optim.param_groups:
+        expected = 2e-2 if group["boomer_role"] == "muon" else 1e-4
+        assert group["initial_lr"] == expected
+    assert set(sched.base_lrs) == {2e-2, 1e-4}
+
+
+@muon_required
+def test_lambdalr_accepts_the_hybrid_and_scaling_reaches_both_suboptimizers():
+    """LambdaLR does isinstance(optimizer, Optimizer) — a duck-typed wrapper dies here.
+
+    And once attached, its warmup multiplier has to reach the dicts the sub-optimizers
+    actually read, or the schedule would be adjusting a rate nobody uses.
+    """
+    from boomer.optim import MuonWithAuxAdamW
+
+    model = nn.Sequential(nn.Linear(64, 64), nn.LayerNorm(64))
+    opt = MuonWithAuxAdamW(model, lr=2e-2, aux_lr=1e-4)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda step: 0.5)
+
+    assert opt.param_groups[0] is opt._muon.param_groups[0], "group identity is the mechanism"
+    assert opt.param_groups[1] is opt._aux.param_groups[0]
+
+    for p in model.parameters():
+        p.grad = torch.randn_like(p)
+    opt.step()
+    sched.step()
+    assert opt._muon.param_groups[0]["lr"] == pytest.approx(1e-2)
+    assert opt._aux.param_groups[0]["lr"] == pytest.approx(5e-5)
+
+
+@muon_required
+def test_end_to_end_lightning_fit_with_muon():
+    """The wrapper has to survive a real Trainer.fit, not just direct stepping."""
+    import lightning as L
+    from torch.utils.data import DataLoader, TensorDataset
+
+    from boomer.optim import MuonWithAuxAdamW
+
+    class Tiny(L.LightningModule):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Sequential(nn.Linear(16, 16), nn.LayerNorm(16), nn.Linear(16, 16))
+
+        def training_step(self, batch, _):
+            x, y = batch
+            return ((self.net(x) - y) ** 2).mean()
+
+        def configure_optimizers(self):
+            opt = MuonWithAuxAdamW(self.net, lr=1e-2, aux_lr=1e-3)
+            sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 1.0)
+            return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "step"}}
+
+    torch.manual_seed(0)
+    data = TensorDataset(torch.randn(32, 16), torch.randn(32, 16))
+    model = Tiny()
+    before = model.net[0].weight.detach().clone()
+    L.Trainer(max_steps=4, accelerator="cpu", logger=False, enable_checkpointing=False,
+              enable_progress_bar=False, enable_model_summary=False).fit(
+        model, DataLoader(data, batch_size=8)
+    )
+    assert not torch.equal(before, model.net[0].weight), "Muon group never moved"
+    assert torch.isfinite(model.net[0].weight).all()

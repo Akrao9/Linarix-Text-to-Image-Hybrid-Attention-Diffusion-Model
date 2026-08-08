@@ -790,25 +790,52 @@ class BoomerLit(pl.LightningModule):
         # Under --optimizer came8bit the live learning rate is --came-lr; --lr belongs to
         # AdamW and is ignored there. Taking self.hparams.lr unconditionally would push
         # the (much larger) AdamW rate into CAME's param groups on every resume.
-        target = float(self.hparams.lr)
-        if getattr(self.hparams, "optimizer", "adamw") == "came8bit":
-            target = float(self.hparams.came_lr)
+        # Under --optimizer muon there are TWO rates by design (Muon on 2D hidden
+        # weights, AdamW on norms/biases/embeddings), so the target is resolved PER
+        # GROUP off its boomer_role tag. Collapsing both to one value would silently
+        # retune half the model on every resume.
         changed = False
         for optim in self.trainer.optimizers:
             for group in optim.param_groups:
+                target = self._cli_lr_for_group(group)
                 if group.get("initial_lr") is not None and group["initial_lr"] != target:
                     group["initial_lr"] = target
                     changed = True
         for config in self.trainer.lr_scheduler_configs:
             sched = config.scheduler
             base = getattr(sched, "base_lrs", None)
-            if base and any(value != target for value in base):
-                sched.base_lrs = [target] * len(base)
+            if not base:
+                continue
+            # base_lrs is positionally aligned with the optimizer's param_groups.
+            desired = [self._cli_lr_for_group(g) for g in sched.optimizer.param_groups]
+            if list(base) != desired:
+                sched.base_lrs = desired
                 changed = True
         if changed:
-            flag = "--came-lr" if getattr(self.hparams, "optimizer", "adamw") == "came8bit" else "--lr"
-            print(f"[lr] CLI {flag} {target:g} overrides the resumed optimizer/scheduler "
+            mode = getattr(self.hparams, "optimizer", "adamw")
+            flag = {"came8bit": "--came-lr", "muon": "--muon-lr/--muon-aux-lr"}.get(mode, "--lr")
+            rates = sorted({g["initial_lr"] for o in self.trainer.optimizers
+                            for g in o.param_groups if g.get("initial_lr") is not None})
+            shown = ", ".join(f"{r:g}" for r in rates)
+            print(f"[lr] CLI {flag} ({shown}) overrides the resumed optimizer/scheduler "
                   f"learning rate", flush=True)
+
+    def _cli_lr_for_group(self, group: dict) -> float:
+        """The learning rate the CLI asks for, for one param group.
+
+        --lr belongs to AdamW. came8bit runs on --came-lr and must never inherit --lr
+        (it is ~5x too large). muon runs two groups at once, distinguished by the
+        boomer_role tag its optimizer stamps on each group.
+        """
+        hp = self.hparams
+        mode = getattr(hp, "optimizer", "adamw")
+        if mode == "came8bit":
+            return float(hp.came_lr)
+        if mode == "muon":
+            if group.get("boomer_role") == "muon":
+                return float(getattr(hp, "muon_lr", None) or hp.lr)
+            return float(getattr(hp, "muon_aux_lr", None) or hp.lr)
+        return float(hp.lr)
 
     def configure_optimizers(self):
         hp = self.hparams
@@ -838,6 +865,38 @@ class BoomerLit(pl.LightningModule):
             print(
                 f"[optim] CAME8bit lr={float(came_lr):g} (AdamW --lr {hp.lr:g} ignored) | "
                 f"optimizer state {came_state_bytes(self.model) / gib:.2f} GiB vs "
+                f"{adamw_state_bytes(self.model) / gib:.2f} GiB for fp32 AdamW",
+                flush=True,
+            )
+        elif getattr(hp, "optimizer", "adamw") == "muon":
+            from boomer.optim import (
+                MuonWithAuxAdamW,
+                adamw_state_bytes,
+                muon_state_bytes,
+            )
+
+            # match_rms_adamw makes the AdamW rate transfer, so defaulting to --lr is
+            # correct here — the opposite of came8bit, which refuses to inherit it.
+            muon_lr = float(getattr(hp, "muon_lr", None) or hp.lr)
+            aux_lr = float(getattr(hp, "muon_aux_lr", None) or hp.lr)
+            optim = MuonWithAuxAdamW(
+                self.model,
+                lr=muon_lr,
+                aux_lr=aux_lr,
+                weight_decay=float(getattr(hp, "muon_weight_decay", 0.1)),
+                aux_weight_decay=hp.weight_decay,
+                aux_betas=(hp.beta1, hp.beta2),
+                momentum=float(getattr(hp, "muon_momentum", 0.95)),
+                ns_steps=int(getattr(hp, "muon_ns_steps", 5)),
+                adjust_lr_fn=str(getattr(hp, "muon_adjust_lr_fn", "match_rms_adamw")),
+            )
+            gib = 1024 ** 3
+            print(
+                f"[optim] Muon lr={muon_lr:g} wd={optim.defaults['weight_decay']:g} "
+                f"adjust_lr_fn={optim.defaults['adjust_lr_fn']} on "
+                f"{optim.muon_params / 1e6:.1f}M params | AdamW lr={aux_lr:g} on "
+                f"{optim.aux_params / 1e6:.1f}M (norms/biases/embeddings/heads) | "
+                f"optimizer state {muon_state_bytes(self.model) / gib:.2f} GiB vs "
                 f"{adamw_state_bytes(self.model) / gib:.2f} GiB for fp32 AdamW",
                 flush=True,
             )
@@ -2691,11 +2750,34 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--beta1", type=float, default=0.9)
     p.add_argument("--beta2", type=float, default=0.95)
     p.add_argument("--fused-adamw", action=bo, default=True)
-    p.add_argument("--optimizer", default="adamw", choices=["adamw", "came8bit"],
+    p.add_argument("--optimizer", default="adamw", choices=["adamw", "came8bit", "muon"],
                    help="came8bit = SANA 1.5's CAME with factored second moments and "
                         "8-bit first moments (~7x less optimizer state than fp32 AdamW). "
                         "Gradient checkpointing does not touch optimizer state, so this "
-                        "is the remaining large lever on peak memory.")
+                        "is the remaining large lever on peak memory. "
+                        "muon = torch.optim.Muon (torch >= 2.9) on 2D hidden weights with "
+                        "AdamW on norms/biases/embeddings; in production at Kimi K2, "
+                        "GLM-4.5, INTELLECT-3. Aimed at quality, and halves optimizer "
+                        "state as a side effect (momentum only, no second moment).")
+    p.add_argument("--muon-lr", type=float, default=None,
+                   help="LR for the Muon (2D hidden weight) group. Defaults to --lr: "
+                        "adjust_lr_fn=match_rms_adamw rescales the update to AdamW's RMS, "
+                        "so an AdamW-tuned rate transfers (unlike --came-lr).")
+    p.add_argument("--muon-aux-lr", type=float, default=None,
+                   help="LR for the AdamW group (norms, biases, embeddings, heads). "
+                        "Defaults to --lr.")
+    p.add_argument("--muon-weight-decay", type=float, default=0.1,
+                   help="Weight decay on the Muon group. NOT --weight-decay: decoupled "
+                        "weight decay is one of the two changes 'Muon is Scalable for LLM "
+                        "Training' identifies as required to scale Muon, so it defaults "
+                        "on (torch's default) even when --weight-decay is 0.")
+    p.add_argument("--muon-momentum", type=float, default=0.95)
+    p.add_argument("--muon-ns-steps", type=int, default=5,
+                   help="Newton-Schulz iterations per step.")
+    p.add_argument("--muon-adjust-lr-fn", default="match_rms_adamw",
+                   choices=["match_rms_adamw", "original"],
+                   help="match_rms_adamw = Moonshot's 0.2*lr*sqrt(max(A,B)) so AdamW LRs "
+                        "transfer; original = Keller's sqrt(max(1, A/B)).")
     p.add_argument("--came-lr", type=float, default=None,
                    help="LR for --optimizer came8bit. REQUIRED: CAME RMS-clips its update "
                         "and has no bias correction, so an AdamW LR is far too large. "
@@ -3093,6 +3175,12 @@ def main() -> None:
         came_lr=args.came_lr,
         came_block_size=args.came_block_size,
         came_min_8bit_size=args.came_min_8bit_size,
+        muon_lr=args.muon_lr,
+        muon_aux_lr=args.muon_aux_lr,
+        muon_weight_decay=args.muon_weight_decay,
+        muon_momentum=args.muon_momentum,
+        muon_ns_steps=args.muon_ns_steps,
+        muon_adjust_lr_fn=args.muon_adjust_lr_fn,
         warmup_steps=args.warmup_steps,
         lr_scheduler=args.lr_scheduler,
         min_lr_ratio=args.min_lr_ratio,

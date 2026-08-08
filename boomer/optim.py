@@ -1,4 +1,14 @@
-"""CAME with 8-bit first moments — the memory-efficient optimizer from SANA 1.5.
+"""Alternatives to fp32 AdamW: CAME8Bit (memory) and Muon (quality, and less memory).
+
+Two optimizers with different aims, both reachable from `--optimizer`:
+
+  * `CAME8Bit` cuts optimizer STATE ~7.5x (measured 0.88 GiB vs 6.63 GiB on v8's 890M),
+    hoping to be quality-neutral. Learning rate does NOT transfer from AdamW.
+  * `MuonWithAuxAdamW` targets QUALITY -- orthogonalised momentum on 2D hidden weights --
+    and halves state as a side effect, since Muon carries momentum only. Learning rate
+    DOES transfer from AdamW via `adjust_lr_fn="match_rms_adamw"`.
+
+--- CAME8Bit -------------------------------------------------------------------
 
 Gradient checkpointing took v8's ACTIVATION peak to 11.07 GB, which promotes optimizer
 state to a comparable share of the budget: fused AdamW holds `exp_avg` + `exp_avg_sq` in
@@ -36,7 +46,15 @@ from __future__ import annotations
 
 import torch
 
-__all__ = ["CAME8Bit", "came_state_bytes", "adamw_state_bytes"]
+__all__ = [
+    "CAME8Bit",
+    "MuonWithAuxAdamW",
+    "MUON_EXCLUDE_PREFIXES",
+    "split_muon_parameters",
+    "came_state_bytes",
+    "muon_state_bytes",
+    "adamw_state_bytes",
+]
 
 # A block whose values are all equal has zero range. Dividing by the clamped scale sends
 # every code to 0, and dequantisation then returns `bmin` exactly -- constant blocks
@@ -316,3 +334,188 @@ def came_state_bytes(model: torch.nn.Module, block_size: int = 2048,
 def adamw_state_bytes(model: torch.nn.Module) -> int:
     """Bytes of persistent optimizer state fp32 AdamW holds: exp_avg + exp_avg_sq."""
     return sum(8 * p.numel() for p in model.parameters() if p.requires_grad)
+
+
+# ---------------------------------------------------------------------------
+# Muon
+# ---------------------------------------------------------------------------
+# Muon orthogonalises the momentum of 2D weight matrices with a Newton-Schulz
+# iteration, so each step moves every singular direction by a comparable amount
+# instead of letting a few dominant ones set the scale. It went into production
+# during 2025 (Kimi K2 at 1T, GLM-4.5 at 355B, INTELLECT-3 at 106B) and now ships
+# as `torch.optim.Muon` in torch >= 2.9, so there is no third-party dependency.
+#
+# Two facts shape the wrapper below.
+#
+# 1. `torch.optim.Muon` REJECTS anything that is not 2D -- "Muon only supports 2D
+#    parameters". Norm weights, biases and scale_shift_table have to go to a
+#    second optimizer. That is not a workaround, it is the documented design:
+#    "Other parameters, such as bias, and embedding, should be optimized by a
+#    standard method such as AdamW."
+# 2. `adjust_lr_fn="match_rms_adamw"` rescales the update so its RMS matches what
+#    AdamW would produce (Moonshot's 0.2*lr*sqrt(max(A,B)), from "Muon is
+#    Scalable for LLM Training"). With it, the AdamW learning rate transfers --
+#    which is why --muon-lr defaults to --lr rather than demanding a new search,
+#    the opposite of the CAME8Bit situation above.
+#
+# On v8's layout 99.3% of parameters live in 2D weights, so Muon covers nearly
+# the whole model; the aux group is ~2% and exists mostly for correctness.
+
+# Input embeddings and output heads stay on AdamW. This is the standard Muon
+# split: those matrices map between a hidden space and a *semantically fixed*
+# space (pixels, latents, the text-encoder readout, the DINO target), so their
+# singular directions are not interchangeable the way a hidden weight's are, and
+# orthogonalising them throws away scale information that matters. Everything
+# else -- attention projections, GLUMBConv, adaLN modulation -- is a hidden
+# transform and goes to Muon.
+MUON_EXCLUDE_PREFIXES: tuple[str, ...] = (
+    "x_embedder",          # latent -> hidden
+    "decoder_x_embedder",  # DDT decoder's latent -> hidden
+    "caption_embedder",    # Qwen readout -> hidden
+    "out_proj",            # hidden -> latent (the velocity head)
+    "repa_proj",           # hidden -> DINO space (auxiliary head, dropped at 50k)
+    "pos_embed",
+)
+
+
+def split_muon_parameters(
+    model: torch.nn.Module, exclude_prefixes: tuple[str, ...] = MUON_EXCLUDE_PREFIXES
+) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
+    """Partition into (Muon-eligible 2D hidden weights, everything else)."""
+    muon: list[torch.nn.Parameter] = []
+    aux: list[torch.nn.Parameter] = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if param.ndim == 2 and not name.startswith(exclude_prefixes):
+            muon.append(param)
+        else:
+            aux.append(param)
+    return muon, aux
+
+
+class MuonWithAuxAdamW(torch.optim.Optimizer):
+    """Muon on 2D hidden weights, AdamW on everything else, as one optimizer.
+
+    This MUST subclass `torch.optim.Optimizer`, not merely satisfy Lightning's
+    structural `Optimizable` protocol: `torch.optim.lr_scheduler.LambdaLR` does a hard
+    `isinstance(optimizer, Optimizer)` and raises `TypeError` otherwise, so a duck-typed
+    wrapper passes Lightning and then dies when the scheduler is attached.
+
+    The two sub-optimizers ADOPT this optimizer's own param-group dicts rather than
+    building their own: `Optimizer.add_param_group` appends the dict it is handed
+    (verified in tests), so `self.param_groups[0] is self._muon.param_groups[0]`. That
+    identity is what makes an LR scheduler work -- it mutates `group["lr"]` on our
+    groups, and the sub-optimizer that will actually read it sees the same dict. Copying
+    the groups instead would leave the scheduler adjusting a rate nobody reads.
+
+    Each group carries a `boomer_role` of "muon" or "aux" so a resume can restore the
+    two different learning rates to the right groups.
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        *,
+        lr: float,
+        aux_lr: float,
+        weight_decay: float = 0.1,
+        aux_weight_decay: float = 0.0,
+        aux_betas: tuple[float, float] = (0.9, 0.999),
+        momentum: float = 0.95,
+        nesterov: bool = True,
+        ns_steps: int = 5,
+        adjust_lr_fn: str = "match_rms_adamw",
+        exclude_prefixes: tuple[str, ...] = MUON_EXCLUDE_PREFIXES,
+    ) -> None:
+        try:
+            from torch.optim import Muon
+        except ImportError as exc:  # pragma: no cover - depends on torch version
+            raise RuntimeError(
+                "torch.optim.Muon requires torch >= 2.9; this build has "
+                f"{torch.__version__}. Upgrade torch or use --optimizer adamw."
+            ) from exc
+
+        muon_params, aux_params = split_muon_parameters(model, exclude_prefixes)
+        if not muon_params:
+            raise ValueError(
+                "no Muon-eligible parameters found (2D weights outside "
+                f"{exclude_prefixes}); refusing to run Muon over nothing"
+            )
+
+        groups: list[dict] = [
+            {"params": muon_params, "lr": lr, "boomer_role": "muon"}
+        ]
+        if aux_params:
+            groups.append({"params": aux_params, "lr": aux_lr, "boomer_role": "aux"})
+        super().__init__(groups, dict(lr=lr))
+
+        # Hand the sub-optimizers OUR group dicts (see class docstring): they append the
+        # same objects, so scheduler mutations on self.param_groups land where they are
+        # read. Each sub-optimizer setdefaults its own hyperparameters into the group.
+        self._muon = Muon(
+            [self.param_groups[0]],
+            lr=lr,
+            weight_decay=weight_decay,
+            momentum=momentum,
+            nesterov=nesterov,
+            ns_steps=ns_steps,
+            adjust_lr_fn=adjust_lr_fn,
+        )
+        # AdamW here is deliberately plain: the aux group is norms, biases and the
+        # embedding/head matrices, which is where AdamW is known-good and where Muon's
+        # own authors keep it.
+        self._aux = (
+            torch.optim.AdamW(
+                [self.param_groups[1]],
+                lr=aux_lr,
+                betas=aux_betas,
+                weight_decay=aux_weight_decay,
+            )
+            if aux_params
+            else None
+        )
+
+        self.defaults = dict(
+            lr=lr, aux_lr=aux_lr, weight_decay=weight_decay, momentum=momentum,
+            ns_steps=ns_steps, adjust_lr_fn=adjust_lr_fn,
+        )
+        self.muon_params = sum(p.numel() for p in muon_params)
+        self.aux_params = sum(p.numel() for p in aux_params)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = closure() if closure is not None else None
+        self._muon.step()
+        if self._aux is not None:
+            self._aux.step()
+        return loss
+
+    def state_dict(self) -> dict:
+        return {
+            "muon": self._muon.state_dict(),
+            "aux": self._aux.state_dict() if self._aux is not None else None,
+        }
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        self._muon.load_state_dict(state_dict["muon"])
+        if self._aux is not None and state_dict.get("aux") is not None:
+            self._aux.load_state_dict(state_dict["aux"])
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics
+        return (
+            f"MuonWithAuxAdamW(muon={self.muon_params / 1e6:.1f}M params, "
+            f"aux={self.aux_params / 1e6:.1f}M params)"
+        )
+
+
+def muon_state_bytes(model: torch.nn.Module,
+                     exclude_prefixes: tuple[str, ...] = MUON_EXCLUDE_PREFIXES) -> int:
+    """Persistent optimizer state for the Muon/AdamW split.
+
+    Muon keeps ONE momentum buffer per 2D weight (4 bytes/param) against AdamW's two
+    (8), so the hybrid roughly halves optimizer state on top of whatever it does for
+    quality. Compare with `adamw_state_bytes` / `came_state_bytes`.
+    """
+    muon_params, aux_params = split_muon_parameters(model, exclude_prefixes)
+    return 4 * sum(p.numel() for p in muon_params) + 8 * sum(p.numel() for p in aux_params)
