@@ -78,13 +78,33 @@ def clone_case(query, residuals, rms_w):
     return q, rs, rms_w.clone()
 
 
+def check_single_source_is_bypassed() -> None:
+    """L=1 is excluded from the sweep below; verify the bypass that makes that valid.
+
+    With one source the depth softmax is identically 1.0, so the output carries no
+    dependence on the query and the reference dq is analytically ZERO. FLA's
+    assert_close scores relative error (err_rms / (ref_rms + 1e-8)), so any float noise
+    in the kernel's dq reduction — ~6e-5 absolute, negligible against real gradients —
+    divides by ~0 and reports a ratio in the thousands. That says nothing about the
+    kernel, and Boomer never asks it: BlockAttnRes returns the lone source directly.
+    """
+    from boomer.models.boomer_fla_dit import BlockAttnRes
+
+    mod = BlockAttnRes(D, slot_counts=[1]).to(DEVICE)
+    src = torch.randn(2, 8, D, device=DEVICE, dtype=DTYPE)
+    out = mod(0, [src])
+    assert out is src, "L=1 bypass is gone — restore it or re-include L=1 in the sweep"
+    print("L=1 bypass verified (single-source sites never reach the kernel)")
+
+
 def run_parity(param_dtype=DTYPE, label: str = "uniform bf16") -> None:
     torch.manual_seed(0)
     for batch, tokens in SHAPES:
         # with_onorm covers the final z site, which fuses its learned output RMSNorm
         # into the kernel via output_rms_weight; per-block sites pass None.
         for with_onorm in (False, True):
-            for n in range(1, MAX_SOURCES + 1):
+            # from 2: see check_single_source_is_bypassed
+            for n in range(2, MAX_SOURCES + 1):
                 q0, r0, w0 = make_case(n, batch, tokens, param_dtype=param_dtype)
                 q1, r1, w1 = clone_case(q0, r0, w0)
                 ow0 = ow1 = None
@@ -122,7 +142,7 @@ def run_parity(param_dtype=DTYPE, label: str = "uniform bf16") -> None:
                 for i, (a, b) in enumerate(zip(r0, r1)):
                     assert_close(f"dv{i}[{tag}]", a.grad, b.grad, RATIO)
                     assert b.grad.dtype == DTYPE, f"{tag}: dv{i} is {b.grad.dtype}"
-        print(f"parity OK [{label}]: B={batch} T={tokens} D={D}, L=1..{MAX_SOURCES} "
+        print(f"parity OK [{label}]: B={batch} T={tokens} D={D}, L=2..{MAX_SOURCES} "
               f"fwd+bwd, with and without fused output RMSNorm")
 
 
@@ -189,6 +209,7 @@ if __name__ == "__main__":
     if not torch.cuda.is_available():
         raise SystemExit("needs the training GPU; run in Colab, not locally")
     print(f"device: {torch.cuda.get_device_name()}; torch {torch.__version__}")
+    check_single_source_is_bypassed()
     run_parity()  # uniform bf16: the kernel's own numerics
     # bf16-mixed, i.e. what training actually runs: fp32 params/buffers, bf16 sources.
     run_parity(param_dtype=torch.float32, label="mixed fp32-param/bf16-act")
