@@ -923,9 +923,9 @@ class FullImageSelfAttention(nn.Module):
         if use_flash and out.dtype != x.dtype:
             out = out.to(dtype=x.dtype)
         if not use_flash:
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
+            q = _sdpa_ready(q.transpose(1, 2))
+            k = _sdpa_ready(k.transpose(1, 2))
+            v = _sdpa_ready(v.transpose(1, 2))
             out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
             out = out.transpose(1, 2)
 
@@ -1402,6 +1402,19 @@ class BoomerFLABlock(nn.Module):
         return x
 
 
+def _sdpa_ready(t: torch.Tensor) -> torch.Tensor:
+    """Guarantee a contiguous last dimension for SDPA / flash kernels.
+
+    Eager produces head-dim-contiguous q/k/v naturally, but Inductor is free to pick a
+    different layout for the fused q_norm/RoPE producer and can hand SDPA a tensor with
+    stride(-1) != 1 -- flash then fails with "Input tensor must have contiguous last
+    dimension". Asking for contiguity is a layout CONSTRAINT, not necessarily a copy:
+    Inductor usually satisfies it by planning the producer's layout, and in eager the
+    check is already true so this is a no-op.
+    """
+    return t if t.stride(-1) == 1 else t.contiguous()
+
+
 _FLASH4_VARLEN = None
 _FLASH4_CHECKED = False
 
@@ -1445,6 +1458,7 @@ def _flash4_varlen_joint(
     # the compiled FA4 extension, non-CUDA, fp32) must be visible in the log, not
     # inferred from the absence of a line.
     _JOINT_SDPA_BACKEND = "flash4-varlen"
+    q, k, v = _sdpa_ready(q), _sdpa_ready(k), _sdpa_ready(v)
     seqused = (num_image + text_valid.sum(dim=1)).to(torch.int32)
     seqlen = q.shape[1]
     out = fn(
@@ -1608,9 +1622,9 @@ class JointTextImageAttentionMixin:
             # under --compile — for a case variable-length captions rarely hit. The
             # flash4 varlen path above is the real answer to the mask.
             out = joint_sdpa(
-                q.transpose(1, 2),
-                k.transpose(1, 2),
-                v.transpose(1, 2),
+                _sdpa_ready(q.transpose(1, 2)),
+                _sdpa_ready(k.transpose(1, 2)),
+                _sdpa_ready(v.transpose(1, 2)),
                 attend_mask[:, None, None, :],
             ).transpose(1, 2)
         out = out.reshape(image_tokens.shape[0], num_image + num_text, -1)
