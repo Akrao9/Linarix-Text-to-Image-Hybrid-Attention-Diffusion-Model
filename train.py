@@ -673,19 +673,19 @@ class BoomerLit(pl.LightningModule):
             # sanity signal that the mask distribution is what --fill-mask-probs asked for.
             self.log("train/fill_coverage", fill_mask.float().mean(),
                      on_step=True, on_epoch=False, batch_size=bs)
-        # v8 Block AttnRes telemetry: mean depth-attention weight per (site, slot). Slot 0
-        # is the token embedding, the last slot is the current stream ("latest"). Mass
-        # staying ~1 on the last slot = AttnRes has degenerated to its identity init; mass
-        # spreading to earlier slots = it is earning its parameters. last_weights refreshes
-        # on EAGER forwards only (torch.compile skips the attribute mutation); under
-        # --compile fall back to softmax(slot_bias) — exact at init (queries start at
-        # zero) and the token-independent part of the depth attention thereafter, so the
-        # attribution channel survives compiled runs.
+        # v8 Block AttnRes telemetry: mean depth-attention weight per (site, slot). Sites
+        # 0..encoder_depth-1 are per-block retrievals; the last site is the final z
+        # aggregation. Slot 0 is the token embedding, middle slots are completed group
+        # delta sums (shallow -> deep), the last slot is the current partial sum. Init is
+        # the paper's uniform 1/N; weights staying pinned there = AttnRes is not
+        # differentiating sources; structured drift = it is earning its parameters.
+        # BlockAttnRes.forward is compiler-disabled (FLA's dispatch already graph-breaks
+        # there), so last_weights refreshes every step even under --compile.
         attnres = getattr(self.model, "block_attnres", None)
         if attnres is not None:
             for site, w in enumerate(attnres.last_weights):
                 if w is None:
-                    w = attnres.slot_biases[site].detach().float().softmax(0)
+                    continue
                 for slot in range(w.numel()):
                     self.log(f"attnres/site{site}_slot{slot}", w[slot],
                              on_step=True, on_epoch=False, batch_size=bs)
@@ -2240,7 +2240,6 @@ def build_config(args: argparse.Namespace, record: Any) -> BoomerFLADiTConfig:
         attnres_group_ends=(
             (parse_int_tuple(args.attnres_group_ends) or ()) if args.block_attnres else ()
         ),
-        attnres_latest_bias=args.attnres_latest_bias,
     )
 
 
@@ -2527,18 +2526,18 @@ def build_parser() -> argparse.ArgumentParser:
                    help="v8 substitutive refresh: refresh blocks drop the GDN2/FLA mixer — joint "
                         "attention replaces it instead of supplementing it (GLUMBConv stays).")
     p.add_argument("--block-attnres", action=bo, default=False,
-                   help="v8: Kimi Block AttnRes (arXiv 2603.15031) over encoder residual groups. "
-                        "Snapshots the image stream after each --attnres-group-ends block; the "
-                        "next group starts from a learned per-token softmax mixture over "
-                        "[token embedding, snapshots]. Latest-biased function-preserving init.")
-    p.add_argument("--attnres-group-ends", default="3,7,11,15",
-                   help="csv of encoder block indices closing each AttnRes group (the last group "
-                        "needs no boundary). v8 layout: 3,7,11,15 -> groups 0-3/4-7/8-11/12-15/16-21.")
-    p.add_argument("--attnres-latest-bias", type=float, default=4.0,
-                   help="initial depth-attention logit bias on the newest slot. 4.0 puts ~92%% of "
-                        "the softmax mass on the current stream at init (approximately the "
-                        "ordinary residual pathway) while keeping usable gradients; the paper's "
-                        "uniform-average init is 0.")
+                   help="v8: Kimi Block AttnRes (arXiv 2603.15031), paper algorithm. EVERY encoder "
+                        "block's input is a learned per-token softmax mixture over [token "
+                        "embedding, completed per-group delta sums, current partial sum] (one "
+                        "pseudo-query per block); block deltas accumulate into the partial, which "
+                        "folds at each --attnres-group-ends index; a dedicated final operator "
+                        "aggregates the bank into z.")
+    p.add_argument("--attnres-group-ends", default="2,5,8,11,14,17,19,21",
+                   help="csv of encoder block indices closing each AttnRes delta group. Default "
+                        "gives the paper-backed ~8 groups over 22 encoder blocks "
+                        "(3,3,3,3,3,3,2,2); a trailing end at the last block is allowed and "
+                        "coincides with the post-loop fold. Routing runs on FLA's fused_attnres "
+                        "Triton kernel (FLA_ATTNRES_GLUON=1 opts into the Gluon backend).")
     p.add_argument("--ddt-decoder-depth", type=int, default=0,
                    help="v7: DDT split (arXiv 2504.05741) — the last N of --depth blocks become a "
                         "velocity decoder (full softmax attention + GLUMBConv, conditioned "

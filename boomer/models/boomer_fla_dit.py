@@ -128,16 +128,20 @@ class BoomerFLADiTConfig:
     # The 9-way modulation layout is kept (msa rows simply unused), preserving shared-adaLN
     # compatibility with BoomerFLABlock. False = v6/v7 additive form (mixer + attention).
     refresh_no_mixer: bool = False
-    # v8: Kimi Block AttnRes (arXiv 2603.15031) across encoder residual groups. The image
-    # stream is snapshotted after each block index in attnres_group_ends; the next group
-    # starts from a learned per-token softmax mixture over [token embedding, snapshots].
-    # Init is function-preserving-biased: pseudo-queries start at zero and a per-slot bias
-    # puts ~e^latest_bias of the softmax mass on the newest state, so training starts from
-    # (approximately) the ordinary residual pathway rather than the paper's uniform average.
-    # Encoder-only; text tokens are never stored in the bank; the decoder is untouched.
+    # v8: Kimi Block AttnRes (arXiv 2603.15031) across the encoder, paper algorithm.
+    # The bank stores the token embedding plus per-group sums of block CONTRIBUTIONS
+    # (deltas), not cumulative stream snapshots. EVERY encoder block's input is a learned
+    # per-token softmax mixture over [embedding, completed groups, current partial sum]
+    # (one pseudo-query per block), the block's delta accumulates into the partial sum,
+    # and the partial folds into the bank after each attnres_group_ends index. A final
+    # dedicated operator aggregates the bank into z (the paper's learned final
+    # aggregation). Zero pseudo-queries and unit key-norm weights make init the paper's
+    # uniform average. Routing runs on FLA's fused_attnres Triton kernel on CUDA
+    # (pointer-table sources — no torch.stack; fp32 logits/softmax; checkpoint_level=1
+    # recomputes the mix in backward), with a naive-reference fallback elsewhere.
+    # Encoder-only; text tokens never enter the bank; the decoder is untouched.
     block_attnres: bool = False
     attnres_group_ends: tuple[int, ...] = ()
-    attnres_latest_bias: float = 4.0
 
 
 def maybe_add_sibling_fla_repo() -> None:
@@ -1704,62 +1708,103 @@ class BoomerFLADDTDecoderBlock(nn.Module):
 
 
 class BlockAttnRes(nn.Module):
-    """Kimi Block AttnRes (arXiv 2603.15031) over encoder residual-group snapshots.
+    """Kimi Block AttnRes (arXiv 2603.15031), paper algorithm over encoder blocks.
 
-    Follows the official pseudocode: per retrieval site, stack the stored states
-    [N, B, T, D], RMS-normalize the KEYS only (values stay raw), score each state with
-    a single learned pseudo-query vector, softmax over depth PER TOKEN, and return the
-    weighted mixture. Departures from the paper, both deliberate (v8 plan):
+    Per retrieval site: RMS-normalize the KEYS only (values stay raw), score each
+    source with a single learned pseudo-query vector, softmax over depth PER TOKEN in
+    fp32, and return the weighted mixture. Sources are [token embedding, completed
+    per-group delta sums, current partial sum] — the paper's decomposition, NOT
+    cumulative stream snapshots. One site per encoder block (retrieval before every
+    residual-producing layer; with parallel blocks each Boomer block is exactly one
+    residual add, matching the reference's per-sublayer granularity) plus one final
+    site whose output is the encoder state z (the paper's learned final aggregation).
 
-    * Retrieval runs once per residual GROUP boundary (4 sites for the 22-block
-      encoder), not before every sublayer — the states are cumulative stream
-      snapshots, so a mixture concentrated on the newest slot IS the ordinary
-      residual pathway.
-    * Init is latest-biased instead of uniform: pseudo-queries start at zero and a
-      per-slot logit bias puts most of the softmax mass on the newest state, so the
-      model starts (approximately) function-preserving rather than averaging the
-      stream down by 1/N. Softmax and scoring run in fp32.
+    Zero-init pseudo-queries give the paper's uniform-average start. The per-site key
+    RMSNorm weight is LEARNABLE, ones-init (FLA's own AttnRes integration convention;
+    unit weights == the paper's parameter-free norm at init, and the kernel computes
+    its gradient anyway).
 
-    Site k mixes k + 2 slots: [token embedding b0, snapshot 1, ..., snapshot k+1],
-    where the last slot is the stream that just crossed the boundary.
+    Routing executes on FLA's ``fused_attnres`` Triton kernel when the sources live on
+    CUDA and FLA imports: sources pass through a pointer table (no torch.stack), all
+    routing math is fp32, and ``checkpoint_level=1`` recomputes the mix in backward
+    instead of retaining it. Elsewhere (CPU tests, missing triton) an inline replica of
+    FLA's ``naive_attnres`` reference runs — same fp32-end-to-end math the kernel's
+    parity suite verifies against. Single-source sites bypass routing entirely
+    (softmax over one source is identity), mirroring FLA's L=1 bypass.
+
+    ``forward`` is ``torch.compiler.disable``d: FLA's dispatch wrapper already forces a
+    graph break at every call, so keeping the whole operator (validation, telemetry)
+    eager costs nothing extra and guarantees ``last_weights`` refreshes under
+    ``--compile``.
     """
 
-    def __init__(self, hidden_dim: int, num_sites: int, latest_bias: float) -> None:
+    def __init__(self, hidden_dim: int, slot_counts: list[int], eps: float = 1e-6) -> None:
         super().__init__()
-        if num_sites < 1:
-            raise ValueError(f"BlockAttnRes needs at least one site, got {num_sites}")
+        if not slot_counts or any(n < 1 for n in slot_counts):
+            raise ValueError(f"slot_counts must be non-empty positive ints, got {slot_counts}")
+        self.eps = eps
+        self.slot_counts = tuple(slot_counts)
         self.queries = nn.ParameterList(
-            nn.Parameter(torch.zeros(hidden_dim)) for _ in range(num_sites)
+            nn.Parameter(torch.zeros(hidden_dim)) for _ in slot_counts
         )
-        biases = []
-        for site in range(num_sites):
-            bias = torch.zeros(site + 2)
-            bias[-1] = latest_bias
-            biases.append(nn.Parameter(bias))
-        self.slot_biases = nn.ParameterList(biases)
-        # Telemetry: mean depth-attention weights per site, refreshed on eager forwards
-        # (skipped inside torch.compile graphs — attribute mutation would specialize).
-        # Plain attribute, deliberately outside state_dict.
-        self.last_weights: list[torch.Tensor | None] = [None] * num_sites
+        self.key_norm_weights = nn.ParameterList(
+            nn.Parameter(torch.ones(hidden_dim)) for _ in slot_counts
+        )
+        # Telemetry: mean depth-attention weights per site. Plain attribute,
+        # deliberately outside state_dict.
+        self.last_weights: list[torch.Tensor | None] = [None] * len(slot_counts)
+        self._fused = None
+        self._fused_checked = False
 
-    def forward(self, site: int, states: list[torch.Tensor]) -> torch.Tensor:
-        expected = site + 2
-        if len(states) != expected:
-            raise ValueError(f"site {site} expects {expected} states, got {len(states)}")
-        values = torch.stack(states)  # [N, B, T, D]
-        # Keys only are normalized (official recipe); fp32 before squaring, same
-        # convention as AttentionRMSNorm.
-        v32 = values.float()
-        keys = v32 * torch.rsqrt(v32.square().mean(dim=-1, keepdim=True) + 1e-6)
-        logits = torch.einsum("d,nbtd->nbt", self.queries[site].float(), keys)
-        logits = logits + self.slot_biases[site].float().view(-1, 1, 1)
-        weights = logits.softmax(dim=0)  # fp32 softmax over depth, per token
-        mixed = torch.einsum("nbt,nbtd->btd", weights, v32).to(values.dtype)
-        if not torch.compiler.is_compiling():
-            # Stays on-device: a .cpu() here would sync the stream every step. Loggers
-            # that want host values pay that cost at their own cadence.
-            self.last_weights[site] = weights.detach().mean(dim=(1, 2))
-        return mixed
+    def _fused_op(self):
+        if not self._fused_checked:
+            self._fused_checked = True
+            try:
+                from fla.ops.attnres import fused_attnres
+
+                self._fused = fused_attnres
+            except Exception:
+                self._fused = None
+        return self._fused
+
+    def _naive(self, site: int, sources: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Inline replica of fla.ops.attnres.naive_attnres (no output norm): fp32
+        end-to-end, weighted key RMSNorm, one downcast at the end."""
+        dim = sources[0].shape[-1]
+        v = torch.stack(sources).float()
+        k = F.rms_norm(v, (dim,), self.key_norm_weights[site].float(), self.eps)
+        p = torch.einsum("nbtd,d->nbt", k, self.queries[site].float()).softmax(dim=0)
+        out = torch.einsum("nbt,nbtd->btd", p, v).to(sources[0].dtype)
+        return out, p
+
+    @torch.compiler.disable
+    def forward(self, site: int, sources: list[torch.Tensor]) -> torch.Tensor:
+        expected = self.slot_counts[site]
+        if len(sources) != expected:
+            raise ValueError(f"site {site} expects {expected} sources, got {len(sources)}")
+        if len(sources) == 1:
+            # Softmax over one source is exactly identity; skip the kernel launch
+            # (FLA's model integration bypasses L=1 the same way).
+            self.last_weights[site] = sources[0].new_ones(1, dtype=torch.float32)
+            return sources[0]
+        fused = self._fused_op() if sources[0].is_cuda else None
+        if fused is not None:
+            out, p = fused(
+                query=self.queries[site],
+                residuals=sources,
+                rms_weight=self.key_norm_weights[site],
+                output_rms_weight=None,  # the following norm is adaLN-modulated; can't fuse
+                rms_eps=self.eps,
+                scale=1.0,
+                return_weights=True,
+                checkpoint_level=1,
+            )
+        else:
+            out, p = self._naive(site, sources)
+        # Stays on-device: a .cpu() here would sync the stream every step. Loggers
+        # that want host values pay that cost at their own cadence.
+        self.last_weights[site] = p.detach().mean(dim=(1, 2))
+        return out
 
 
 class BoomerFLADiT(nn.Module):
@@ -1902,27 +1947,38 @@ class BoomerFLADiT(nn.Module):
         # self.blocks is the condition encoder (== the whole model when DDT is off).
         self.blocks = nn.ModuleList([make_block(i) for i in range(encoder_depth)])
         self.encoder_depth = encoder_depth
-        # v8 Block AttnRes: one retrieval site per group boundary. Snapshot the image
-        # stream after each attnres_group_ends block; the next block starts from the
-        # site's softmax mixture over [token embedding, snapshots so far]. Optional
-        # module (no state-dict keys when off), same convention as decoder_blocks.
+        # v8 Block AttnRes, paper algorithm: one retrieval site per encoder block plus a
+        # final site producing z. The partial delta sum folds into the bank after each
+        # attnres_group_ends index (a trailing end == encoder_depth-1 is allowed and
+        # coincides with the post-loop fold). Optional module (no state-dict keys when
+        # off), same convention as decoder_blocks.
         self.block_attnres: BlockAttnRes | None = None
-        self._attnres_group_ends: tuple[int, ...] = ()
+        self._attnres_fold_ends: frozenset[int] = frozenset()
         if config.block_attnres:
             ends = tuple(config.attnres_group_ends)
             if not ends:
                 raise ValueError("block_attnres=True needs non-empty attnres_group_ends")
             if list(ends) != sorted(set(ends)):
                 raise ValueError(f"attnres_group_ends must be strictly increasing, got {ends}")
-            if ends[0] < 0 or ends[-1] >= encoder_depth - 1:
+            if ends[0] < 0 or ends[-1] > encoder_depth - 1:
                 raise ValueError(
-                    f"attnres_group_ends {ends} must lie in [0, {encoder_depth - 1}) — each "
-                    "boundary needs at least one encoder block after it to feed"
+                    f"attnres_group_ends {ends} must lie in [0, {encoder_depth - 1}]"
                 )
-            self._attnres_group_ends = ends
-            self.block_attnres = BlockAttnRes(
-                hidden_dim, num_sites=len(ends), latest_bias=config.attnres_latest_bias
-            )
+            # The last group needs no explicit boundary; a fold at the final block would
+            # duplicate the post-loop fold, so it is dropped from the in-loop set.
+            self._attnres_fold_ends = frozenset(e for e in ends if e < encoder_depth - 1)
+            # Source count per site: [embedding] + completed groups (+ partial once the
+            # current group has accumulated at least one block delta).
+            slot_counts = []
+            completed, has_partial = 1, False
+            for layer in range(encoder_depth):
+                slot_counts.append(completed + (1 if has_partial else 0))
+                has_partial = True
+                if layer in self._attnres_fold_ends:
+                    completed += 1
+                    has_partial = False
+            slot_counts.append(completed + (1 if has_partial else 0))  # final z site
+            self.block_attnres = BlockAttnRes(hidden_dim, slot_counts=slot_counts)
         # v7 DDT velocity decoder: empty ModuleList (no state-dict keys) when off, so a
         # ddt_decoder_depth=0 model is key-for-key identical to pre-v7 checkpoints.
         self.decoder_blocks = nn.ModuleList(
@@ -2303,11 +2359,20 @@ class BoomerFLADiT(nn.Module):
         want_dispersive = return_dispersive
         repa_feat: torch.Tensor | None = None
         dispersive_feat: torch.Tensor | None = None
-        # v8 Block AttnRes: the bank opens with the token embedding (paper: "blocks
-        # already include token embedding"). Image stream only — text is never stored.
-        attnres_bank: list[torch.Tensor] = [x] if self.block_attnres is not None else []
-        attnres_site = 0
+        # v8 Block AttnRes (paper algorithm): the bank opens with the token embedding
+        # ("blocks already include token embedding") and stores per-group DELTA sums.
+        # Image stream only — text never enters the bank. Every block's input is the
+        # site's mixture; the block's contribution (output - input) accumulates into
+        # the partial sum, which folds into the bank at each group end.
+        attnres_completed: list[torch.Tensor] = [x] if self.block_attnres is not None else []
+        attnres_partial: torch.Tensor | None = None
         for layer_idx, block in enumerate(self.blocks):
+            if self.block_attnres is not None:
+                sources = attnres_completed + (
+                    [attnres_partial] if attnres_partial is not None else []
+                )
+                x = self.block_attnres(layer_idx, sources)
+                attnres_block_in = x
             if getattr(block, "joint_refresh", False):
                 # Joint refresh block: returns (x, text_tokens); needs both the mixer
                 # permutation (GDN2 spine) and the joint-attention coord/text inputs.
@@ -2384,6 +2449,19 @@ class BoomerFLADiT(nn.Module):
                         t_mod=t_mod, image_attn_t_mod=image_attn_t_mod,
                         mixer_perm=mixer_perm, mixer_perm_inv=mixer_perm_inv,
                     )
+            if self.block_attnres is not None:
+                # The block adds its contributions onto its input internally, so the
+                # delta is recovered by subtraction — identical to the reference, where
+                # the sublayer returns the bare contribution. Fold BEFORE the delta at a
+                # group end would misfile this block's delta; the reference folds before
+                # accumulating only because its boundary test looks at the NEXT index.
+                delta = x - attnres_block_in
+                attnres_partial = (
+                    delta if attnres_partial is None else attnres_partial + delta
+                )
+                if layer_idx in self._attnres_fold_ends:
+                    attnres_completed.append(attnres_partial)
+                    attnres_partial = None
             if want_repa and layer_idx == self.repa_layer:
                 # Pool image tokens -> project to the SSL space for alignment.
                 repa_feat = self.repa_proj(x.mean(dim=1))
@@ -2391,15 +2469,12 @@ class BoomerFLADiT(nn.Module):
                 # Pool image tokens -> per-sample feature; dispersion is computed in the
                 # loss. No projector: the regularizer acts on the raw hidden state.
                 dispersive_feat = x.mean(dim=1)
-            # Group boundary: snapshot the stream (it becomes the site's "latest" slot,
-            # where the latest-biased init concentrates the softmax), then hand the next
-            # group the retrieved mixture. Runs AFTER the REPA/dispersive captures so
-            # those keep seeing the plain block output. Outside the checkpointed block
-            # calls on purpose: the bank entries are outer-loop tensors either way.
-            if self.block_attnres is not None and layer_idx in self._attnres_group_ends:
-                attnres_bank.append(x)
-                x = self.block_attnres(attnres_site, attnres_bank)
-                attnres_site += 1
+        if self.block_attnres is not None:
+            # Paper: learned final aggregation over the full bank produces z. (The
+            # executable reference sums here; the paper calls for the operator.)
+            if attnres_partial is not None:
+                attnres_completed.append(attnres_partial)
+            x = self.block_attnres(self.encoder_depth, attnres_completed)
         if self.decoder_x_embedder is not None:
             # v7 DDT: the encoder output z is the semantic state carrier. _ddt_decode
             # re-embeds the noisy latent and runs the 6 decoder blocks under s=silu(t+z).
