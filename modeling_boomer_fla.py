@@ -1879,10 +1879,10 @@ class BlockAttnRes(nn.Module):
     residual add, matching the reference's per-sublayer granularity) plus one final
     site whose output is the encoder state z (the paper's learned final aggregation).
 
-    Zero-init pseudo-queries give the paper's uniform-average start. The per-site key
-    RMSNorm weight is LEARNABLE, ones-init (FLA's own AttnRes integration convention;
-    unit weights == the paper's parameter-free norm at init, and the kernel computes
-    its gradient anyway).
+    Zero-init pseudo-queries give the paper's uniform-average start. The key RMSNorm is
+    PARAMETER-FREE, exactly as in the paper (the official implementation's
+    RMSNormNoWeight): the kernel's ``rms_weight`` receives a fixed ones buffer shared
+    by every site — non-persistent, never trained, never serialized.
 
     Sites listed in ``output_norm_sites`` apply a learned output RMSNorm to the mixed
     result (fused into the kernel via ``output_rms_weight``, FLA's own integration
@@ -1891,18 +1891,23 @@ class BlockAttnRes(nn.Module):
     dominate ``s = silu(z + t)``; the norm restores unit RMS. Per-block sites skip it —
     their following norm is adaLN-modulated and cannot be fused.
 
-    Routing executes on FLA's ``fused_attnres`` Triton kernel when the sources live on
-    CUDA and FLA imports: sources pass through a pointer table (no torch.stack), all
-    routing math is fp32, and ``checkpoint_level=1`` recomputes the mix in backward
-    instead of retaining it. Elsewhere (CPU tests, missing triton) an inline replica of
-    FLA's ``naive_attnres`` reference runs — same fp32-end-to-end math the kernel's
-    parity suite verifies against. Single-source sites bypass routing entirely
-    (softmax over one source is identity), mirroring FLA's L=1 bypass.
+    Routing executes on FLA's ``fused_attnres`` Triton kernel on CUDA: sources pass
+    through a pointer table (no torch.stack), all routing math is fp32, and
+    ``checkpoint_level=1`` recomputes the mix in backward instead of retaining it.
+    CUDA WITHOUT the kernel is a hard error — the naive path's torch.stack().float()
+    would silently burn >1 GiB of transients at the nine-source production shape, so
+    it is reserved for CPU (tests / missing triton is not a CUDA-tolerable state).
+    The naive path is an inline replica of FLA's ``naive_attnres`` reference — same
+    fp32-end-to-end math the kernel's parity suite verifies against. Single-source
+    sites bypass routing entirely (softmax over one source is identity), mirroring
+    FLA's L=1 bypass.
 
-    ``forward`` is ``torch.compiler.disable``d: FLA's dispatch wrapper already forces a
-    graph break at every call, so keeping the whole operator (validation, telemetry)
-    eager costs nothing extra and guarantees ``last_weights`` refreshes under
-    ``--compile``.
+    ``forward`` is ``torch.compiler.disable``d: FLA's dispatch wrapper is itself
+    compiler-disabled, so the kernel call can never inline into a compiled graph;
+    disabling the whole operator keeps validation and telemetry out of the traced
+    region and guarantees ``last_weights`` refreshes under ``--compile``. This DOES
+    fragment the encoder into ~one graph per AttnRes site (~23 boundaries at v8
+    depth) — benchmark a compiled 200-step run against eager before a long run.
     """
 
     def __init__(
@@ -1924,9 +1929,10 @@ class BlockAttnRes(nn.Module):
         self.queries = nn.ParameterList(
             nn.Parameter(torch.zeros(hidden_dim)) for _ in slot_counts
         )
-        self.key_norm_weights = nn.ParameterList(
-            nn.Parameter(torch.ones(hidden_dim)) for _ in slot_counts
-        )
+        # Paper's parameter-free key RMSNorm (RMSNormNoWeight): the kernel API wants a
+        # weight tensor, so hand it a fixed ones buffer — shared across sites, never
+        # trained, non-persistent (no state_dict key).
+        self.register_buffer("key_norm_weight", torch.ones(hidden_dim), persistent=False)
         # Learned output RMSNorm weights, keyed by site index (ParameterDict keys are
         # strings). Ones-init: exact RMSNorm at load, drift is learnable.
         self.out_norm_weights = nn.ParameterDict(
@@ -1955,11 +1961,11 @@ class BlockAttnRes(nn.Module):
     def _naive(
         self, site: int, sources: list[torch.Tensor], out_norm: torch.Tensor | None
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Inline replica of fla.ops.attnres.naive_attnres: fp32 end-to-end, weighted
-        key RMSNorm, optional output RMSNorm, one downcast at the end."""
+        """Inline replica of fla.ops.attnres.naive_attnres: fp32 end-to-end,
+        parameter-free key RMSNorm, optional output RMSNorm, one downcast at the end."""
         dim = sources[0].shape[-1]
         v = torch.stack(sources).float()
-        k = F.rms_norm(v, (dim,), self.key_norm_weights[site].float(), self.eps)
+        k = F.rms_norm(v, (dim,), self.key_norm_weight.float(), self.eps)
         p = torch.einsum("nbtd,d->nbt", k, self.queries[site].float()).softmax(dim=0)
         out = torch.einsum("nbt,nbtd->btd", p, v)
         if out_norm is not None:
@@ -1982,12 +1988,21 @@ class BlockAttnRes(nn.Module):
                 return src
             dim = src.shape[-1]
             return F.rms_norm(src.float(), (dim,), out_norm.float(), self.eps).to(src.dtype)
-        fused = self._fused_op() if sources[0].is_cuda else None
-        if fused is not None:
+        if sources[0].is_cuda:
+            fused = self._fused_op()
+            if fused is None:
+                # Fail fast: the naive path's torch.stack().float() costs >1 GiB of
+                # transients at the nine-source production shape and would silently
+                # tank throughput/OOM. CPU tests still take the naive branch below.
+                raise RuntimeError(
+                    "Block AttnRes needs fla.ops.attnres.fused_attnres on CUDA, but the "
+                    "installed flash-linear-attention does not provide it. Pin FLA to a "
+                    "current origin/main commit (the naive fallback is CPU-only)."
+                )
             res = fused(
                 query=self.queries[site],
                 residuals=sources,
-                rms_weight=self.key_norm_weights[site],
+                rms_weight=self.key_norm_weight,
                 # Per-block sites: the following norm is adaLN-modulated; can't fuse.
                 # The final z site fuses its dedicated learned RMSNorm here instead.
                 output_rms_weight=out_norm,

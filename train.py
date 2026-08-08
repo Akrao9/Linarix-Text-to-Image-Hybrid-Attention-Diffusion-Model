@@ -225,6 +225,9 @@ class BoomerLit(pl.LightningModule):
         # times per global_step, so a bare `global_step % every == 0` test fires N
         # times: the first flush drains the window and the rest log a near-empty one.
         self._sigma_bucket_flushed_at = -1
+        # Same accumulation trap for AttnRes telemetry: without this guard, a logging
+        # step would collect weights and submit all 116 scalars once per microbatch.
+        self._attnres_collected_at = -1
         if hp.get("compile"):
             self.model = torch.compile(self.model, mode=hp.get("compile_mode", "default"))
 
@@ -627,11 +630,16 @@ class BoomerLit(pl.LightningModule):
         # v8 Block AttnRes telemetry is opt-in per step: return_weights=True plus 23
         # per-site reductions every microbatch (and up to 116 self.log calls x accum)
         # is pure overhead off the logging cadence, so collect only when this step's
-        # scalars will actually be written.
+        # scalars will actually be written — and only on the FIRST microbatch of the
+        # accumulation window (global_step is constant across all of them; same trap
+        # as _sigma_bucket_flushed_at).
         attnres = getattr(self.model, "block_attnres", None)
         if attnres is not None:
             log_every = max(int(getattr(self.trainer, "log_every_n_steps", 50) or 1), 1)
-            attnres.collect_weights = self.global_step % log_every == 0
+            attnres.collect_weights = (
+                self.global_step % log_every == 0
+                and self.global_step != self._attnres_collected_at
+            )
         out = self.model(
             x_t, t, text, mask,
             cond_input=cond_input,
@@ -691,6 +699,7 @@ class BoomerLit(pl.LightningModule):
         # BlockAttnRes.forward is compiler-disabled (FLA's dispatch already graph-breaks
         # there), so last_weights refreshes on those steps even under --compile.
         if attnres is not None and attnres.collect_weights:
+            self._attnres_collected_at = self.global_step
             for site, w in enumerate(attnres.last_weights):
                 if w is None:
                     continue
