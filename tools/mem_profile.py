@@ -177,6 +177,25 @@ def main() -> None:
                                   "refresh_layers": None,
                                   "image_attention_every": 4}), args.batch)
 
+    # Where do the baseline activations actually go? Each row disables ONE component
+    # of v8 full; a large drop names the term. These configs are diagnostic only —
+    # they change the architecture and are not trainable substitutes.
+    print("\n--- baseline attribution (each row cripples one component) ---")
+    measure("v8 + gradient checkpointing",
+            BoomerFLADiTConfig(**{**full, "gradient_checkpointing": True}), args.batch)
+    measure("v8, cross-attn every 4 (not every block)",
+            BoomerFLADiTConfig(**{**full, "cross_attention_every": 4}), args.batch)
+    measure("v8, mlp_ratio 1.0 (GLUMBConv width)",
+            BoomerFLADiTConfig(**{**full, "mlp_ratio": 1.0}), args.batch)
+    measure("v8, no dual-stream prefix",
+            BoomerFLADiTConfig(**{**full, "dual_stream_depth": 0}), args.batch)
+    measure("v8, torch attention instead of GDN2",
+            BoomerFLADiTConfig(**{**full, "mixer_type": "torch"}), args.batch)
+    measure("v8, GDN2 unidirectional",
+            BoomerFLADiTConfig(**{**full, "fla_bidirectional": False}), args.batch)
+    measure("v8, no short conv",
+            BoomerFLADiTConfig(**{**full, "use_short_conv": False}), args.batch)
+
 
 if __name__ == "__main__":
     if not torch.cuda.is_available():
