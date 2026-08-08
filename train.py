@@ -787,7 +787,12 @@ class BoomerLit(pl.LightningModule):
         # changed --lr is silently ignored and the run quietly continues at the old
         # value. base_lrs is what the warmup/decay lambda multiplies, so both must be
         # rewritten or the scheduler would stomp the param group on its next step.
+        # Under --optimizer came8bit the live learning rate is --came-lr; --lr belongs to
+        # AdamW and is ignored there. Taking self.hparams.lr unconditionally would push
+        # the (much larger) AdamW rate into CAME's param groups on every resume.
         target = float(self.hparams.lr)
+        if getattr(self.hparams, "optimizer", "adamw") == "came8bit":
+            target = float(self.hparams.came_lr)
         changed = False
         for optim in self.trainer.optimizers:
             for group in optim.param_groups:
@@ -801,18 +806,49 @@ class BoomerLit(pl.LightningModule):
                 sched.base_lrs = [target] * len(base)
                 changed = True
         if changed:
-            print(f"[lr] CLI --lr {target:g} overrides the resumed optimizer/scheduler "
+            flag = "--came-lr" if getattr(self.hparams, "optimizer", "adamw") == "came8bit" else "--lr"
+            print(f"[lr] CLI {flag} {target:g} overrides the resumed optimizer/scheduler "
                   f"learning rate", flush=True)
 
     def configure_optimizers(self):
         hp = self.hparams
-        optim = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=hp.lr,
-            weight_decay=hp.weight_decay,
-            betas=(hp.beta1, hp.beta2),
-            fused=hp.fused_adamw,
-        )
+        if getattr(hp, "optimizer", "adamw") == "came8bit":
+            from boomer.optim import CAME8Bit, adamw_state_bytes, came_state_bytes
+
+            # CAME's step is RMS-clipped and bias-correction-free, so its natural step
+            # size is roughly an order of magnitude under AdamW's. Silently reusing --lr
+            # would look like it trained and quietly diverge, so require the LR to be
+            # stated rather than inherited.
+            came_lr = getattr(hp, "came_lr", None)
+            if not came_lr:
+                raise ValueError(
+                    "--optimizer came8bit requires an explicit --came-lr. CAME's update is "
+                    "RMS-clipped to clip_threshold and carries no bias correction, so an "
+                    f"AdamW learning rate (--lr {hp.lr:g}) is far too large for it. SANA's "
+                    "came8bit configs use 2e-5; start there."
+                )
+            optim = CAME8Bit(
+                self.model.parameters(),
+                lr=float(came_lr),
+                weight_decay=hp.weight_decay,
+                block_size=int(getattr(hp, "came_block_size", 2048)),
+                min_8bit_size=int(getattr(hp, "came_min_8bit_size", 16384)),
+            )
+            gib = 1024 ** 3
+            print(
+                f"[optim] CAME8bit lr={float(came_lr):g} (AdamW --lr {hp.lr:g} ignored) | "
+                f"optimizer state {came_state_bytes(self.model) / gib:.2f} GiB vs "
+                f"{adamw_state_bytes(self.model) / gib:.2f} GiB for fp32 AdamW",
+                flush=True,
+            )
+        else:
+            optim = torch.optim.AdamW(
+                self.model.parameters(),
+                lr=hp.lr,
+                weight_decay=hp.weight_decay,
+                betas=(hp.beta1, hp.beta2),
+                fused=hp.fused_adamw,
+            )
         warmup = max(0, int(hp.warmup_steps))
         sched_name = getattr(hp, "lr_scheduler", "linear-warmup-constant")
         min_lr_ratio = float(getattr(hp, "min_lr_ratio", 0.1))
@@ -2655,6 +2691,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--beta1", type=float, default=0.9)
     p.add_argument("--beta2", type=float, default=0.95)
     p.add_argument("--fused-adamw", action=bo, default=True)
+    p.add_argument("--optimizer", default="adamw", choices=["adamw", "came8bit"],
+                   help="came8bit = SANA 1.5's CAME with factored second moments and "
+                        "8-bit first moments (~7x less optimizer state than fp32 AdamW). "
+                        "Gradient checkpointing does not touch optimizer state, so this "
+                        "is the remaining large lever on peak memory.")
+    p.add_argument("--came-lr", type=float, default=None,
+                   help="LR for --optimizer came8bit. REQUIRED: CAME RMS-clips its update "
+                        "and has no bias correction, so an AdamW LR is far too large. "
+                        "SANA's came8bit configs use 2e-5 where AdamW recipes use ~1e-4.")
+    p.add_argument("--came-block-size", type=int, default=2048,
+                   help="Quantization block for CAME 8-bit first moments.")
+    p.add_argument("--came-min-8bit-size", type=int, default=16384,
+                   help="Parameters smaller than this keep an fp32 first moment.")
     p.add_argument("--warmup-steps", type=int, default=1000,
                    help="Linear warmup steps for the warmup-bearing schedulers.")
     p.add_argument("--lr-scheduler", default="linear-warmup-constant",
@@ -3040,6 +3089,10 @@ def main() -> None:
         beta1=args.beta1,
         beta2=args.beta2,
         fused_adamw=args.fused_adamw,
+        optimizer=args.optimizer,
+        came_lr=args.came_lr,
+        came_block_size=args.came_block_size,
+        came_min_8bit_size=args.came_min_8bit_size,
         warmup_steps=args.warmup_steps,
         lr_scheduler=args.lr_scheduler,
         min_lr_ratio=args.min_lr_ratio,
