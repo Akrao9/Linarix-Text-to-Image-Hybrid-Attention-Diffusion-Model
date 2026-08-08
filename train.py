@@ -694,6 +694,15 @@ class BoomerLit(pl.LightningModule):
         if sched is not None:
             self.log("train/lr", sched.get_last_lr()[0], on_step=True, on_epoch=False, batch_size=bs)
         self.log("train/sigma_mean", t.float().mean(), on_step=True, on_epoch=False, batch_size=bs)
+        if torch.cuda.is_available():
+            # Peak allocated since the last reset, in GB. The headroom this reports is
+            # what decides batch size: --compile fuses each block's pointwise chains
+            # (modulate / SiLU / GLU / gates / sandwich norms) so their intermediates are
+            # never materialized for backward, which is worth more here than its speed.
+            self.log("train/vram_peak_gb", torch.cuda.max_memory_allocated() / 1e9,
+                     on_step=True, on_epoch=False, batch_size=bs)
+            self.log("train/vram_reserved_gb", torch.cuda.memory_reserved() / 1e9,
+                     on_step=True, on_epoch=False, batch_size=bs)
         self._log_sigma_buckets(t, raw_per_sample, bs)
         if hp.t_sampler_final:
             self.log("train/t_polish", float(polish), on_step=True, on_epoch=False, batch_size=bs)
