@@ -121,7 +121,9 @@ class BoomerFLADiTConfig:
     # v8: explicit joint-refresh placement (encoder-absolute, zero-based). Overrides the
     # image_attention_every cadence selector AND its trailing-candidate demotion, so the
     # final encoder block CAN be a refresh block (the v8 layout ends in one: z leaves the
-    # encoder through exact global mixing). None = keep the v6 cadence machinery.
+    # encoder through exact global mixing). Also disables the legacy image-attention
+    # cadence in plain BoomerFLABlocks outright — refresh sites are the ONLY global
+    # attention, regardless of image_attention_every. None = keep the v6 cadence machinery.
     refresh_layers: tuple[int, ...] | None = None
     # v8: substitutive refresh — joint refresh blocks drop the GDN2/FLA mixer entirely,
     # so attention REPLACES the linear mixer at those depths instead of supplementing it.
@@ -1014,12 +1016,22 @@ class FLASelfMixer(nn.Module):
 
 
 class BoomerFLABlock(nn.Module):
-    def __init__(self, config: BoomerFLADiTConfig, *, layer_idx: int) -> None:
+    def __init__(
+        self,
+        config: BoomerFLADiTConfig,
+        *,
+        layer_idx: int,
+        image_attention: bool | None = None,
+    ) -> None:
         super().__init__()
         hidden_dim = config.hidden_dim
         self.parallel_block = config.parallel_block
+        # image_attention overrides the cadence rule; explicit refresh_layers passes
+        # False so no legacy image-attention block survives off-refresh (v8).
         self.use_image_attention = (
-            config.image_attention_every > 0 and (layer_idx + 1) % config.image_attention_every == 0
+            image_attention
+            if image_attention is not None
+            else config.image_attention_every > 0 and (layer_idx + 1) % config.image_attention_every == 0
         )
         self.norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
         if config.mixer_type in {"torch", "fallback"}:
@@ -1114,7 +1126,8 @@ class BoomerFLABlock(nn.Module):
         image_attn_t_mod: torch.Tensor | None = None,
         mixer_perm: torch.Tensor | None = None,
         mixer_perm_inv: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        return_update: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if self.mod is not None:
             timestep_mod = self.mod(t_emb)
         elif t_mod is None:
@@ -1173,17 +1186,29 @@ class BoomerFLABlock(nn.Module):
                         self.image_attn(modulate(self.image_attn_norm(base), shift_img, scale_img))
                     )
                 )
-            return base + sum(branches)
+            # Sum at update scale first: the AttnRes bank consumes the bare update, and
+            # recovering it later by (out - base) in bf16 would cancel away small terms.
+            update = sum(branches)
+            out = base + update
+            return (out, update) if return_update else out
 
-        x = x + gate_msa * self.sandwich_mixer(
+        # Sequential path: contributions apply to the evolving stream one by one, but
+        # each bare contribution is kept so the block's total update can be returned at
+        # update scale (no bf16 stream-scale subtraction downstream).
+        updates = []
+        u = gate_msa * self.sandwich_mixer(
             self._mixer(modulate(self.norm1(x), shift_msa, scale_msa), mixer_perm, mixer_perm_inv)
         )
+        x = x + u
+        updates.append(u)
         if self.use_image_attention:
-            x = x + gate_img * self.sandwich_image_attn(
+            u = gate_img * self.sandwich_image_attn(
                 self.image_attn(modulate(self.image_attn_norm(x), shift_img, scale_img))
             )
+            x = x + u
+            updates.append(u)
         if self.use_cross_attention:
-            x = x + gate_cross * self.sandwich_cross(
+            u = gate_cross * self.sandwich_cross(
                 self._cross_attention(
                     modulate(self.norm3(x), shift_cross, scale_cross),
                     text_tokens,
@@ -1191,9 +1216,15 @@ class BoomerFLABlock(nn.Module):
                     text_attn_bias,
                 )
             )
-        x = x + gate_mlp * self.sandwich_mlp(
+            x = x + u
+            updates.append(u)
+        u = gate_mlp * self.sandwich_mlp(
             self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp), height=height, width=width)
         )
+        x = x + u
+        updates.append(u)
+        if return_update:
+            return x, sum(updates)
         return x
 
 
@@ -1331,7 +1362,8 @@ class BoomerFLADualStreamBlock(JointTextImageAttentionMixin, nn.Module):
         text_coord_ids: torch.Tensor | None = None,
         image_t_mod: torch.Tensor | None = None,
         text_t_mod: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return_update: bool = False,
+    ) -> tuple[torch.Tensor, ...]:
         del text_attn_bias
         if self.image_mod is not None:
             image_timestep_mod = self.image_mod(t_emb)
@@ -1363,31 +1395,36 @@ class BoomerFLADualStreamBlock(JointTextImageAttentionMixin, nn.Module):
         image_attn = self.image_sandwich_attn(image_attn)
         text_attn = self.text_sandwich_attn(text_attn)
         if self.parallel_block:
-            x = image_base + image_gate_attn * image_attn + image_gate_mlp * self.image_sandwich_mlp(
+            # Image update summed at update scale (see BoomerFLABlock: the AttnRes bank
+            # consumes the bare update; bf16 stream-scale subtraction would corrupt it).
+            image_update = image_gate_attn * image_attn + image_gate_mlp * self.image_sandwich_mlp(
                 self.image_mlp(
                     modulate(self.image_norm2(image_base), image_shift_mlp, image_scale_mlp),
                     height=height,
                     width=width,
                 )
             )
+            x = image_base + image_update
             text_tokens = text_base + text_gate_attn * text_attn + text_gate_mlp * self.text_sandwich_mlp(
                 self.text_mlp(modulate(self.text_norm2(text_base), text_shift_mlp, text_scale_mlp))
             )
-            return x, text_tokens
+            return (x, text_tokens, image_update) if return_update else (x, text_tokens)
 
-        x = image_base + image_gate_attn * image_attn
+        u_attn = image_gate_attn * image_attn
+        x = image_base + u_attn
         text_tokens = text_base + text_gate_attn * text_attn
-        x = x + image_gate_mlp * self.image_sandwich_mlp(
+        u_mlp = image_gate_mlp * self.image_sandwich_mlp(
             self.image_mlp(
                 modulate(self.image_norm2(x), image_shift_mlp, image_scale_mlp),
                 height=height,
                 width=width,
             )
         )
+        x = x + u_mlp
         text_tokens = text_tokens + text_gate_mlp * self.text_sandwich_mlp(
             self.text_mlp(modulate(self.text_norm2(text_tokens), text_shift_mlp, text_scale_mlp))
         )
-        return x, text_tokens
+        return (x, text_tokens, u_attn + u_mlp) if return_update else (x, text_tokens)
 
 
 class BoomerFLAJointRefreshBlock(JointTextImageAttentionMixin, nn.Module):
@@ -1501,7 +1538,8 @@ class BoomerFLAJointRefreshBlock(JointTextImageAttentionMixin, nn.Module):
         text_t_mod: torch.Tensor | None = None,
         mixer_perm: torch.Tensor | None = None,
         mixer_perm_inv: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return_update: bool = False,
+    ) -> tuple[torch.Tensor, ...]:
         del text_attn_bias
         if self.mod is not None:
             timestep_mod = self.mod(t_emb)
@@ -1561,12 +1599,17 @@ class BoomerFLAJointRefreshBlock(JointTextImageAttentionMixin, nn.Module):
                     self.text_mlp(modulate(self.text_norm2(text_base), text_shift_mlp, text_scale_mlp))
                 )
             )
-            return x, text_tokens
+            return (x, text_tokens, image_update) if return_update else (x, text_tokens)
 
+        # Sequential path: bare image contributions kept so the block's total update
+        # can be returned at update scale (AttnRes bank; see BoomerFLABlock).
+        updates = []
         if not self.no_mixer:
-            x = x + gate_msa * self.sandwich_mixer(
+            u = gate_msa * self.sandwich_mixer(
                 self._mixer(modulate(self.norm1(x), shift_msa, scale_msa), mixer_perm, mixer_perm_inv)
             )
+            x = x + u
+            updates.append(u)
         image_attn, text_attn = self._joint_attention(
             modulate(self.joint_norm(x), shift_joint, scale_joint),
             modulate(self.text_norm1(text_tokens), text_shift_attn, text_scale_attn),
@@ -1575,14 +1618,20 @@ class BoomerFLAJointRefreshBlock(JointTextImageAttentionMixin, nn.Module):
             image_coord_ids,
             text_coord_ids,
         )
-        x = x + gate_joint * self.sandwich_joint(image_attn)
+        u = gate_joint * self.sandwich_joint(image_attn)
+        x = x + u
+        updates.append(u)
         text_tokens = text_tokens + text_gate_attn * self.text_sandwich_attn(text_attn)
-        x = x + gate_mlp * self.sandwich_mlp(
+        u = gate_mlp * self.sandwich_mlp(
             self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp), height=height, width=width)
         )
+        x = x + u
+        updates.append(u)
         text_tokens = text_tokens + text_gate_mlp * self.text_sandwich_mlp(
             self.text_mlp(modulate(self.text_norm2(text_tokens), text_shift_mlp, text_scale_mlp))
         )
+        if return_update:
+            return x, text_tokens, sum(updates)
         return x, text_tokens
 
 
@@ -1724,6 +1773,13 @@ class BlockAttnRes(nn.Module):
     unit weights == the paper's parameter-free norm at init, and the kernel computes
     its gradient anyway).
 
+    Sites listed in ``output_norm_sites`` apply a learned output RMSNorm to the mixed
+    result (fused into the kernel via ``output_rms_weight``, FLA's own integration
+    convention). Boomer uses it on the final z site only: the convex average over the
+    bank shrinks z by ~1/L (nine sources at init), which would let the timestep term
+    dominate ``s = silu(z + t)``; the norm restores unit RMS. Per-block sites skip it —
+    their following norm is adaLN-modulated and cannot be fused.
+
     Routing executes on FLA's ``fused_attnres`` Triton kernel when the sources live on
     CUDA and FLA imports: sources pass through a pointer table (no torch.stack), all
     routing math is fp32, and ``checkpoint_level=1`` recomputes the mix in backward
@@ -1738,10 +1794,20 @@ class BlockAttnRes(nn.Module):
     ``--compile``.
     """
 
-    def __init__(self, hidden_dim: int, slot_counts: list[int], eps: float = 1e-6) -> None:
+    def __init__(
+        self,
+        hidden_dim: int,
+        slot_counts: list[int],
+        eps: float = 1e-6,
+        output_norm_sites: tuple[int, ...] = (),
+    ) -> None:
         super().__init__()
         if not slot_counts or any(n < 1 for n in slot_counts):
             raise ValueError(f"slot_counts must be non-empty positive ints, got {slot_counts}")
+        if any(not (0 <= s < len(slot_counts)) for s in output_norm_sites):
+            raise ValueError(
+                f"output_norm_sites {output_norm_sites} must index into {len(slot_counts)} sites"
+            )
         self.eps = eps
         self.slot_counts = tuple(slot_counts)
         self.queries = nn.ParameterList(
@@ -1750,8 +1816,16 @@ class BlockAttnRes(nn.Module):
         self.key_norm_weights = nn.ParameterList(
             nn.Parameter(torch.ones(hidden_dim)) for _ in slot_counts
         )
-        # Telemetry: mean depth-attention weights per site. Plain attribute,
-        # deliberately outside state_dict.
+        # Learned output RMSNorm weights, keyed by site index (ParameterDict keys are
+        # strings). Ones-init: exact RMSNorm at load, drift is learnable.
+        self.out_norm_weights = nn.ParameterDict(
+            {str(s): nn.Parameter(torch.ones(hidden_dim)) for s in output_norm_sites}
+        )
+        # Telemetry: mean depth-attention weights per site, refreshed only while
+        # collect_weights is True (the trainer flips it at its logging cadence —
+        # return_weights + 23 reductions every microbatch is pure overhead otherwise).
+        # Plain attributes, deliberately outside state_dict.
+        self.collect_weights = False
         self.last_weights: list[torch.Tensor | None] = [None] * len(slot_counts)
         self._fused = None
         self._fused_checked = False
@@ -1767,43 +1841,57 @@ class BlockAttnRes(nn.Module):
                 self._fused = None
         return self._fused
 
-    def _naive(self, site: int, sources: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-        """Inline replica of fla.ops.attnres.naive_attnres (no output norm): fp32
-        end-to-end, weighted key RMSNorm, one downcast at the end."""
+    def _naive(
+        self, site: int, sources: list[torch.Tensor], out_norm: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Inline replica of fla.ops.attnres.naive_attnres: fp32 end-to-end, weighted
+        key RMSNorm, optional output RMSNorm, one downcast at the end."""
         dim = sources[0].shape[-1]
         v = torch.stack(sources).float()
         k = F.rms_norm(v, (dim,), self.key_norm_weights[site].float(), self.eps)
         p = torch.einsum("nbtd,d->nbt", k, self.queries[site].float()).softmax(dim=0)
-        out = torch.einsum("nbt,nbtd->btd", p, v).to(sources[0].dtype)
-        return out, p
+        out = torch.einsum("nbt,nbtd->btd", p, v)
+        if out_norm is not None:
+            out = F.rms_norm(out, (dim,), out_norm.float(), self.eps)
+        return out.to(sources[0].dtype), p
 
     @torch.compiler.disable
     def forward(self, site: int, sources: list[torch.Tensor]) -> torch.Tensor:
         expected = self.slot_counts[site]
         if len(sources) != expected:
             raise ValueError(f"site {site} expects {expected} sources, got {len(sources)}")
+        out_norm = self.out_norm_weights.get(str(site))
         if len(sources) == 1:
             # Softmax over one source is exactly identity; skip the kernel launch
             # (FLA's model integration bypasses L=1 the same way).
-            self.last_weights[site] = sources[0].new_ones(1, dtype=torch.float32)
-            return sources[0]
+            if self.collect_weights:
+                self.last_weights[site] = sources[0].new_ones(1, dtype=torch.float32)
+            src = sources[0]
+            if out_norm is None:
+                return src
+            dim = src.shape[-1]
+            return F.rms_norm(src.float(), (dim,), out_norm.float(), self.eps).to(src.dtype)
         fused = self._fused_op() if sources[0].is_cuda else None
         if fused is not None:
-            out, p = fused(
+            res = fused(
                 query=self.queries[site],
                 residuals=sources,
                 rms_weight=self.key_norm_weights[site],
-                output_rms_weight=None,  # the following norm is adaLN-modulated; can't fuse
+                # Per-block sites: the following norm is adaLN-modulated; can't fuse.
+                # The final z site fuses its dedicated learned RMSNorm here instead.
+                output_rms_weight=out_norm,
                 rms_eps=self.eps,
                 scale=1.0,
-                return_weights=True,
+                return_weights=self.collect_weights,
                 checkpoint_level=1,
             )
+            out, p = res if self.collect_weights else (res, None)
         else:
-            out, p = self._naive(site, sources)
-        # Stays on-device: a .cpu() here would sync the stream every step. Loggers
-        # that want host values pay that cost at their own cadence.
-        self.last_weights[site] = p.detach().mean(dim=(1, 2))
+            out, p = self._naive(site, sources, out_norm)
+        if self.collect_weights and p is not None:
+            # Stays on-device: a .cpu() here would sync the stream every step. Loggers
+            # that want host values pay that cost at their own cadence.
+            self.last_weights[site] = p.detach().mean(dim=(1, 2))
         return out
 
 
@@ -1908,9 +1996,16 @@ class BoomerFLADiT(nn.Module):
             # adaLN — their modulation is token-wise from z, inherently per-block.
             if config.dual_stream_depth < encoder_depth:
                 self.shared_mod = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 9))
-            has_image_attn = config.image_attention_every > 0 and any(
-                (i + 1) % config.image_attention_every == 0 and i not in refresh_indices
-                for i in range(config.dual_stream_depth, encoder_depth)
+            # Explicit refresh_layers (v8) disables the legacy image-attention cadence
+            # entirely — refresh blocks are the only global-attention sites, so neither
+            # stray BoomerFLABlock image attention nor its shared modulation exists.
+            has_image_attn = (
+                config.refresh_layers is None
+                and config.image_attention_every > 0
+                and any(
+                    (i + 1) % config.image_attention_every == 0 and i not in refresh_indices
+                    for i in range(config.dual_stream_depth, encoder_depth)
+                )
             )
             if has_image_attn:
                 self.shared_image_attn_mod = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 3))
@@ -1942,7 +2037,13 @@ class BoomerFLADiT(nn.Module):
                 return BoomerFLADualStreamBlock(config, layer_idx=i)
             if i in refresh_indices:
                 return BoomerFLAJointRefreshBlock(config, layer_idx=i)
-            return BoomerFLABlock(config, layer_idx=i)
+            return BoomerFLABlock(
+                config,
+                layer_idx=i,
+                # v8: explicit refresh placement owns global attention outright; the
+                # cadence must not resurrect a plain image-attention block off-refresh.
+                image_attention=False if config.refresh_layers is not None else None,
+            )
 
         # self.blocks is the condition encoder (== the whole model when DDT is off).
         self.blocks = nn.ModuleList([make_block(i) for i in range(encoder_depth)])
@@ -1978,7 +2079,11 @@ class BoomerFLADiT(nn.Module):
                     completed += 1
                     has_partial = False
             slot_counts.append(completed + (1 if has_partial else 0))  # final z site
-            self.block_attnres = BlockAttnRes(hidden_dim, slot_counts=slot_counts)
+            # Output RMSNorm on the final z site only: the convex average shrinks z by
+            # ~1/L at init, which would let t_emb dominate s = silu(z + t) downstream.
+            self.block_attnres = BlockAttnRes(
+                hidden_dim, slot_counts=slot_counts, output_norm_sites=(encoder_depth,)
+            )
         # v7 DDT velocity decoder: empty ModuleList (no state-dict keys) when off, so a
         # ddt_decoder_depth=0 model is key-for-key identical to pre-v7 checkpoints.
         self.decoder_blocks = nn.ModuleList(
@@ -2362,17 +2467,20 @@ class BoomerFLADiT(nn.Module):
         # v8 Block AttnRes (paper algorithm): the bank opens with the token embedding
         # ("blocks already include token embedding") and stores per-group DELTA sums.
         # Image stream only — text never enters the bank. Every block's input is the
-        # site's mixture; the block's contribution (output - input) accumulates into
-        # the partial sum, which folds into the bank at each group end.
-        attnres_completed: list[torch.Tensor] = [x] if self.block_attnres is not None else []
+        # site's mixture; the block RETURNS its bare image update (return_update=True),
+        # which accumulates into the partial sum and folds into the bank at each group
+        # end. The update is never recovered by (output - input): that bf16 stream-scale
+        # subtraction cancels away the small contributions the bank exists to keep.
+        want_delta = self.block_attnres is not None
+        attnres_completed: list[torch.Tensor] = [x] if want_delta else []
         attnres_partial: torch.Tensor | None = None
+        attnres_delta: torch.Tensor | None = None
         for layer_idx, block in enumerate(self.blocks):
-            if self.block_attnres is not None:
+            if want_delta:
                 sources = attnres_completed + (
                     [attnres_partial] if attnres_partial is not None else []
                 )
                 x = self.block_attnres(layer_idx, sources)
-                attnres_block_in = x
             if getattr(block, "joint_refresh", False):
                 # Joint refresh block: returns (x, text_tokens); needs both the mixer
                 # permutation (GDN2 spine) and the joint-attention coord/text inputs.
@@ -2381,26 +2489,32 @@ class BoomerFLADiT(nn.Module):
                 if use_ckpt:
                     def _refresh_fn(x, tt, te, mk, bi, tm, ttm,
                                     _blk=block, h=_h, w=_w, cr=_cr, ii=_ii, ti=_ti,
-                                    mp=mixer_perm, mpi=mixer_perm_inv):
+                                    mp=mixer_perm, mpi=mixer_perm_inv, ru=want_delta):
                         return _blk(x, tt, te, mk, bi,
                                     height=h, width=w, coord_rope=cr,
                                     image_coord_ids=ii, text_coord_ids=ti,
                                     t_mod=tm, text_t_mod=ttm,
-                                    mixer_perm=mp, mixer_perm_inv=mpi)
-                    x, text_tokens = _ckpt(_refresh_fn, x, text_tokens, t_emb,
-                                           text_key_padding_mask, text_attn_bias,
-                                           t_mod, dual_text_t_mod,
-                                           use_reentrant=False,
-                                           preserve_rng_state=False)
+                                    mixer_perm=mp, mixer_perm_inv=mpi,
+                                    return_update=ru)
+                    res = _ckpt(_refresh_fn, x, text_tokens, t_emb,
+                                text_key_padding_mask, text_attn_bias,
+                                t_mod, dual_text_t_mod,
+                                use_reentrant=False,
+                                preserve_rng_state=False)
                 else:
-                    x, text_tokens = block(
+                    res = block(
                         x, text_tokens, t_emb, text_key_padding_mask, text_attn_bias,
                         height=token_height, width=token_width,
                         coord_rope=self.coord_embedder,
                         image_coord_ids=image_coord_ids, text_coord_ids=text_coord_ids,
                         t_mod=t_mod, text_t_mod=dual_text_t_mod,
                         mixer_perm=mixer_perm, mixer_perm_inv=mixer_perm_inv,
+                        return_update=want_delta,
                     )
+                if want_delta:
+                    x, text_tokens, attnres_delta = res
+                else:
+                    x, text_tokens = res
             elif getattr(block, "updates_text", False):
                 # Dual-stream block: returns (x, text_tokens).
                 # Non-tensor args (height, width, coord_rope, coord IDs) captured via closure;
@@ -2409,55 +2523,67 @@ class BoomerFLADiT(nn.Module):
                 _cr, _ii, _ti = self.coord_embedder, image_coord_ids, text_coord_ids
                 if use_ckpt:
                     def _dual_fn(x, tt, te, mk, bi, im, tm,
-                                 _blk=block, h=_h, w=_w, cr=_cr, ii=_ii, ti=_ti):
+                                 _blk=block, h=_h, w=_w, cr=_cr, ii=_ii, ti=_ti,
+                                 ru=want_delta):
                         return _blk(x, tt, te, mk, bi,
                                     height=h, width=w, coord_rope=cr,
                                     image_coord_ids=ii, text_coord_ids=ti,
-                                    image_t_mod=im, text_t_mod=tm)
-                    x, text_tokens = _ckpt(_dual_fn, x, text_tokens, t_emb,
-                                           text_key_padding_mask, text_attn_bias,
-                                           dual_image_t_mod, dual_text_t_mod,
-                                           use_reentrant=False,
-                                           preserve_rng_state=False)
+                                    image_t_mod=im, text_t_mod=tm,
+                                    return_update=ru)
+                    res = _ckpt(_dual_fn, x, text_tokens, t_emb,
+                                text_key_padding_mask, text_attn_bias,
+                                dual_image_t_mod, dual_text_t_mod,
+                                use_reentrant=False,
+                                preserve_rng_state=False)
                 else:
-                    x, text_tokens = block(
+                    res = block(
                         x, text_tokens, t_emb, text_key_padding_mask, text_attn_bias,
                         height=token_height, width=token_width,
                         coord_rope=self.coord_embedder,
                         image_coord_ids=image_coord_ids, text_coord_ids=text_coord_ids,
                         image_t_mod=dual_image_t_mod, text_t_mod=dual_text_t_mod,
+                        return_update=want_delta,
                     )
+                if want_delta:
+                    x, text_tokens, attnres_delta = res
+                else:
+                    x, text_tokens = res
             else:
                 # Single-stream block: returns x only.
                 _h, _w = token_height, token_width
                 if use_ckpt:
                     def _single_fn(x, tt, te, mk, bi, tm, iam,
                                    _blk=block, h=_h, w=_w,
-                                   mp=mixer_perm, mpi=mixer_perm_inv):
+                                   mp=mixer_perm, mpi=mixer_perm_inv, ru=want_delta):
                         return _blk(x, tt, te, mk, bi, height=h, width=w,
                                     t_mod=tm, image_attn_t_mod=iam,
-                                    mixer_perm=mp, mixer_perm_inv=mpi)
-                    x = _ckpt(_single_fn, x, text_tokens, t_emb,
-                               text_key_padding_mask, text_attn_bias,
-                               t_mod, image_attn_t_mod,
-                               use_reentrant=False,
-                               preserve_rng_state=False)
+                                    mixer_perm=mp, mixer_perm_inv=mpi,
+                                    return_update=ru)
+                    res = _ckpt(_single_fn, x, text_tokens, t_emb,
+                                text_key_padding_mask, text_attn_bias,
+                                t_mod, image_attn_t_mod,
+                                use_reentrant=False,
+                                preserve_rng_state=False)
                 else:
-                    x = block(
+                    res = block(
                         x, text_tokens, t_emb, text_key_padding_mask, text_attn_bias,
                         height=token_height, width=token_width,
                         t_mod=t_mod, image_attn_t_mod=image_attn_t_mod,
                         mixer_perm=mixer_perm, mixer_perm_inv=mixer_perm_inv,
+                        return_update=want_delta,
                     )
-            if self.block_attnres is not None:
-                # The block adds its contributions onto its input internally, so the
-                # delta is recovered by subtraction — identical to the reference, where
-                # the sublayer returns the bare contribution. Fold BEFORE the delta at a
-                # group end would misfile this block's delta; the reference folds before
-                # accumulating only because its boundary test looks at the NEXT index.
-                delta = x - attnres_block_in
+                if want_delta:
+                    x, attnres_delta = res
+                else:
+                    x = res
+            if want_delta:
+                # The bare update, at update scale, straight from the block (the
+                # reference's sublayers return contributions the same way). Fold BEFORE
+                # accumulating at a group end would misfile this block's delta; the
+                # reference folds first only because its boundary test looks at the
+                # NEXT index.
                 attnres_partial = (
-                    delta if attnres_partial is None else attnres_partial + delta
+                    attnres_delta if attnres_partial is None else attnres_partial + attnres_delta
                 )
                 if layer_idx in self._attnres_fold_ends:
                     attnres_completed.append(attnres_partial)

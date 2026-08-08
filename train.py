@@ -624,6 +624,14 @@ class BoomerLit(pl.LightningModule):
         )
         # Dispersive loss needs no external target, so it only depends on its weight.
         want_disp = hp.dispersive_weight > 0.0
+        # v8 Block AttnRes telemetry is opt-in per step: return_weights=True plus 23
+        # per-site reductions every microbatch (and up to 116 self.log calls x accum)
+        # is pure overhead off the logging cadence, so collect only when this step's
+        # scalars will actually be written.
+        attnres = getattr(self.model, "block_attnres", None)
+        if attnres is not None:
+            log_every = max(int(getattr(self.trainer, "log_every_n_steps", 50) or 1), 1)
+            attnres.collect_weights = self.global_step % log_every == 0
         out = self.model(
             x_t, t, text, mask,
             cond_input=cond_input,
@@ -679,10 +687,10 @@ class BoomerLit(pl.LightningModule):
         # delta sums (shallow -> deep), the last slot is the current partial sum. Init is
         # the paper's uniform 1/N; weights staying pinned there = AttnRes is not
         # differentiating sources; structured drift = it is earning its parameters.
+        # Collected only on collect_weights steps (set above at the logging cadence);
         # BlockAttnRes.forward is compiler-disabled (FLA's dispatch already graph-breaks
-        # there), so last_weights refreshes every step even under --compile.
-        attnres = getattr(self.model, "block_attnres", None)
-        if attnres is not None:
+        # there), so last_weights refreshes on those steps even under --compile.
+        if attnres is not None and attnres.collect_weights:
             for site, w in enumerate(attnres.last_weights):
                 if w is None:
                     continue

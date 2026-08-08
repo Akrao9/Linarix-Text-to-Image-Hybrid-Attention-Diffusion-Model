@@ -67,25 +67,40 @@ def clone_case(query, residuals, rms_w):
 def run_parity() -> None:
     torch.manual_seed(0)
     for batch, tokens in SHAPES:
-        for n in range(1, MAX_SOURCES + 1):
-            q0, r0, w0 = make_case(n, batch, tokens)
-            q1, r1, w1 = clone_case(q0, r0, w0)
+        # with_onorm covers the final z site, which fuses its learned output RMSNorm
+        # into the kernel via output_rms_weight; per-block sites pass None.
+        for with_onorm in (False, True):
+            for n in range(1, MAX_SOURCES + 1):
+                q0, r0, w0 = make_case(n, batch, tokens)
+                q1, r1, w1 = clone_case(q0, r0, w0)
+                ow0 = ow1 = None
+                if with_onorm:
+                    ow0 = torch.ones(D, device=DEVICE, dtype=DTYPE, requires_grad=True)
+                    ow1 = ow0.detach().clone().requires_grad_(True)
 
-            ref = naive_attnres(query=q0, residuals=r0, rms_weight=w0, rms_eps=1e-6)
-            out = fused_attnres(
-                query=q1, residuals=r1, rms_weight=w1, rms_eps=1e-6,
-                checkpoint_level=1,
-            )
-            grad = torch.randn_like(ref)
-            ref.backward(grad)
-            out.backward(grad)
+                ref = naive_attnres(
+                    query=q0, residuals=r0, rms_weight=w0,
+                    output_rms_weight=ow0, rms_eps=1e-6,
+                )
+                out = fused_attnres(
+                    query=q1, residuals=r1, rms_weight=w1,
+                    output_rms_weight=ow1, rms_eps=1e-6,
+                    checkpoint_level=1,
+                )
+                grad = torch.randn_like(ref)
+                ref.backward(grad)
+                out.backward(grad)
 
-            assert_close(f"o[L={n},B={batch},T={tokens}]", ref, out, RATIO)
-            assert_close(f"dq[L={n}]", q0.grad, q1.grad, RATIO)
-            assert_close(f"dw[L={n}]", w0.grad, w1.grad, RATIO)
-            for i, (a, b) in enumerate(zip(r0, r1)):
-                assert_close(f"dv{i}[L={n}]", a.grad, b.grad, RATIO)
-        print(f"parity OK: B={batch} T={tokens} D={D} bf16, L=1..{MAX_SOURCES} fwd+bwd")
+                tag = f"L={n},B={batch},T={tokens},onorm={with_onorm}"
+                assert_close(f"o[{tag}]", ref, out, RATIO)
+                assert_close(f"dq[{tag}]", q0.grad, q1.grad, RATIO)
+                assert_close(f"dw[{tag}]", w0.grad, w1.grad, RATIO)
+                if with_onorm:
+                    assert_close(f"dow[{tag}]", ow0.grad, ow1.grad, RATIO)
+                for i, (a, b) in enumerate(zip(r0, r1)):
+                    assert_close(f"dv{i}[{tag}]", a.grad, b.grad, RATIO)
+        print(f"parity OK: B={batch} T={tokens} D={D} bf16, L=1..{MAX_SOURCES} "
+              f"fwd+bwd, with and without fused output RMSNorm")
 
 
 def run_timing(iters: int = 50) -> None:
@@ -94,11 +109,17 @@ def run_timing(iters: int = 50) -> None:
     site_counts = [1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 5, 6, 6, 6, 7, 7, 7, 8, 8, 9, 9]
     for batch, tokens in SHAPES:
         cases = [make_case(n, batch, tokens) for n in site_counts if n > 1]
+        # The last routed call is the final z site, which fuses its output RMSNorm.
+        onorm = torch.ones(D, device=DEVICE, dtype=DTYPE, requires_grad=True)
         torch.cuda.synchronize()
         start = time.perf_counter()
         for _ in range(iters):
-            for q, rs, w in cases:
-                out = fused_attnres(query=q, residuals=rs, rms_weight=w, rms_eps=1e-6)
+            for idx, (q, rs, w) in enumerate(cases):
+                out = fused_attnres(
+                    query=q, residuals=rs, rms_weight=w,
+                    output_rms_weight=onorm if idx == len(cases) - 1 else None,
+                    rms_eps=1e-6,
+                )
                 out.sum().backward()
         torch.cuda.synchronize()
         ms = (time.perf_counter() - start) / iters * 1000
