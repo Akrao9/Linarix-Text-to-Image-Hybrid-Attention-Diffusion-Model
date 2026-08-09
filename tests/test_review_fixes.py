@@ -345,3 +345,47 @@ def test_vram_telemetry_resets_then_logs_complete_batch_peaks(monkeypatch) -> No
     assert logged["train/vram_peak_gb"][0] == 7.0
     assert logged["train/vram_reserved_peak_gb"][0] == 9.0
     assert logged["train/vram_peak_gb"][1]["batch_size"] == 3
+
+
+def test_cmuon_cli_flags_reach_the_lightning_module() -> None:
+    """configure_optimizers reads hp.cmuon_*; main() must actually forward them.
+
+    Every read is `getattr(hp, "cmuon_x", <default>)`, so an unforwarded flag does not
+    raise -- it silently falls back to the default. `--cmuon-lr 2e-4` would be accepted
+    on the command line and ignored for 300k steps.
+    """
+    import inspect
+
+    import train
+
+    source = inspect.getsource(train.main)
+    construction = source[source.index("BoomerLit("):]
+    for flag in ("cmuon_lr", "cmuon_aux_lr", "cmuon_weight_decay",
+                 "cmuon_momentum", "cmuon_ns_steps", "cmuon_chunk_rescale"):
+        assert f"{flag}=args.{flag}" in construction, f"{flag} never reaches BoomerLit"
+
+
+def test_ddt_decoder_honours_image_rope_theta() -> None:
+    """The decoder block omitted rope_theta and silently kept the 10000.0 default.
+
+    RoPE2D bakes theta into non-persistent cos/sin buffers rather than storing it, so
+    compare the decoder's tables across two thetas: identical tables mean the flag
+    never reached the decoder.
+    """
+    from boomer.models.boomer_fla_dit import BoomerFLADiT, BoomerFLADiTConfig
+
+    def decoder_tables(theta: float):
+        cfg = BoomerFLADiTConfig(
+            hidden_dim=64, depth=4, num_heads=4, ddt_decoder_depth=2,
+            mixer_type="fallback", image_attention_rope=True, image_rope_theta=theta,
+            latent_size=8, patch_size=1,
+        )
+        model = BoomerFLADiT(cfg)
+        rope = model.decoder_blocks[0].attn.rope
+        assert rope is not None, "decoder image attention has no RoPE"
+        return rope.cos_h.clone()
+
+    default, changed = decoder_tables(10000.0), decoder_tables(50000.0)
+    assert not torch.allclose(default, changed), (
+        "--image-rope-theta does not reach the DDT decoder"
+    )

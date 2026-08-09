@@ -2086,6 +2086,9 @@ class BoomerFLADDTDecoderBlock(nn.Module):
             grid_size=config.latent_size // config.patch_size,
             rope=config.image_attention_rope,
             rope_ntk_factor=config.rope_ntk_factor,
+            # Was omitted, so the decoder silently kept the 10000.0 constructor default
+            # while the encoder honoured --image-rope-theta. A no-op at the default.
+            rope_theta=config.image_rope_theta,
         )
         self.norm2 = make_norm()
         self.mlp = GLUMBConv(hidden_dim, config.mlp_ratio)
