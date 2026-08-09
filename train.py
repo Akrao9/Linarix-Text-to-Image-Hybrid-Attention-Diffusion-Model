@@ -827,7 +827,7 @@ class BoomerLit(pl.LightningModule):
         # Under --optimizer came8bit the live learning rate is --came-lr; --lr belongs to
         # AdamW and is ignored there. Taking self.hparams.lr unconditionally would push
         # the (much larger) AdamW rate into CAME's param groups on every resume.
-        # Under --optimizer muon there are TWO rates by design (Muon on 2D hidden
+        # Under --optimizer muon/cmuon there are TWO base rates by design (Muon on 2D hidden
         # weights, AdamW on norms/biases/embeddings), so the target is resolved PER
         # GROUP off its boomer_role tag. Collapsing both to one value would silently
         # retune half the model on every resume.
@@ -850,7 +850,11 @@ class BoomerLit(pl.LightningModule):
                 changed = True
         if changed:
             mode = getattr(self.hparams, "optimizer", "adamw")
-            flag = {"came8bit": "--came-lr", "muon": "--muon-lr/--muon-aux-lr"}.get(mode, "--lr")
+            flag = {
+                "came8bit": "--came-lr",
+                "muon": "--muon-lr/--muon-aux-lr",
+                "cmuon": "--cmuon-lr/--cmuon-aux-lr",
+            }.get(mode, "--lr")
             rates = sorted({g["initial_lr"] for o in self.trainer.optimizers
                             for g in o.param_groups if g.get("initial_lr") is not None})
             shown = ", ".join(f"{r:g}" for r in rates)
@@ -872,6 +876,14 @@ class BoomerLit(pl.LightningModule):
             if group.get("boomer_role") == "muon":
                 return float(getattr(hp, "muon_lr", None) or hp.lr)
             return float(getattr(hp, "muon_aux_lr", None) or hp.lr)
+        if mode == "cmuon":
+            if group.get("boomer_role") == "muon":
+                base = float(getattr(hp, "cmuon_lr", None) or hp.lr)
+                # Paper-default chunk rescaling gives fused QKV/FFN/adaLN groups
+                # sqrt(N) times the base rate. Preserve that relative scale when a
+                # resumed scheduler is overwritten from the CLI.
+                return base * float(group.get("boomer_lr_scale", 1.0))
+            return float(getattr(hp, "cmuon_aux_lr", None) or hp.lr)
         return float(hp.lr)
 
     def configure_optimizers(self):
@@ -934,6 +946,41 @@ class BoomerLit(pl.LightningModule):
                 f"{optim.muon_params / 1e6:.1f}M params | AdamW lr={aux_lr:g} on "
                 f"{optim.aux_params / 1e6:.1f}M (norms/biases/embeddings/heads) | "
                 f"optimizer state {muon_state_bytes(self.model) / gib:.2f} GiB vs "
+                f"{adamw_state_bytes(self.model) / gib:.2f} GiB for fp32 AdamW",
+                flush=True,
+            )
+        elif getattr(hp, "optimizer", "adamw") == "cmuon":
+            from boomer.optim import (
+                CMuonWithAuxAdamW,
+                adamw_state_bytes,
+                cmuon_state_bytes,
+            )
+
+            cmuon_lr = float(getattr(hp, "cmuon_lr", None) or hp.lr)
+            aux_lr = float(getattr(hp, "cmuon_aux_lr", None) or hp.lr)
+            optim = CMuonWithAuxAdamW(
+                self.model,
+                lr=cmuon_lr,
+                aux_lr=aux_lr,
+                weight_decay=float(getattr(hp, "cmuon_weight_decay", 0.0)),
+                aux_weight_decay=hp.weight_decay,
+                aux_betas=(hp.beta1, hp.beta2),
+                momentum=float(getattr(hp, "cmuon_momentum", 0.95)),
+                ns_steps=int(getattr(hp, "cmuon_ns_steps", 6)),
+                chunk_rescale=bool(getattr(hp, "cmuon_chunk_rescale", True)),
+            )
+            gib = 1024 ** 3
+            print(
+                f"[optim] CMuon (Dion) base_lr={cmuon_lr:g} "
+                f"wd={optim.defaults['weight_decay']:g} ns_steps="
+                f"{optim.defaults['ns_steps']} chunk_rescale="
+                f"{optim.defaults['chunk_rescale']} | "
+                f"{optim.chunked_params / 1e6:.1f}M params in "
+                f"{optim.chunked_matrices} semantic fused matrices, "
+                f"{(optim.muon_params - optim.chunked_params) / 1e6:.1f}M ordinary "
+                f"Muon params | AdamW lr={aux_lr:g} on "
+                f"{optim.aux_params / 1e6:.1f}M | optimizer state "
+                f"{cmuon_state_bytes(self.model) / gib:.2f} GiB vs "
                 f"{adamw_state_bytes(self.model) / gib:.2f} GiB for fp32 AdamW",
                 flush=True,
             )
@@ -2787,7 +2834,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--beta1", type=float, default=0.9)
     p.add_argument("--beta2", type=float, default=0.95)
     p.add_argument("--fused-adamw", action=bo, default=True)
-    p.add_argument("--optimizer", default="adamw", choices=["adamw", "came8bit", "muon"],
+    p.add_argument("--optimizer", default="adamw", choices=["adamw", "came8bit", "muon", "cmuon"],
                    help="came8bit = SANA 1.5's CAME with factored second moments and "
                         "8-bit first moments (~7x less optimizer state than fp32 AdamW). "
                         "Gradient checkpointing does not touch optimizer state, so this "
@@ -2795,7 +2842,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "muon = torch.optim.Muon (torch >= 2.9) on 2D hidden weights with "
                         "AdamW on norms/biases/embeddings; in production at Kimi K2, "
                         "GLM-4.5, INTELLECT-3. Aimed at quality, and halves optimizer "
-                        "state as a side effect (momentum only, no second moment).")
+                        "state as a side effect (momentum only, no second moment). "
+                        "cmuon = diffusion-specific chunked Muon through Microsoft Dion: "
+                        "fused QKV, GLUMBConv gate/value, and adaLN rows are "
+                        "orthogonalized independently after fused momentum accumulation.")
     p.add_argument("--muon-lr", type=float, default=None,
                    help="LR for the Muon (2D hidden weight) group. Defaults to --lr: "
                         "adjust_lr_fn=match_rms_adamw rescales the update to AdamW's RMS, "
@@ -2815,6 +2865,21 @@ def build_parser() -> argparse.ArgumentParser:
                    choices=["match_rms_adamw", "original"],
                    help="match_rms_adamw = Moonshot's 0.2*lr*sqrt(max(A,B)) so AdamW LRs "
                         "transfer; original = Keller's sqrt(max(1, A/B)).")
+    p.add_argument("--cmuon-lr", type=float, default=None,
+                   help="Base LR for CMuon matrices. Defaults to --lr; the paper's "
+                        "DC-AE DiT-XL recipe used 2e-4 with Moonlight RMS scaling.")
+    p.add_argument("--cmuon-aux-lr", type=float, default=None,
+                   help="LR for CMuon's AdamW group (1D params, embeddings, final head). "
+                        "Defaults to --lr.")
+    p.add_argument("--cmuon-weight-decay", type=float, default=0.0,
+                   help="Decoupled decay for CMuon matrices. Paper default is 0.")
+    p.add_argument("--cmuon-momentum", type=float, default=0.95)
+    p.add_argument("--cmuon-ns-steps", type=int, default=6,
+                   help="Newton-Schulz iterations. The CMuon DC-AE DiT-XL recipe uses 6.")
+    p.add_argument("--cmuon-chunk-rescale", action=bo, default=True,
+                   help="Multiply semantic chunk-group updates by sqrt(number of chunks), "
+                        "the paper's default early-convergence acceleration. Disable with "
+                        "--no-cmuon-chunk-rescale.")
     p.add_argument("--came-lr", type=float, default=None,
                    help="LR for --optimizer came8bit. REQUIRED: CAME RMS-clips its update "
                         "and has no bias correction, so an AdamW LR is far too large. "

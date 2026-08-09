@@ -16,5 +16,10 @@ dependencies = [
   "webdataset",
 ]
 
+[project.optional-dependencies]
+# Dion main includes the split_sizes param-group API required by CMuon. Pin the
+# reviewed revision so a future optimizer API change cannot silently alter a run.
+cmuon = ["dion @ git+https://github.com/microsoft/dion.git@0a059a4542e5aa74b40dcd1dce363836c7afcd48"]
+
 [tool.setuptools.packages.find]
 include = ["boomer*"]

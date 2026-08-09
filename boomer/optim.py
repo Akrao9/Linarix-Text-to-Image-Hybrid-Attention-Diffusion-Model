@@ -1,12 +1,15 @@
-"""Alternatives to fp32 AdamW: CAME8Bit (memory) and Muon (quality, and less memory).
+"""Alternatives to fp32 AdamW: CAME8Bit, Muon, and diffusion-specific CMuon.
 
-Two optimizers with different aims, both reachable from `--optimizer`:
+Three optimizers with different aims, all reachable from `--optimizer`:
 
   * `CAME8Bit` cuts optimizer STATE ~7.5x (measured 0.88 GiB vs 6.63 GiB on v8's 890M),
     hoping to be quality-neutral. Learning rate does NOT transfer from AdamW.
   * `MuonWithAuxAdamW` targets QUALITY -- orthogonalised momentum on 2D hidden weights --
     and halves state as a side effect, since Muon carries momentum only. Learning rate
     DOES transfer from AdamW via `adjust_lr_fn="match_rms_adamw"`.
+  * `CMuonWithAuxAdamW` keeps Muon's fused momentum but independently orthogonalises
+    the semantic rows of QKV, FFN gate+up, and adaLN projections. It uses Microsoft
+    Dion's `split_sizes` engine and the CMuon paper's six-step Newton--Schulz recipe.
 
 --- CAME8Bit -------------------------------------------------------------------
 
@@ -44,14 +47,22 @@ AdamW recipes sit near 1e-4. `--lr` is NOT reused implicitly; see `--came-lr`.
 
 from __future__ import annotations
 
+import functools
+import math
+from collections import defaultdict
+
 import torch
 
 __all__ = [
     "CAME8Bit",
+    "CMuonWithAuxAdamW",
     "MuonWithAuxAdamW",
+    "CMUON_EXCLUDE_PREFIXES",
     "MUON_EXCLUDE_PREFIXES",
+    "split_cmuon_parameter_groups",
     "split_muon_parameters",
     "came_state_bytes",
+    "cmuon_state_bytes",
     "muon_state_bytes",
     "adamw_state_bytes",
 ]
@@ -381,6 +392,116 @@ MUON_EXCLUDE_PREFIXES: tuple[str, ...] = (
     "pos_embed",
 )
 
+# CMuon's paper keeps embeddings and the final layer on AdamW.  Boomer's
+# final_t_block is part of the velocity head even though it is physically a Linear,
+# so CMuon excludes it in addition to the fixed-space projections above.  Keep this
+# separate from MUON_EXCLUDE_PREFIXES so selecting --optimizer cmuon cannot silently
+# alter the established --optimizer muon experiment.
+CMUON_EXCLUDE_PREFIXES: tuple[str, ...] = MUON_EXCLUDE_PREFIXES + ("final_t_block",)
+
+# Fused Linear projections whose output rows have distinct semantic roles.  CMuon
+# updates momentum on the original fused matrix, then independently orthogonalises
+# these row blocks.  This preserves the fast fused GEMM in the model while avoiding
+# the cross-role coupling of vanilla Muon.
+_CMUON_FIXED_CHUNKS: dict[str, int] = {
+    "qkv": 3,
+    "image_qkv": 3,
+    "text_qkv": 3,
+    "kv_linear": 2,
+    "cond_mod": 6,
+}
+_CMUON_MODULATION_PARENTS: frozenset[str] = frozenset(
+    {
+        "mod",
+        "image_mod",
+        "text_mod",
+        "shared_mod",
+        "shared_image_attn_mod",
+        "shared_dual_image_mod",
+        "shared_dual_text_mod",
+    }
+)
+
+
+def _cmuon_split_sizes(module_name: str, module: torch.nn.Linear) -> tuple[int, ...] | None:
+    """Return the paper's semantic row chunks for one fused Boomer Linear."""
+    leaf = module_name.rsplit(".", 1)[-1]
+    chunks = _CMUON_FIXED_CHUNKS.get(leaf)
+
+    # GLUMBConv's input projection is [gate; value], exactly the fused FFN
+    # projection chunked in CMuon.  The trailing ``.0`` is the Linear inside its
+    # Sequential(Linear, SiLU).
+    if module_name.endswith("inverted_fc.0"):
+        chunks = 2
+
+    # adaLN projections occur both per-block and as v8's shared projections.  Their
+    # number of semantic outputs is encoded by out_features / hidden_dim (3, 6, or
+    # 9), rather than hard-coding one value for every block type.
+    parts = module_name.split(".")
+    parent = parts[-2] if len(parts) >= 2 else ""
+    if leaf == "1" and parent in _CMUON_MODULATION_PARENTS:
+        if module.out_features % module.in_features:
+            raise ValueError(
+                f"CMuon adaLN projection {module_name!r} has shape "
+                f"({module.out_features}, {module.in_features}); output rows must be "
+                "an integer multiple of the hidden width"
+            )
+        chunks = module.out_features // module.in_features
+
+    if chunks is None or chunks <= 1:
+        return None
+    if module.out_features % chunks:
+        raise ValueError(
+            f"CMuon projection {module_name!r} has {module.out_features} output rows, "
+            f"which cannot be divided into {chunks} semantic chunks"
+        )
+    rows = module.out_features // chunks
+    return (rows,) * chunks
+
+
+def split_cmuon_parameter_groups(
+    model: torch.nn.Module,
+    exclude_prefixes: tuple[str, ...] = CMUON_EXCLUDE_PREFIXES,
+) -> tuple[list[dict], list[torch.nn.Parameter]]:
+    """Partition a model into semantic CMuon groups and an AdamW auxiliary set.
+
+    Groups are keyed by ``split_sizes`` so Dion can megabatch parameters sharing the
+    same semantic layout.  A group without ``split_sizes`` is ordinary Muon.  Only
+    actual ``nn.Linear.weight`` objects are eligible; learned 2D tables remain AdamW.
+    """
+    while hasattr(model, "_orig_mod"):
+        model = model._orig_mod
+
+    by_split: dict[tuple[int, ...] | None, list[torch.nn.Parameter]] = defaultdict(list)
+    eligible_ids: set[int] = set()
+    for module_name, module in model.named_modules():
+        if not isinstance(module, torch.nn.Linear) or not module.weight.requires_grad:
+            continue
+        excluded = any(
+            module_name == prefix or module_name.startswith(f"{prefix}.")
+            for prefix in exclude_prefixes
+        )
+        if excluded:
+            continue
+        split_sizes = _cmuon_split_sizes(module_name, module)
+        by_split[split_sizes].append(module.weight)
+        eligible_ids.add(id(module.weight))
+
+    aux = [
+        param
+        for param in model.parameters()
+        if param.requires_grad and id(param) not in eligible_ids
+    ]
+    groups = [
+        {
+            "params": params,
+            "split_sizes": split_sizes,
+            "boomer_cmuon_chunks": len(split_sizes) if split_sizes else 1,
+        }
+        for split_sizes, params in by_split.items()
+    ]
+    return groups, aux
+
 
 def split_muon_parameters(
     model: torch.nn.Module, exclude_prefixes: tuple[str, ...] = MUON_EXCLUDE_PREFIXES
@@ -550,6 +671,177 @@ class MuonWithAuxAdamW(torch.optim.Optimizer):
         )
 
 
+@torch.compile(fullgraph=True)
+def _cmuon_newton_schulz(
+    grad: torch.Tensor,
+    epsilon: float | torch.Tensor = 1e-7,
+    *,
+    steps: int = 6,
+) -> torch.Tensor:
+    """CMuon paper Algorithm 3, supporting Dion's batched 2D matrices.
+
+    Dion's default Polar Express kernel is a good general Muon implementation, but
+    the CMuon DC-AE/DiT-XL result used six iterations of the fixed quintic map below.
+    Supplying it as Dion's custom NS function makes the training recipe explicit and
+    avoids silently benchmarking a different polar approximation.
+    """
+    if grad.ndim not in (2, 3):
+        raise ValueError(f"CMuon Newton-Schulz expects a 2D/3D tensor, got {grad.ndim}D")
+    if steps <= 0:
+        raise ValueError(f"CMuon Newton-Schulz steps must be positive, got {steps}")
+
+    x = grad.to(torch.bfloat16)
+    transposed = x.shape[-2] > x.shape[-1]
+    if transposed:
+        x = x.mT
+    x = x / (x.norm(dim=(-2, -1), keepdim=True) + epsilon)
+    a, b, c = 3.4445, -4.7750, 2.0315
+    for _ in range(steps):
+        gram = x @ x.mT
+        x = a * x + (b * gram + c * (gram @ gram)) @ x
+    return x.mT if transposed else x
+
+
+class CMuonWithAuxAdamW(torch.optim.Optimizer):
+    """Paper-faithful chunked Muon using Dion, plus AdamW for scalar/fixed heads.
+
+    Momentum is accumulated on each original fused parameter by Dion *before* the
+    update is split.  QKV, GLUMBConv gate/value, and adaLN modulation rows are then
+    independently orthogonalised and concatenated.  The optional sqrt(N) multiplier
+    is represented as a per-group LR scale; weight decay is divided by the same scale
+    so the resulting decoupled decay coefficient remains ``base_lr * weight_decay``.
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        *,
+        lr: float,
+        aux_lr: float,
+        weight_decay: float = 0.0,
+        aux_weight_decay: float = 0.0,
+        aux_betas: tuple[float, float] = (0.9, 0.95),
+        momentum: float = 0.95,
+        nesterov: bool = True,
+        ns_steps: int = 6,
+        chunk_rescale: bool = True,
+        exclude_prefixes: tuple[str, ...] = CMUON_EXCLUDE_PREFIXES,
+    ) -> None:
+        try:
+            from dion import Muon as DionMuon
+        except ImportError as exc:  # pragma: no cover - environment dependent
+            raise RuntimeError(
+                "--optimizer cmuon requires Microsoft Dion with split_sizes support. "
+                "Install the pinned dependency with `pip install -e '.[cmuon]'`, or "
+                "for a sibling clone run `pip install -e ../dion`. Dion2 is not a "
+                "substitute: split_sizes is currently implemented by dion.Muon."
+            ) from exc
+
+        specs, aux_params = split_cmuon_parameter_groups(model, exclude_prefixes)
+        if not specs:
+            raise ValueError(
+                "no CMuon-eligible hidden Linear weights found; refusing to run CMuon "
+                "over only an AdamW auxiliary group"
+            )
+
+        groups: list[dict] = []
+        for spec in specs:
+            chunks = int(spec["boomer_cmuon_chunks"])
+            lr_scale = math.sqrt(chunks) if chunk_rescale and chunks > 1 else 1.0
+            group = {
+                **spec,
+                "lr": lr * lr_scale,
+                "weight_decay": weight_decay / lr_scale,
+                "boomer_role": "muon",
+                "boomer_lr_scale": lr_scale,
+            }
+            # None is accepted by our splitter but omitting it keeps Dion's ordinary
+            # Muon group unambiguous in checkpoint diagnostics.
+            if group["split_sizes"] is None:
+                group.pop("split_sizes")
+            groups.append(group)
+
+        muon_group_count = len(groups)
+        if aux_params:
+            groups.append({"params": aux_params, "lr": aux_lr, "boomer_role": "aux"})
+        super().__init__(groups, dict(lr=lr))
+
+        ns_func = functools.partial(_cmuon_newton_schulz, steps=ns_steps)
+        self._muon = DionMuon(
+            self.param_groups[:muon_group_count],
+            lr=lr,
+            mu=momentum,
+            weight_decay=weight_decay,
+            nesterov=nesterov,
+            adjust_lr="rms_norm",
+            use_polar_express=False,
+            newton_schulz_func=ns_func,
+        )
+        self._aux = (
+            torch.optim.AdamW(
+                [self.param_groups[-1]],
+                lr=aux_lr,
+                betas=aux_betas,
+                weight_decay=aux_weight_decay,
+            )
+            if aux_params
+            else None
+        )
+
+        self.defaults = dict(
+            lr=lr,
+            aux_lr=aux_lr,
+            weight_decay=weight_decay,
+            momentum=momentum,
+            ns_steps=ns_steps,
+            chunk_rescale=chunk_rescale,
+            adjust_lr_fn="match_rms_adamw",
+        )
+        self.muon_params = sum(p.numel() for spec in specs for p in spec["params"])
+        self.aux_params = sum(p.numel() for p in aux_params)
+        self.chunked_params = sum(
+            p.numel()
+            for spec in specs
+            if int(spec["boomer_cmuon_chunks"]) > 1
+            for p in spec["params"]
+        )
+        self.chunked_matrices = sum(
+            len(spec["params"])
+            for spec in specs
+            if int(spec["boomer_cmuon_chunks"]) > 1
+        )
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        with torch.enable_grad():
+            loss = closure() if closure is not None else None
+        self._muon.step()
+        if self._aux is not None:
+            self._aux.step()
+        return loss
+
+    def state_dict(self) -> dict:
+        return {
+            "muon": self._muon.state_dict(),
+            "aux": self._aux.state_dict() if self._aux is not None else None,
+        }
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        self._muon.load_state_dict(state_dict["muon"])
+        if self._aux is not None and state_dict.get("aux") is not None:
+            self._aux.load_state_dict(state_dict["aux"])
+        self.param_groups = list(self._muon.param_groups)
+        if self._aux is not None:
+            self.param_groups.extend(self._aux.param_groups)
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics
+        return (
+            f"CMuonWithAuxAdamW(cmuon={self.muon_params / 1e6:.1f}M params, "
+            f"chunked={self.chunked_params / 1e6:.1f}M/{self.chunked_matrices} matrices, "
+            f"aux={self.aux_params / 1e6:.1f}M params)"
+        )
+
+
 def muon_state_bytes(model: torch.nn.Module,
                      exclude_prefixes: tuple[str, ...] = MUON_EXCLUDE_PREFIXES) -> int:
     """Persistent optimizer state for the Muon/AdamW split.
@@ -560,3 +852,13 @@ def muon_state_bytes(model: torch.nn.Module,
     """
     muon_params, aux_params = split_muon_parameters(model, exclude_prefixes)
     return 4 * sum(p.numel() for p in muon_params) + 8 * sum(p.numel() for p in aux_params)
+
+
+def cmuon_state_bytes(
+    model: torch.nn.Module,
+    exclude_prefixes: tuple[str, ...] = CMUON_EXCLUDE_PREFIXES,
+) -> int:
+    """Persistent state for the CMuon/Dion momentum + auxiliary AdamW split."""
+    groups, aux_params = split_cmuon_parameter_groups(model, exclude_prefixes)
+    cmuon_params = [param for group in groups for param in group["params"]]
+    return 4 * sum(p.numel() for p in cmuon_params) + 8 * sum(p.numel() for p in aux_params)

@@ -10,6 +10,8 @@ learning rates must survive a resume. Everything here is CPU-only and fast.
 from __future__ import annotations
 
 import copy
+import importlib.util
+import math
 
 import pytest
 import torch
@@ -320,6 +322,8 @@ def _hparams(**overrides):
         came_block_size=2048, came_min_8bit_size=16384,
         muon_lr=None, muon_aux_lr=None, muon_weight_decay=0.1,
         muon_momentum=0.95, muon_ns_steps=5, muon_adjust_lr_fn="match_rms_adamw",
+        cmuon_lr=None, cmuon_aux_lr=None, cmuon_weight_decay=0.0,
+        cmuon_momentum=0.95, cmuon_ns_steps=6, cmuon_chunk_rescale=True,
         warmup_steps=0, lr_scheduler="constant", min_lr_ratio=0.1, max_steps=100,
     )
     base.update(overrides)
@@ -746,3 +750,153 @@ def test_end_to_end_lightning_fit_with_muon():
     )
     assert not torch.equal(before, model.net[0].weight), "Muon group never moved"
     assert torch.isfinite(model.net[0].weight).all()
+
+
+# --- CMuon ---------------------------------------------------------------------
+
+
+def _cmuon_layout_model():
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.x_embedder = nn.Linear(8, 8, bias=False)
+            self.qkv = nn.Linear(8, 24, bias=False)
+            self.cross_attn = nn.Module()
+            self.cross_attn.kv_linear = nn.Linear(8, 16, bias=False)
+            self.mlp = nn.Module()
+            self.mlp.inverted_fc = nn.Sequential(nn.Linear(8, 16, bias=False), nn.SiLU())
+            self.mod = nn.Sequential(nn.SiLU(), nn.Linear(8, 48, bias=False))
+            self.proj = nn.Linear(8, 8, bias=False)
+            self.final_t_block = nn.Sequential(nn.SiLU(), nn.Linear(8, 16, bias=False))
+            self.scale_shift_table = nn.Parameter(torch.zeros(6, 8))
+
+    return Model()
+
+
+def test_cmuon_split_routes_semantic_fused_rows_and_keeps_final_head_aux():
+    from boomer.optim import split_cmuon_parameter_groups
+
+    model = _cmuon_layout_model()
+    groups, aux = split_cmuon_parameter_groups(model)
+    by_param = {
+        id(param): group.get("split_sizes")
+        for group in groups
+        for param in group["params"]
+    }
+
+    assert by_param[id(model.qkv.weight)] == (8, 8, 8)
+    assert by_param[id(model.cross_attn.kv_linear.weight)] == (8, 8)
+    assert by_param[id(model.mlp.inverted_fc[0].weight)] == (8, 8)
+    assert by_param[id(model.mod[1].weight)] == (8, 8, 8, 8, 8, 8)
+    assert by_param[id(model.proj.weight)] is None
+    aux_ids = {id(param) for param in aux}
+    assert id(model.x_embedder.weight) in aux_ids
+    assert id(model.final_t_block[1].weight) in aux_ids
+    assert id(model.scale_shift_table) in aux_ids
+
+
+def test_cmuon_split_unwraps_torch_compile_without_losing_exclusions():
+    from boomer.optim import split_cmuon_parameter_groups
+
+    eager = _cmuon_layout_model()
+    compiled = torch.compile(eager)
+    eager_groups, eager_aux = split_cmuon_parameter_groups(eager)
+    compiled_groups, compiled_aux = split_cmuon_parameter_groups(compiled)
+    assert {
+        (id(param), group.get("split_sizes"))
+        for group in eager_groups
+        for param in group["params"]
+    } == {
+        (id(param), group.get("split_sizes"))
+        for group in compiled_groups
+        for param in group["params"]
+    }
+    assert {id(p) for p in eager_aux} == {id(p) for p in compiled_aux}
+
+
+def test_cmuon_newton_schulz_is_batched_finite_and_shape_preserving():
+    from boomer.optim import _cmuon_newton_schulz
+
+    torch.manual_seed(0)
+    for shape in ((24, 8), (3, 8, 16)):
+        grad = torch.randn(*shape)
+        out = _cmuon_newton_schulz(grad, steps=6)
+        assert out.shape == grad.shape
+        assert out.dtype == torch.bfloat16
+        assert torch.isfinite(out).all()
+
+
+def _dion_available():
+    return importlib.util.find_spec("dion") is not None
+
+
+dion_required = pytest.mark.skipif(not _dion_available(), reason="CMuon needs Microsoft Dion")
+
+
+@dion_required
+def test_cmuon_wrapper_applies_paper_chunk_scaling_without_changing_decay():
+    from boomer.optim import CMuonWithAuxAdamW
+
+    opt = CMuonWithAuxAdamW(
+        _cmuon_layout_model(),
+        lr=1e-3,
+        aux_lr=2e-4,
+        weight_decay=0.1,
+        chunk_rescale=True,
+    )
+    for group in opt.param_groups:
+        if group["boomer_role"] == "aux":
+            assert float(group["lr"]) == pytest.approx(2e-4)
+            continue
+        chunks = group["boomer_cmuon_chunks"]
+        scale = math.sqrt(chunks) if chunks > 1 else 1.0
+        assert float(group["lr"]) == pytest.approx(1e-3 * scale)
+        # lr*wd must remain the requested decoupled-decay coefficient.
+        assert float(group["lr"]) * float(group["weight_decay"]) == pytest.approx(1e-4)
+
+
+@dion_required
+def test_cmuon_wrapper_steps_checkpoints_and_keeps_scheduler_groups_live():
+    from boomer.optim import CMuonWithAuxAdamW
+
+    torch.manual_seed(0)
+    model = _cmuon_layout_model()
+    opt = CMuonWithAuxAdamW(model, lr=1e-3, aux_lr=2e-4)
+    before = [p.detach().clone() for p in model.parameters()]
+    for p in model.parameters():
+        p.grad = torch.randn_like(p)
+    opt.step()
+    assert all(not torch.equal(old, new) for old, new in zip(before, model.parameters()))
+
+    snapshot = copy.deepcopy(opt.state_dict())
+    opt.load_state_dict(snapshot)
+    live_groups = opt._muon.param_groups + opt._aux.param_groups
+    assert all(a is b for a, b in zip(opt.param_groups, live_groups))
+
+    old_lrs = [float(g["lr"]) for g in opt.param_groups]
+    torch.optim.lr_scheduler.LambdaLR(opt, lambda _: 0.5)
+    assert [float(g["lr"]) for g in live_groups] == pytest.approx(
+        [lr * 0.5 for lr in old_lrs]
+    )
+
+
+@dion_required
+def test_configure_optimizers_builds_cmuon_and_resume_preserves_scaled_rates():
+    import train
+    from types import SimpleNamespace
+
+    lit = _TinyLit(_hparams(optimizer="cmuon", cmuon_lr=2e-4, cmuon_aux_lr=1e-4))
+    optim = train.BoomerLit.configure_optimizers(lit)["optimizer"]
+    from boomer.optim import CMuonWithAuxAdamW
+
+    assert isinstance(optim, CMuonWithAuxAdamW)
+    for group in optim.param_groups:
+        group["initial_lr"] = 999.0
+    sched = SimpleNamespace(base_lrs=[999.0] * len(optim.param_groups), optimizer=optim)
+    lit.trainer = SimpleNamespace(
+        optimizers=[optim], lr_scheduler_configs=[SimpleNamespace(scheduler=sched)]
+    )
+    train.BoomerLit.on_train_start(lit)
+    expected = [train.BoomerLit._cli_lr_for_group(lit, g) for g in optim.param_groups]
+    assert [g["initial_lr"] for g in optim.param_groups] == pytest.approx(expected)
+    assert sched.base_lrs == pytest.approx(expected)
