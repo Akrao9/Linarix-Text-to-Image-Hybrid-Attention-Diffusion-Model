@@ -47,7 +47,6 @@ AdamW recipes sit near 1e-4. `--lr` is NOT reused implicitly; see `--came-lr`.
 
 from __future__ import annotations
 
-import contextlib
 import functools
 import math
 from collections import defaultdict
@@ -57,6 +56,7 @@ import torch
 __all__ = [
     "CAME8Bit",
     "CMuonWithAuxAdamW",
+    "patch_dion_muon_kernels",
     "MuonWithAuxAdamW",
     "CMUON_EXCLUDE_PREFIXES",
     "MUON_EXCLUDE_PREFIXES",
@@ -672,39 +672,81 @@ class MuonWithAuxAdamW(torch.optim.Optimizer):
         )
 
 
-# Dion decorates `muon_update_post_orthogonalize` with @torch.compile(fullgraph=True),
-# and Dynamo guards on `len(U)` -- the number of tensors in one megabatch bucket. v8
-# produces far more than the default `recompile_limit` (8) distinct bucket sizes, and
-# under fullgraph=True exceeding the limit is a hard FailOnRecompileLimitHit that kills
-# the run at the first optimizer step rather than falling back to eager. Per-shape
-# specialisation is the CORRECT behaviour for an optimizer kernel, so raise the budget
-# -- but only around Dion's step, so the model's own compilation keeps the default and a
-# genuine runaway recompile in the 28 blocks still surfaces.
-CMUON_RECOMPILE_LIMIT = 256
+def _muon_update_post_orthogonalize_inplace(
+    X: list[torch.Tensor],
+    U: list[torch.Tensor],
+    base_lr,
+    adjusted_lr,
+    weight_decay,
+    cautious_wd: bool = False,
+) -> None:
+    """Dion's post-orthogonalize step, scaling U in place.
+
+    Identical to upstream except for the final scale. Upstream writes
+    ``U = torch._foreach_mul(U, adjusted_lr)``, which allocates a second copy of an
+    entire megabatch bucket -- the 583 MB request that failed on a full card.
+
+    The in-place form is safe because ``megabatch_orthogonalize_async`` returns views
+    into a freshly ``torch.stack``-ed tensor, so U cannot alias the momentum buffers.
+    Note that "U is not read again" would NOT be sufficient justification on its own:
+    ``muon_update_pre_orthogonalize`` sets ``U = M`` when nesterov is off, and its
+    following ``.to(dtype)`` is an identity no-op when M already has that dtype. It is
+    the stack copy, not the usage pattern, that makes this safe.
+    """
+    if cautious_wd:
+        coeff = base_lr * weight_decay
+        decay_masks = torch._foreach_mul(X, U)
+        decay_masks = torch._foreach_sign(decay_masks)
+        decay_masks = torch._foreach_add(decay_masks, 1)
+        decay_masks = torch._foreach_minimum(decay_masks, 1)
+        decay_terms = torch._foreach_mul(X, decay_masks)
+        decay_terms = torch._foreach_mul(decay_terms, coeff)
+        torch._foreach_sub_(X, decay_terms)
+    else:
+        torch._foreach_mul_(X, 1 - base_lr * weight_decay)
+
+    torch._foreach_mul_(U, adjusted_lr)
+    torch._foreach_sub_(X, U)
 
 
-@contextlib.contextmanager
-def _dynamo_recompile_budget(limit: int):
-    """Raise Dynamo's per-code-object recompile budget for the enclosed block."""
-    from torch._dynamo import config as dynamo_config
+def patch_dion_muon_kernels() -> dict[str, str]:
+    """Undo Dion's torch.compile on the two Muon helpers, and drop the U copy.
 
-    # torch renamed cache_size_limit -> recompile_limit and keeps both as aliases;
-    # patch whichever this build exposes.
-    overrides = {
-        name: limit
-        for name in ("recompile_limit", "cache_size_limit")
-        if hasattr(dynamo_config, name)
-    }
-    overrides.update({
-        name: max(limit * 4, getattr(dynamo_config, name))
-        for name in ("accumulated_recompile_limit", "accumulated_cache_size_limit")
-        if hasattr(dynamo_config, name)
-    })
-    if not overrides:  # pragma: no cover - depends on torch version
-        yield
-        return
-    with dynamo_config.patch(**overrides):
-        yield
+    Upstream decorates `muon_update_pre_orthogonalize` and
+    `muon_update_post_orthogonalize` with `@torch.compile(fullgraph=True)`. Dynamo
+    guards those on the list length -- the number of tensors in one megabatch bucket --
+    and v8 has far more than the default `recompile_limit` of 8 distinct bucket sizes.
+    Under fullgraph=True, exceeding the limit is a hard `FailOnRecompileLimitHit`: it
+    does NOT degrade to eager, so the run dies at the first optimizer step. Raising the
+    limit instead would only convert one crash into hundreds of compilations.
+
+    Both bodies are chains of `torch._foreach_*` calls, which are already fused
+    multi-tensor kernels. Running them eager costs approximately nothing and accepts
+    any list length without compiling.
+
+    Returns a summary of what changed, for the launch log.
+    """
+    from dion import muon as dion_muon
+
+    if getattr(dion_muon, "_boomer_patched", False):
+        return {}
+
+    changes: dict[str, str] = {}
+    for name in ("muon_update_pre_orthogonalize", "muon_update_post_orthogonalize"):
+        fn = getattr(dion_muon, name, None)
+        original = getattr(fn, "_torchdynamo_orig_callable", None)
+        if original is not None:
+            setattr(dion_muon, name, original)
+            changes[name] = "uncompiled"
+
+    # Replace the body only for the one whose allocation we also need to remove; it is
+    # looked up as a module global at the call site, so rebinding is sufficient.
+    dion_muon.muon_update_post_orthogonalize = _muon_update_post_orthogonalize_inplace
+    changes["muon_update_post_orthogonalize"] = (
+        "uncompiled + in-place scale" if changes else "in-place scale"
+    )
+    dion_muon._boomer_patched = True
+    return changes
 
 
 def _cmuon_newton_schulz(
@@ -777,6 +819,9 @@ class CMuonWithAuxAdamW(torch.optim.Optimizer):
                 "for a sibling clone run `pip install -e ../dion`. Dion2 is not a "
                 "substitute: split_sizes is currently implemented by dion.Muon."
             ) from exc
+
+        # Must happen before the Dion optimizer is built, and before any step.
+        self.dion_patches = patch_dion_muon_kernels()
 
         specs, aux_params = split_cmuon_parameter_groups(model, exclude_prefixes)
         if not specs:
@@ -856,8 +901,7 @@ class CMuonWithAuxAdamW(torch.optim.Optimizer):
     def step(self, closure=None):
         with torch.enable_grad():
             loss = closure() if closure is not None else None
-        with _dynamo_recompile_budget(CMUON_RECOMPILE_LIMIT):
-            self._muon.step()
+        self._muon.step()
         if self._aux is not None:
             self._aux.step()
         return loss

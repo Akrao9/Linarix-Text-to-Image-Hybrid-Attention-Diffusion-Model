@@ -984,6 +984,11 @@ class BoomerLit(pl.LightningModule):
                 f"{adamw_state_bytes(self.model) / gib:.2f} GiB for fp32 AdamW",
                 flush=True,
             )
+            if optim.dion_patches:
+                # Absence of this line on a fresh Colab means the patch did not apply
+                # and the run will die at the first optimizer step, as it did before.
+                shown = ", ".join(f"{k} ({v})" for k, v in sorted(optim.dion_patches.items()))
+                print(f"[optim] patched Dion kernels: {shown}", flush=True)
         else:
             optim = torch.optim.AdamW(
                 self.model.parameters(),

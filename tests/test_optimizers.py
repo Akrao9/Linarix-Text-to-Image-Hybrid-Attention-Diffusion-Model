@@ -922,41 +922,69 @@ def test_cmuon_newton_schulz_is_not_torch_compiled():
         assert torch.isfinite(out).all()
 
 
-def test_dynamo_recompile_budget_is_raised_only_inside_the_block():
-    """The model's own compilation must keep the default budget."""
-    from torch._dynamo import config as dynamo_config
+@dion_required
+def test_patch_removes_dion_compile_and_the_full_size_temporary():
+    """Dion ships both Muon helpers @torch.compile(fullgraph=True) and copies U."""
+    from dion import muon as dion_muon
 
-    from boomer.optim import CMUON_RECOMPILE_LIMIT, _dynamo_recompile_budget
+    from boomer.optim import patch_dion_muon_kernels
 
-    before = dynamo_config.recompile_limit
-    with _dynamo_recompile_budget(CMUON_RECOMPILE_LIMIT):
-        assert dynamo_config.recompile_limit == CMUON_RECOMPILE_LIMIT
-        assert dynamo_config.accumulated_recompile_limit >= CMUON_RECOMPILE_LIMIT
-    assert dynamo_config.recompile_limit == before
+    patch_dion_muon_kernels()
+    for name in ("muon_update_pre_orthogonalize", "muon_update_post_orthogonalize"):
+        fn = getattr(dion_muon, name)
+        assert not hasattr(fn, "_torchdynamo_orig_callable"), f"{name} still compiled"
+    assert patch_dion_muon_kernels() == {}, "patch must be idempotent"
 
 
 @dion_required
-def test_cmuon_step_runs_dion_under_the_raised_recompile_budget():
-    """Dion's own @torch.compile(fullgraph=True) helper must see the raised limit.
+def test_patched_post_orthogonalize_matches_upstream_numerically():
+    """Guards against upstream drift: same result, one fewer allocation."""
+    from boomer.optim import _muon_update_post_orthogonalize_inplace
 
-    Guarding on `len(U)` (megabatch bucket size), it exceeds the default limit of 8 on
-    v8 and raises FailOnRecompileLimitHit instead of falling back to eager. Assert the
-    budget is live *during* Dion's step rather than compiling many buckets for real.
-    """
-    from torch._dynamo import config as dynamo_config
+    torch.manual_seed(0)
+    for cautious in (False, True):
+        args = lambda: (  # noqa: E731
+            [torch.full((4, 6), 0.5), torch.full((3, 3), -0.25)],
+            [torch.arange(24.0).reshape(4, 6) / 24, torch.ones(3, 3) * 0.1],
+        )
+        base_lr, adj_lr, wd = 1e-3, 2e-3, 0.05
 
-    from boomer.optim import CMUON_RECOMPILE_LIMIT, CMuonWithAuxAdamW
+        # Upstream body, transcribed out-of-place.
+        X_ref, U_ref = args()
+        if cautious:
+            masks = torch._foreach_minimum(
+                torch._foreach_add(torch._foreach_sign(
+                    torch._foreach_mul(X_ref, U_ref)), 1), 1)
+            terms = torch._foreach_mul(torch._foreach_mul(X_ref, masks), base_lr * wd)
+            torch._foreach_sub_(X_ref, terms)
+        else:
+            torch._foreach_mul_(X_ref, 1 - base_lr * wd)
+        torch._foreach_sub_(X_ref, torch._foreach_mul(U_ref, adj_lr))
 
-    model = _split_model()
+        X_new, U_new = args()
+        _muon_update_post_orthogonalize_inplace(
+            X_new, U_new, base_lr, adj_lr, wd, cautious_wd=cautious
+        )
+        for ref, got in zip(X_ref, X_new):
+            torch.testing.assert_close(got, ref)
+
+
+@dion_required
+def test_patched_step_runs_more_shape_buckets_than_the_default_limit():
+    """The original crash: >8 distinct shapes through Dion, now uncompiled."""
+    from boomer.optim import CMuonWithAuxAdamW
+
+    class ManyShapes(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.blocks = nn.ModuleList(
+                [nn.Linear(8 + 2 * i, 16 + 4 * i, bias=False) for i in range(12)]
+            )
+
+    model = ManyShapes()
     opt = CMuonWithAuxAdamW(model, lr=1e-3, aux_lr=1e-4)
-    # Stand in for Dion's step: calling the real one would compile its helper, which
-    # is what this budget exists to permit -- and what we must not pay for in a unit
-    # test. The assertion is that the budget is live at the moment Dion is invoked.
-    seen = []
-    opt._muon.step = lambda *a, **k: seen.append(dynamo_config.recompile_limit)
     for param in model.parameters():
         param.grad = torch.randn_like(param)
-    opt.step()
-
-    assert seen == [CMUON_RECOMPILE_LIMIT]
-    assert dynamo_config.recompile_limit != CMUON_RECOMPILE_LIMIT
+    opt.step()  # must not raise FailOnRecompileLimitHit
+    for param in model.parameters():
+        assert torch.isfinite(param).all()
