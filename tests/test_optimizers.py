@@ -900,3 +900,63 @@ def test_configure_optimizers_builds_cmuon_and_resume_preserves_scaled_rates():
     expected = [train.BoomerLit._cli_lr_for_group(lit, g) for g in optim.param_groups]
     assert [g["initial_lr"] for g in optim.param_groups] == pytest.approx(expected)
     assert sched.base_lrs == pytest.approx(expected)
+
+
+def test_cmuon_newton_schulz_is_not_torch_compiled():
+    """Dynamo specialises on shape; v8 has more shapes than recompile_limit allows.
+
+    A `@torch.compile(fullgraph=True)` Newton-Schulz does not degrade to eager once the
+    limit is hit -- it raises FailOnRecompileLimitHit and kills the run at the first
+    optimizer step. Observed in Colab against the real 890M model.
+    """
+    from boomer.optim import _cmuon_newton_schulz
+
+    assert not hasattr(_cmuon_newton_schulz, "_torchdynamo_orig_callable")
+    assert _cmuon_newton_schulz.__module__ == "boomer.optim"
+
+    # Many distinct shapes in one process must all work.
+    for rows, cols in ((8, 16), (16, 8), (32, 16), (12, 12), (64, 32), (7, 5),
+                       (128, 64), (24, 48), (96, 96), (5, 11)):
+        out = _cmuon_newton_schulz(torch.randn(rows, cols), steps=6)
+        assert out.shape == (rows, cols)
+        assert torch.isfinite(out).all()
+
+
+def test_dynamo_recompile_budget_is_raised_only_inside_the_block():
+    """The model's own compilation must keep the default budget."""
+    from torch._dynamo import config as dynamo_config
+
+    from boomer.optim import CMUON_RECOMPILE_LIMIT, _dynamo_recompile_budget
+
+    before = dynamo_config.recompile_limit
+    with _dynamo_recompile_budget(CMUON_RECOMPILE_LIMIT):
+        assert dynamo_config.recompile_limit == CMUON_RECOMPILE_LIMIT
+        assert dynamo_config.accumulated_recompile_limit >= CMUON_RECOMPILE_LIMIT
+    assert dynamo_config.recompile_limit == before
+
+
+@dion_required
+def test_cmuon_step_runs_dion_under_the_raised_recompile_budget():
+    """Dion's own @torch.compile(fullgraph=True) helper must see the raised limit.
+
+    Guarding on `len(U)` (megabatch bucket size), it exceeds the default limit of 8 on
+    v8 and raises FailOnRecompileLimitHit instead of falling back to eager. Assert the
+    budget is live *during* Dion's step rather than compiling many buckets for real.
+    """
+    from torch._dynamo import config as dynamo_config
+
+    from boomer.optim import CMUON_RECOMPILE_LIMIT, CMuonWithAuxAdamW
+
+    model = _split_model()
+    opt = CMuonWithAuxAdamW(model, lr=1e-3, aux_lr=1e-4)
+    # Stand in for Dion's step: calling the real one would compile its helper, which
+    # is what this budget exists to permit -- and what we must not pay for in a unit
+    # test. The assertion is that the budget is live at the moment Dion is invoked.
+    seen = []
+    opt._muon.step = lambda *a, **k: seen.append(dynamo_config.recompile_limit)
+    for param in model.parameters():
+        param.grad = torch.randn_like(param)
+    opt.step()
+
+    assert seen == [CMUON_RECOMPILE_LIMIT]
+    assert dynamo_config.recompile_limit != CMUON_RECOMPILE_LIMIT

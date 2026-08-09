@@ -47,6 +47,7 @@ AdamW recipes sit near 1e-4. `--lr` is NOT reused implicitly; see `--came-lr`.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import math
 from collections import defaultdict
@@ -671,7 +672,41 @@ class MuonWithAuxAdamW(torch.optim.Optimizer):
         )
 
 
-@torch.compile(fullgraph=True)
+# Dion decorates `muon_update_post_orthogonalize` with @torch.compile(fullgraph=True),
+# and Dynamo guards on `len(U)` -- the number of tensors in one megabatch bucket. v8
+# produces far more than the default `recompile_limit` (8) distinct bucket sizes, and
+# under fullgraph=True exceeding the limit is a hard FailOnRecompileLimitHit that kills
+# the run at the first optimizer step rather than falling back to eager. Per-shape
+# specialisation is the CORRECT behaviour for an optimizer kernel, so raise the budget
+# -- but only around Dion's step, so the model's own compilation keeps the default and a
+# genuine runaway recompile in the 28 blocks still surfaces.
+CMUON_RECOMPILE_LIMIT = 256
+
+
+@contextlib.contextmanager
+def _dynamo_recompile_budget(limit: int):
+    """Raise Dynamo's per-code-object recompile budget for the enclosed block."""
+    from torch._dynamo import config as dynamo_config
+
+    # torch renamed cache_size_limit -> recompile_limit and keeps both as aliases;
+    # patch whichever this build exposes.
+    overrides = {
+        name: limit
+        for name in ("recompile_limit", "cache_size_limit")
+        if hasattr(dynamo_config, name)
+    }
+    overrides.update({
+        name: max(limit * 4, getattr(dynamo_config, name))
+        for name in ("accumulated_recompile_limit", "accumulated_cache_size_limit")
+        if hasattr(dynamo_config, name)
+    })
+    if not overrides:  # pragma: no cover - depends on torch version
+        yield
+        return
+    with dynamo_config.patch(**overrides):
+        yield
+
+
 def _cmuon_newton_schulz(
     grad: torch.Tensor,
     epsilon: float | torch.Tensor = 1e-7,
@@ -684,6 +719,12 @@ def _cmuon_newton_schulz(
     the CMuon DC-AE/DiT-XL result used six iterations of the fixed quintic map below.
     Supplying it as Dion's custom NS function makes the training recipe explicit and
     avoids silently benchmarking a different polar approximation.
+
+    Deliberately NOT torch.compile'd. Dynamo specialises on shape, and this runs once
+    per megabatch bucket -- v8 has far more than `recompile_limit` (8) distinct matrix
+    shapes, so a compiled `fullgraph=True` version does not degrade to eager: it raises
+    FailOnRecompileLimitHit and kills the run at the first optimizer step. The body is
+    six chained matmuls, so eager gives up cuBLAS-bound work only.
     """
     if grad.ndim not in (2, 3):
         raise ValueError(f"CMuon Newton-Schulz expects a 2D/3D tensor, got {grad.ndim}D")
@@ -815,7 +856,8 @@ class CMuonWithAuxAdamW(torch.optim.Optimizer):
     def step(self, closure=None):
         with torch.enable_grad():
             loss = closure() if closure is not None else None
-        self._muon.step()
+        with _dynamo_recompile_budget(CMUON_RECOMPILE_LIMIT):
+            self._muon.step()
         if self._aux is not None:
             self._aux.step()
         return loss
