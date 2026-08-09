@@ -203,7 +203,11 @@ class CAME8Bit(torch.optim.Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None):  # noqa: C901 - the algorithm is one linear sequence
-        loss = closure() if closure is not None else None
+        # Lightning's automatic-optimization closure owns forward + backward.  The
+        # optimizer update itself must stay under no_grad, but the closure must not:
+        # running it under this method's decorator silently disables autograd.
+        with torch.enable_grad():
+            loss = closure() if closure is not None else None
 
         for group in self.param_groups:
             beta_m, beta_v, beta_r = group["betas"]
@@ -381,13 +385,39 @@ MUON_EXCLUDE_PREFIXES: tuple[str, ...] = (
 def split_muon_parameters(
     model: torch.nn.Module, exclude_prefixes: tuple[str, ...] = MUON_EXCLUDE_PREFIXES
 ) -> tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
-    """Partition into (Muon-eligible 2D hidden weights, everything else)."""
+    """Partition into (Muon-eligible hidden Linear weights, everything else).
+
+    ``torch.compile`` wraps the real model in an ``OptimizedModule`` whose parameter
+    names are prefixed with ``_orig_mod.``.  Unwrap it before matching exclusions so a
+    compiled launch cannot silently send the latent/text embedders and output heads to
+    Muon.
+
+    Eligibility is intentionally based on module identity rather than merely
+    ``param.ndim == 2``.  Boomer has several learned two-dimensional *tables* (notably
+    adaLN ``scale_shift_table`` parameters); orthogonalising those as if they were
+    hidden-to-hidden matrices changes their meaning.  Muon receives only
+    ``nn.Linear.weight`` parameters outside the fixed-space embedder/head prefixes.
+    """
+    while hasattr(model, "_orig_mod"):
+        model = model._orig_mod
+
+    eligible_ids: set[int] = set()
+    for module_name, module in model.named_modules():
+        if not isinstance(module, torch.nn.Linear) or not module.weight.requires_grad:
+            continue
+        excluded = any(
+            module_name == prefix or module_name.startswith(f"{prefix}.")
+            for prefix in exclude_prefixes
+        )
+        if not excluded:
+            eligible_ids.add(id(module.weight))
+
     muon: list[torch.nn.Parameter] = []
     aux: list[torch.nn.Parameter] = []
-    for name, param in model.named_parameters():
+    for param in model.parameters():
         if not param.requires_grad:
             continue
-        if param.ndim == 2 and not name.startswith(exclude_prefixes):
+        if id(param) in eligible_ids:
             muon.append(param)
         else:
             aux.append(param)
@@ -485,7 +515,11 @@ class MuonWithAuxAdamW(torch.optim.Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None):
-        loss = closure() if closure is not None else None
+        # Optimizer closures (including Lightning's automatic-optimization closure)
+        # perform forward and backward, so explicitly re-enable autograd inside this
+        # otherwise no-grad update method.
+        with torch.enable_grad():
+            loss = closure() if closure is not None else None
         self._muon.step()
         if self._aux is not None:
             self._aux.step()
@@ -501,6 +535,13 @@ class MuonWithAuxAdamW(torch.optim.Optimizer):
         self._muon.load_state_dict(state_dict["muon"])
         if self._aux is not None and state_dict.get("aux") is not None:
             self._aux.load_state_dict(state_dict["aux"])
+        # Optimizer.load_state_dict replaces each sub-optimizer's param-group dicts.
+        # Rebind the wrapper to those NEW live objects; otherwise LambdaLR and
+        # BoomerLit.on_train_start mutate the stale pre-load groups while Muon/AdamW
+        # continue forever at the checkpoint's restored rates.
+        self.param_groups = list(self._muon.param_groups)
+        if self._aux is not None:
+            self.param_groups.extend(self._aux.param_groups)
 
     def __repr__(self) -> str:  # pragma: no cover - diagnostics
         return (

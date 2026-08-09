@@ -174,6 +174,24 @@ def test_step_is_finite_with_zero_and_tiny_gradients():
         assert torch.isfinite(layer.weight).all()
 
 
+def test_came_closure_runs_with_autograd_enabled():
+    """Lightning-style closures include backward and must escape step's no-grad scope."""
+    layer = nn.Linear(16, 16)
+    opt = CAME8Bit(layer.parameters(), lr=1e-3)
+    inputs, target = torch.randn(8, 16), torch.randn(8, 16)
+    before = layer.weight.detach().clone()
+
+    def closure():
+        opt.zero_grad()
+        loss = ((layer(inputs) - target) ** 2).mean()
+        loss.backward()
+        return loss
+
+    loss = opt.step(closure)
+    assert loss.requires_grad
+    assert not torch.equal(before, layer.weight)
+
+
 def test_weight_decay_shrinks_a_zero_gradient_parameter():
     layer = nn.Linear(256, 256, bias=False)
     with torch.no_grad():
@@ -429,6 +447,46 @@ def test_split_excludes_embeddings_and_heads():
         assert prefix in MUON_EXCLUDE_PREFIXES
 
 
+def test_split_is_identical_after_torch_compile():
+    """OptimizedModule prefixes names with ``_orig_mod.``; exclusions must survive."""
+    from boomer.optim import split_muon_parameters
+
+    class Named(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.x_embedder = nn.Linear(8, 16, bias=False)
+            self.blocks = nn.Linear(16, 16, bias=False)
+            self.out_proj = nn.Linear(16, 8, bias=False)
+
+        def forward(self, x):
+            return self.out_proj(self.blocks(self.x_embedder(x)))
+
+    eager = Named()
+    compiled = torch.compile(eager)
+    eager_muon, eager_aux = split_muon_parameters(eager)
+    compiled_muon, compiled_aux = split_muon_parameters(compiled)
+    assert {id(p) for p in compiled_muon} == {id(p) for p in eager_muon}
+    assert {id(p) for p in compiled_aux} == {id(p) for p in eager_aux}
+    assert eager_muon == [eager.blocks.weight]
+    assert set(eager_aux) == {eager.x_embedder.weight, eager.out_proj.weight}
+
+
+def test_split_keeps_two_dimensional_parameter_tables_on_adamw():
+    """Shape alone is insufficient: adaLN tables are not hidden weight matrices."""
+    from boomer.optim import split_muon_parameters
+
+    class WithTable(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale_shift_table = nn.Parameter(torch.zeros(6, 32))
+            self.proj = nn.Linear(32, 32, bias=False)
+
+    model = WithTable()
+    muon, aux = split_muon_parameters(model)
+    assert muon == [model.proj.weight]
+    assert model.scale_shift_table in aux
+
+
 @muon_required
 def test_torch_muon_rejects_non_2d_which_is_why_the_split_exists():
     with pytest.raises(ValueError, match="2D"):
@@ -491,6 +549,27 @@ def test_hybrid_steps_every_parameter():
 
 
 @muon_required
+def test_hybrid_closure_runs_with_autograd_enabled():
+    """The wrapper must support the closure protocol used by Lightning."""
+    from boomer.optim import MuonWithAuxAdamW
+
+    model = nn.Sequential(nn.Linear(16, 16), nn.LayerNorm(16))
+    opt = MuonWithAuxAdamW(model, lr=1e-2, aux_lr=1e-3)
+    inputs, target = torch.randn(8, 16), torch.randn(8, 16)
+    before = model[0].weight.detach().clone()
+
+    def closure():
+        opt.zero_grad()
+        loss = ((model(inputs) - target) ** 2).mean()
+        loss.backward()
+        return loss
+
+    loss = opt.step(closure)
+    assert loss.requires_grad
+    assert not torch.equal(before, model[0].weight)
+
+
+@muon_required
 def test_hybrid_converges_on_a_quadratic():
     from boomer.optim import MuonWithAuxAdamW
 
@@ -536,6 +615,27 @@ def test_hybrid_state_dict_round_trips():
 
     for a, b in zip(run(None), run(4)):
         assert torch.equal(a, b)
+
+
+@muon_required
+def test_hybrid_resume_keeps_scheduler_groups_live():
+    """Loading replaces suboptimizer group dicts; the wrapper must follow them."""
+    from boomer.optim import MuonWithAuxAdamW
+
+    model = _split_model()
+    opt = MuonWithAuxAdamW(model, lr=1e-3, aux_lr=1e-4)
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda step: 1.0 / (step + 1))
+    snapshot = copy.deepcopy(opt.state_dict())
+    opt.load_state_dict(snapshot)
+
+    assert opt.param_groups[0] is opt._muon.param_groups[0]
+    assert opt.param_groups[1] is opt._aux.param_groups[0]
+    for p in model.parameters():
+        p.grad = torch.randn_like(p)
+    opt.step()
+    sched.step()
+    assert opt._muon.param_groups[0]["lr"] == pytest.approx(5e-4)
+    assert opt._aux.param_groups[0]["lr"] == pytest.approx(5e-5)
 
 
 @muon_required

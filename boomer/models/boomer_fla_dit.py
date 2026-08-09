@@ -906,15 +906,18 @@ class SanaMultiHeadCrossAttention(nn.Module):
         key_padding_mask: torch.Tensor | None,
         attn_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        # Inductor may choose a non-unit last-dimension stride for the norm/projection
+        # producer.  Constrain the layout before SDPA exactly as the joint and decoder
+        # sites do; in eager these calls are no-ops.
+        q = _sdpa_ready(q.transpose(1, 2))
+        k = _sdpa_ready(k.transpose(1, 2))
+        v = _sdpa_ready(v.transpose(1, 2))
         attn_mask = attn_bias
         if attn_mask is None and key_padding_mask is not None:
             # Bool SDPA mask (True = attend): dispatches to fused kernels more readily
             # than a dense additive float bias and skips the masked_fill materialization.
             attn_mask = (~key_padding_mask.bool())[:, None, None, :]
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
+        out = cross_sdpa(q, k, v, attn_mask)
         return out.transpose(1, 2)
 
     def forward(
@@ -1361,6 +1364,7 @@ def _flash4_varlen_joint(
 
 
 _JOINT_SDPA_BACKEND: str | None = None
+_CROSS_SDPA_BACKEND: str | None = None
 
 
 def joint_sdpa_backend() -> str | None:
@@ -1369,6 +1373,67 @@ def joint_sdpa_backend() -> str | None:
     so both a silent fall back from flash4 and a fall back to the `math` kernel are
     visible rather than inferred."""
     return _JOINT_SDPA_BACKEND
+
+
+def cross_sdpa_backend() -> str | None:
+    """Which backend the ordinary image-to-text cross-attention sites used."""
+    return _CROSS_SDPA_BACKEND
+
+
+def _explicit_sdpa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attn_mask: torch.Tensor | None,
+    *,
+    cached_backend: str | None,
+    site: str,
+) -> tuple[torch.Tensor, str]:
+    """Run SDPA through an observed, recoverable backend selection.
+
+    Backend support is shape/dtype/device dependent.  A cached choice is therefore an
+    optimization, not an invariant: retry the remaining candidates if it stops working
+    rather than crashing a later resolution or dtype in the same process.
+    """
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+    except ImportError:  # older torch: implicit dispatch only
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask), "implicit"
+
+    candidates = [] if attn_mask is not None else [("flash", SDPBackend.FLASH_ATTENTION)]
+    candidates += [("efficient", SDPBackend.EFFICIENT_ATTENTION), ("math", SDPBackend.MATH)]
+    by_name = dict(candidates)
+    if cached_backend in by_name:
+        try:
+            with sdpa_kernel(by_name[cached_backend]):
+                return (
+                    F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask),
+                    cached_backend,
+                )
+        except (RuntimeError, NotImplementedError):
+            # The previous shape worked but this one does not. Re-probe below.
+            pass
+
+    for name, backend in candidates:
+        if name == cached_backend:
+            continue
+        try:
+            with sdpa_kernel(backend):
+                out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        except (RuntimeError, NotImplementedError):
+            continue
+        if name == "math":
+            import warnings
+
+            warnings.warn(
+                f"{site} attention fell back to the SDPA math backend: it materializes "
+                f"[B, heads, {q.shape[-2]}, {k.shape[-2]}] and retains it for backward. "
+                "Expect a large memory increase.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+        return out, name
+    raise RuntimeError(f"no usable SDPA backend for {site} attention")
 
 
 def joint_sdpa(
@@ -1391,40 +1456,27 @@ def joint_sdpa(
     global _JOINT_SDPA_BACKEND
     if not q.is_cuda:
         return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-    try:
-        from torch.nn.attention import SDPBackend, sdpa_kernel
-    except ImportError:  # older torch: implicit dispatch only
-        if _JOINT_SDPA_BACKEND is None:
-            _JOINT_SDPA_BACKEND = "implicit"
+    cached = None if _JOINT_SDPA_BACKEND == "flash4-varlen" else _JOINT_SDPA_BACKEND
+    out, _JOINT_SDPA_BACKEND = _explicit_sdpa(
+        q, k, v, attn_mask, cached_backend=cached, site="joint"
+    )
+    return out
+
+
+def cross_sdpa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attn_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Explicit, observable SDPA dispatch for the 14 image-to-text sites."""
+    global _CROSS_SDPA_BACKEND
+    if not q.is_cuda:
         return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-
-    # Flash takes no arbitrary attn_mask, so it is only a candidate when unmasked.
-    candidates = [] if attn_mask is not None else [("flash", SDPBackend.FLASH_ATTENTION)]
-    candidates += [("efficient", SDPBackend.EFFICIENT_ATTENTION), ("math", SDPBackend.MATH)]
-    if _JOINT_SDPA_BACKEND is not None and _JOINT_SDPA_BACKEND != "flash4-varlen":
-        chosen = dict(candidates).get(_JOINT_SDPA_BACKEND)
-        if chosen is not None:
-            with sdpa_kernel(chosen):
-                return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-    for name, backend in candidates:
-        try:
-            with sdpa_kernel(backend):
-                out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-        except (RuntimeError, NotImplementedError):
-            continue
-        _JOINT_SDPA_BACKEND = name
-        if name == "math":
-            import warnings
-
-            warnings.warn(
-                "joint attention fell back to the SDPA math backend: it materializes "
-                f"[B, heads, {q.shape[-2]}, {q.shape[-2]}] and retains it for backward. "
-                "Expect a large memory increase.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        return out
-    raise RuntimeError("no usable SDPA backend for joint attention")
+    out, _CROSS_SDPA_BACKEND = _explicit_sdpa(
+        q, k, v, attn_mask, cached_backend=_CROSS_SDPA_BACKEND, site="cross"
+    )
+    return out
 
 
 class JointTextImageAttentionMixin:

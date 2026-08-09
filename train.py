@@ -112,6 +112,7 @@ from boomer.models.qwen_connector import (  # noqa: E402
 )
 from boomer.models.boomer_fla_dit import (  # noqa: E402
     BoomerFLADiTConfig,
+    cross_sdpa_backend,
     joint_sdpa_backend,
     migrate_glumbconv_state_dict,
 )
@@ -230,6 +231,7 @@ class BoomerLit(pl.LightningModule):
         # step would collect weights and submit all 116 scalars once per microbatch.
         self._attnres_collected_at = -1
         self._joint_backend_logged = False
+        self._cross_backend_logged = False
         if hp.get("compile"):
             self.model = torch.compile(self.model, mode=hp.get("compile_mode", "default"))
 
@@ -694,15 +696,6 @@ class BoomerLit(pl.LightningModule):
         if sched is not None:
             self.log("train/lr", sched.get_last_lr()[0], on_step=True, on_epoch=False, batch_size=bs)
         self.log("train/sigma_mean", t.float().mean(), on_step=True, on_epoch=False, batch_size=bs)
-        if torch.cuda.is_available():
-            # Peak allocated since the last reset, in GB. The headroom this reports is
-            # what decides batch size: --compile fuses each block's pointwise chains
-            # (modulate / SiLU / GLU / gates / sandwich norms) so their intermediates are
-            # never materialized for backward, which is worth more here than its speed.
-            self.log("train/vram_peak_gb", torch.cuda.max_memory_allocated() / 1e9,
-                     on_step=True, on_epoch=False, batch_size=bs)
-            self.log("train/vram_reserved_gb", torch.cuda.memory_reserved() / 1e9,
-                     on_step=True, on_epoch=False, batch_size=bs)
         self._log_sigma_buckets(t, raw_per_sample, bs)
         if hp.t_sampler_final:
             self.log("train/t_polish", float(polish), on_step=True, on_epoch=False, batch_size=bs)
@@ -719,6 +712,11 @@ class BoomerLit(pl.LightningModule):
             if backend is not None:
                 self._joint_backend_logged = True
                 print(f"[attn] joint attention SDPA backend: {backend}", flush=True)
+        if not self._cross_backend_logged:
+            backend = cross_sdpa_backend()
+            if backend is not None:
+                self._cross_backend_logged = True
+                print(f"[attn] cross attention SDPA backend: {backend}", flush=True)
 
         # v8 Block AttnRes telemetry: mean depth-attention weight per (site, slot). Sites
         # 0..encoder_depth-1 are per-block retrievals; the last site is the final z
@@ -779,6 +777,45 @@ class BoomerLit(pl.LightningModule):
 
         self.log("train/total_loss", loss, prog_bar=True, on_step=True, on_epoch=False, batch_size=bs)
         return loss
+
+    def on_train_batch_start(self, batch, batch_idx: int) -> None:
+        """Open a fresh CUDA peak window for this complete dataloader batch."""
+        del batch, batch_idx
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
+    def on_train_batch_end(self, outputs, batch, batch_idx: int) -> None:
+        """Log after automatic backward/optimizer/callback work, not mid-forward.
+
+        Lightning calls this hook after the batch's automatic optimization path.  The
+        paired reset in ``on_train_batch_start`` makes these genuine per-batch peaks;
+        ``max_memory_reserved`` is used rather than the current allocator reservation.
+        On an accumulation boundary the window also includes optimizer and EMA work.
+        """
+        del outputs, batch_idx
+        if not torch.cuda.is_available():
+            return
+        batch_size = 1
+        if isinstance(batch, dict):
+            batch_size = next(
+                (int(value.shape[0]) for value in batch.values()
+                 if isinstance(value, torch.Tensor) and value.ndim > 0),
+                1,
+            )
+        self.log(
+            "train/vram_peak_gb",
+            torch.cuda.max_memory_allocated() / 1e9,
+            on_step=True,
+            on_epoch=False,
+            batch_size=batch_size,
+        )
+        self.log(
+            "train/vram_reserved_peak_gb",
+            torch.cuda.max_memory_reserved() / 1e9,
+            on_step=True,
+            on_epoch=False,
+            batch_size=batch_size,
+        )
 
     def on_train_start(self) -> None:
         # Let the CLI --lr win over restored state, the way --flow-shift already does.

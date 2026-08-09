@@ -239,9 +239,19 @@ def test_cache_rejects_a_schedule_without_step_zero():
         EncoderStateCache(refresh_steps=[1, 4, 7])
 
 
-def test_uniform_schedule_matches_the_stride_cache():
+def test_uniform_schedule_matches_the_stride_cache_when_divisible():
     cache = EncoderStateCache(reuse_steps=5)
     assert uniform_schedule(20, 4) == [i for i in range(20) if cache.refresh_at(i)]
+
+
+def test_uniform_schedule_spans_the_trajectory_when_not_divisible():
+    assert uniform_schedule(10, 6) == [0, 1, 3, 5, 6, 8]
+
+
+@pytest.mark.parametrize("steps,budget", [(0, 1), (10, 0), (10, 11)])
+def test_uniform_schedule_rejects_invalid_budgets(steps, budget):
+    with pytest.raises(ValueError):
+        uniform_schedule(steps, budget)
 
 
 # --- end to end through the sampler --------------------------------------------

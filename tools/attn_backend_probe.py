@@ -28,6 +28,8 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from boomer.models.boomer_fla_dit import (  # noqa: E402
+    cross_sdpa,
+    cross_sdpa_backend,
     maybe_add_sibling_flash_attention_repo,
 )
 
@@ -107,6 +109,36 @@ def probe_decoder_site(backends: dict) -> None:
             print(f"  {name:<15} {_bench(run):7.2f} ms (fwd+bwd), max|Δ| vs sdpa {err:.4f}")
         except Exception as exc:
             print(f"  {name:<15} FAILED on this device — {type(exc).__name__}: {exc}")
+
+
+def probe_cross_site() -> None:
+    """The production image-query/text-key shape used by 14 encoder blocks."""
+    print(f"\n=== cross attention: B={B} Q={IMAGE_TOKENS} K={TEXT_TOKENS} "
+          f"H={HEADS} D={HEAD_DIM}, padded-text mask ===")
+    torch.manual_seed(0)
+    text_len = torch.randint(20, TEXT_TOKENS + 1, (B,), device="cuda")
+    q = torch.randn(B, HEADS, IMAGE_TOKENS, HEAD_DIM, device="cuda",
+                    dtype=DTYPE, requires_grad=True)
+    k, v = (
+        torch.randn(B, HEADS, TEXT_TOKENS, HEAD_DIM, device="cuda",
+                    dtype=DTYPE, requires_grad=True)
+        for _ in range(2)
+    )
+    positions = torch.arange(TEXT_TOKENS, device="cuda")[None, :]
+    mask = (positions < text_len[:, None])[:, None, None, :]
+
+    ref = F.scaled_dot_product_attention(q, k, v, attn_mask=mask).detach()
+    out = cross_sdpa(q, k, v, mask)
+    err = (out.detach().float() - ref.float()).abs().max().item()
+    out.sum().backward()
+
+    def run():
+        result = cross_sdpa(q, k, v, mask)
+        result.sum().backward()
+        return result
+
+    print(f"  explicit SDPA    {_bench(run):7.2f} ms (fwd+bwd), "
+          f"backend={cross_sdpa_backend()}, max|Δ| {err:.4f}")
 
 
 def probe_joint_site(backends: dict) -> None:
@@ -268,6 +300,7 @@ def main() -> None:
         status = backends.get(name)
         print(f"  {name}: {'imported' if callable(status) else status}")
     probe_decoder_site(backends)
+    probe_cross_site()
     probe_joint_site(backends)
     probe_joint_packed(backends)
     print("\nIf a backend FAILED or DIVERGES here, do not route the model through it.")

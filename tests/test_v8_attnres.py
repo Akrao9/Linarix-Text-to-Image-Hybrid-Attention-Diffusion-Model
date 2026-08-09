@@ -556,6 +556,43 @@ def test_joint_sdpa_matches_plain_sdpa_on_cpu() -> None:
     assert torch.equal(joint_sdpa(q, k, v, mask), ref)
 
 
+def test_cross_sdpa_matches_plain_sdpa_on_cpu() -> None:
+    from boomer.models.boomer_fla_dit import cross_sdpa
+
+    q = torch.randn(2, 4, 12, 32)
+    k, v = (torch.randn(2, 4, 17, 32) for _ in range(2))
+    mask = torch.rand(2, 1, 1, 17) > 0.3
+    mask[..., 0] = True
+    ref = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+    assert torch.equal(cross_sdpa(q, k, v, mask), ref)
+
+
+def test_sdpa_layout_helper_repairs_noncontiguous_last_dimension() -> None:
+    from boomer.models.boomer_fla_dit import _sdpa_ready
+
+    source = torch.randn(2, 3, 5, 14)
+    view = source[..., ::2]
+    assert view.stride(-1) != 1
+    ready = _sdpa_ready(view)
+    assert ready.stride(-1) == 1
+    assert torch.equal(ready, view)
+
+
+def test_cached_backend_failure_reprobes_instead_of_crashing() -> None:
+    """Efficient SDPA is unavailable on CPU, so it is a deterministic stale cache."""
+    from boomer.models.boomer_fla_dit import _explicit_sdpa
+
+    q, k, v = (torch.randn(2, 4, 8, 16) for _ in range(3))
+    mask = torch.ones(2, 1, 1, 8, dtype=torch.bool)
+    with pytest.warns(RuntimeWarning, match="math backend"):
+        out, backend = _explicit_sdpa(
+            q, k, v, mask, cached_backend="efficient", site="test"
+        )
+    ref = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+    assert backend == "math"
+    torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-6)
+
+
 # --- image-first joint sequence + flash4 varlen ------------------------------------
 
 

@@ -317,3 +317,31 @@ def test_optimizer_moments_reshaped_to_current_params() -> None:
     assert state[0]["exp_avg"].shape == (4, 8)
     assert state[0]["exp_avg_sq"].shape == (4, 8)
     assert state[1]["exp_avg"].shape == (2, 4)  # untouched
+
+
+def test_vram_telemetry_resets_then_logs_complete_batch_peaks(monkeypatch) -> None:
+    """Peak stats belong in batch hooks, not inside training_step before backward."""
+    import train
+
+    calls: list[tuple] = []
+
+    class FakeModule:
+        def log(self, name, value, **kwargs):
+            calls.append((name, value, kwargs))
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda: calls.append(("reset",)))
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda: 7_000_000_000)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda: 9_000_000_000)
+
+    fake = FakeModule()
+    train.BoomerLit.on_train_batch_start(fake, {"latents": torch.zeros(3, 1)}, 0)
+    train.BoomerLit.on_train_batch_end(
+        fake, None, {"latents": torch.zeros(3, 1)}, 0
+    )
+
+    assert calls[0] == ("reset",)
+    logged = {name: (value, kwargs) for name, value, kwargs in calls[1:]}
+    assert logged["train/vram_peak_gb"][0] == 7.0
+    assert logged["train/vram_reserved_peak_gb"][0] == 9.0
+    assert logged["train/vram_peak_gb"][1]["batch_size"] == 3

@@ -46,11 +46,20 @@ __all__ = [
 
 
 def uniform_schedule(steps: int, num_recompute: int) -> list[int]:
-    """The fixed-stride schedule, as a baseline to compare a solved one against."""
-    if num_recompute < 1:
-        raise ValueError(f"num_recompute must be >= 1, got {num_recompute}")
-    stride = max(1, steps // num_recompute)
-    return [i for i in range(steps) if i % stride == 0][:num_recompute]
+    """An evenly spaced, exact-budget baseline for the solved schedule.
+
+    Integer ``steps // num_recompute`` followed by truncation front-loads the points
+    whenever the division is not exact (10 steps / 6 recomputes became 0..5).  Taking
+    the floor of each ideal fractional boundary spreads the same exact budget across
+    the complete trajectory.
+    """
+    if steps < 1:
+        raise ValueError(f"steps must be >= 1, got {steps}")
+    if not 1 <= num_recompute <= steps:
+        raise ValueError(
+            f"num_recompute must be in [1, {steps}], got {num_recompute}"
+        )
+    return [index * steps // num_recompute for index in range(num_recompute)]
 
 
 def state_similarity(states: list[torch.Tensor]) -> torch.Tensor:
