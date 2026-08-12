@@ -389,3 +389,30 @@ def test_ddt_decoder_honours_image_rope_theta() -> None:
     assert not torch.allclose(default, changed), (
         "--image-rope-theta does not reach the DDT decoder"
     )
+
+
+def test_sampler_recovers_multi_layer_qwen_readout_from_the_checkpoint() -> None:
+    """v8 concatenates 3 Qwen layers; sampling single-layer builds a 1/3-width tensor."""
+    import argparse
+
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "sample_latent_dit", ROOT / "tools" / "sample_latent_dit.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    ckpt = {"train_args": {"text_encoder_layers": "9,18,27"}}
+    args = argparse.Namespace(text_encoder_layers=None)
+    assert module.readout_layers_from_checkpoint(args, ckpt) == (9, 18, 27)
+
+    # An explicit flag wins over the recorded value.
+    args = argparse.Namespace(text_encoder_layers="4,8")
+    assert module.readout_layers_from_checkpoint(args, ckpt) == (4, 8)
+
+    # Single-layer checkpoints stay on the last hidden state.
+    args = argparse.Namespace(text_encoder_layers=None)
+    assert module.readout_layers_from_checkpoint(args, {"train_args": {}}) is None
+    assert module.readout_layers_from_checkpoint(
+        args, {"train_args": {"text_encoder_layers": ""}}
+    ) is None

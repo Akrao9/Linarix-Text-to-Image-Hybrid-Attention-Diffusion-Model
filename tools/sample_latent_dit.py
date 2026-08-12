@@ -81,7 +81,31 @@ def load_condition_from_cache(cache_path: str | Path) -> tuple[torch.Tensor, tor
     return record.text_embedding.unsqueeze(0), record.attention_mask.unsqueeze(0), record.caption
 
 
-def load_condition_from_prompt(args: argparse.Namespace, cache_config: CacheConfig) -> tuple[torch.Tensor, torch.Tensor, str]:
+def readout_layers_from_checkpoint(
+    args: argparse.Namespace, checkpoint: dict
+) -> tuple[int, ...] | None:
+    """v8 reads SEVERAL Qwen layers and concatenates them, tripling text_dim.
+
+    Sampling with the single-layer default silently builds a 2560-wide conditioning
+    tensor for a caption_embedder trained on 7680, which surfaces as an opaque matmul
+    shape error deep in the forward. Recover the training value from the checkpoint.
+    """
+    if args.text_encoder_layers is not None:
+        raw = args.text_encoder_layers
+    else:
+        raw = (checkpoint.get("train_args") or {}).get("text_encoder_layers")
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None
+    if isinstance(raw, str):
+        return tuple(int(part) for part in raw.replace(",", " ").split())
+    return tuple(int(part) for part in raw)
+
+
+def load_condition_from_prompt(
+    args: argparse.Namespace,
+    cache_config: CacheConfig,
+    readout_layers: tuple[int, ...] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, str]:
     if not args.prompt:
         raise ValueError("Provide either --condition-cache or --prompt.")
     hf_token = hf_token_value(args.hf_token)
@@ -89,6 +113,7 @@ def load_condition_from_prompt(args: argparse.Namespace, cache_config: CacheConf
         qwen_config = QwenConnectorConfig(
             qwen_model_id=cache_config.text_encoder_id,
             readout_layer=-1,
+            readout_layers=readout_layers,
             dtype=cache_config.dtype,
             instruction=QwenConnectorConfig.instruction,
             max_text_tokens=cache_config.max_length,
@@ -220,7 +245,11 @@ def main() -> None:
     parser.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--vae-id", default=CacheConfig.vae_id)
     parser.add_argument("--text-encoder-id", default=CacheConfig.text_encoder_id)
-    parser.add_argument("--max-length", type=int, default=CacheConfig.max_length)
+    parser.add_argument("--max-length", type=int, default=None,
+                        help="Text tokens. Defaults to the checkpoint's text_seq_len.")
+    parser.add_argument("--text-encoder-layers", default=None,
+                        help="Multi-layer Qwen readout, e.g. \"9,18,27\". Defaults to "
+                             "the value recorded in the checkpoint's train_args.")
     parser.add_argument(
         "--model-config-json",
         help="Model config JSON, or @path/to/config.json. Required for legacy Lightning "
@@ -271,15 +300,6 @@ def main() -> None:
 
     device = args.device if args.device != "cuda" or torch.cuda.is_available() else "cpu"
     dtype = resolve_dtype(args.dtype, device)
-    cache_config = CacheConfig(
-        vae_id=args.vae_id,
-        text_encoder_id=args.text_encoder_id,
-        max_length=args.max_length,
-        dtype=args.dtype,
-        device=device,
-        scaling_factor=args.scaling_factor,
-    )
-
     checkpoint = load_checkpoint(args.checkpoint)
     if override := model_config_override(args.model_config_json):
         checkpoint["config"] = override
@@ -287,6 +307,20 @@ def main() -> None:
         parser.error(
             "checkpoint has no embedded model config; pass --model-config-json @config.json"
         )
+
+    # Text length has to match what the DiT was trained on, and the checkpoint records
+    # it -- so default to that instead of CacheConfig's unrelated 340.
+    max_length = args.max_length or int(
+        (checkpoint.get("config") or {}).get("text_seq_len") or CacheConfig.max_length
+    )
+    cache_config = CacheConfig(
+        vae_id=args.vae_id,
+        text_encoder_id=args.text_encoder_id,
+        max_length=max_length,
+        dtype=args.dtype,
+        device=device,
+        scaling_factor=args.scaling_factor,
+    )
     model_config = config_from_checkpoint(checkpoint)
     flow_shift, y_norm, y_norm_scale_factor = condition_settings_from_args(args, checkpoint)
     if args.y_norm is not None or args.y_norm_scale_factor is not None:
@@ -309,7 +343,25 @@ def main() -> None:
     if args.condition_cache:
         text_embedding, attention_mask, caption = load_condition_from_cache(args.condition_cache)
     else:
-        text_embedding, attention_mask, caption = load_condition_from_prompt(args, cache_config)
+        readout_layers = readout_layers_from_checkpoint(args, checkpoint)
+        text_embedding, attention_mask, caption = load_condition_from_prompt(
+            args, cache_config, readout_layers
+        )
+        print(
+            f"[text] {cache_config.text_encoder_id} max_length={cache_config.max_length} "
+            f"layers={readout_layers or 'last'} -> dim {text_embedding.shape[-1]}",
+            flush=True,
+        )
+
+    # Catch a conditioning/architecture mismatch here, with the two numbers named, rather
+    # than as an opaque matmul error inside caption_embedder.
+    expected_dim = int((checkpoint.get("config") or {}).get("text_dim") or 0)
+    if expected_dim and text_embedding.shape[-1] != expected_dim:
+        parser.error(
+            f"text embedding is {text_embedding.shape[-1]}-dim but the checkpoint was "
+            f"trained on {expected_dim}. Pass --text-encoder-layers to match training "
+            f"(v8 multi-layer readout multiplies the width by the number of layers)."
+        )
 
     sampler_kwargs = dict(
         text_embedding=text_embedding,
