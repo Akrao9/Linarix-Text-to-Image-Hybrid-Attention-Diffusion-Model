@@ -3025,6 +3025,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sample-seed", type=int, default=0, help="Fixed seed so previews are comparable across steps.")
     p.add_argument("--sample-vae-id", default=CacheConfig.vae_id, help="DC-AE decoder id for previews.")
     p.add_argument("--sample-scaling-factor", type=float, default=CacheConfig.scaling_factor)
+    p.add_argument("--sample-flow-shift", type=float, default=None,
+                   help="Flow shift for the preview sampler. Defaults to --flow-shift, "
+                        "which is the TRAINING value -- MONET's reference trains at a low "
+                        "shift and samples at 5, so previews rendered at the training shift "
+                        "understate the model. Set this to your inference shift so the W&B "
+                        "previews match what tools/sample_latent_dit.py produces.")
     p.add_argument("--resume-weights-only", action="store_true",
                    help="With --resume, load model weights only; reset optimizer/scheduler/step.")
     p.add_argument("--compile", action="store_true",
@@ -3446,6 +3452,11 @@ def main() -> None:
     if args.ema_decay > 0.0:
         ema_cb = EMACallback(decay=args.ema_decay, update_every=args.ema_update_every)
         callbacks.append(ema_cb)
+    # Previews exist to show what the model can do, so they default to --flow-shift only
+    # for back-compat; --sample-flow-shift is how you render them at the inference shift.
+    sample_flow_shift = (
+        args.flow_shift if args.sample_flow_shift is None else args.sample_flow_shift
+    )
     if args.sample_every_steps > 0:
         callbacks.append(SamplePreviewCallback(
             every_n_steps=args.sample_every_steps,
@@ -3458,7 +3469,7 @@ def main() -> None:
             cfg_scale=args.sample_cfg_scale,
             cfg_rescale=args.sample_cfg_rescale,
             cfg_interval=(args.sample_cfg_interval_low, args.sample_cfg_interval_high),
-            flow_shift=args.flow_shift,
+            flow_shift=sample_flow_shift,
             latent_mean=args.latent_mean,
             latent_std=args.latent_std,
             seed=args.sample_seed,
@@ -3487,7 +3498,7 @@ def main() -> None:
             cfg_scale=args.sample_cfg_scale,
             cfg_rescale=args.sample_cfg_rescale,
             cfg_interval=(args.sample_cfg_interval_low, args.sample_cfg_interval_high),
-            flow_shift=args.flow_shift,
+            flow_shift=sample_flow_shift,
             latent_mean=args.latent_mean,
             latent_std=args.latent_std,
             seed=args.sample_seed,

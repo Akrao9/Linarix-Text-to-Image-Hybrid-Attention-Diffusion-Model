@@ -416,3 +416,32 @@ def test_sampler_recovers_multi_layer_qwen_readout_from_the_checkpoint() -> None
     assert module.readout_layers_from_checkpoint(
         args, {"train_args": {"text_encoder_layers": ""}}
     ) is None
+
+
+def test_preview_flow_shift_defaults_to_training_but_is_overridable() -> None:
+    """Previews rendered at the training shift understate the model.
+
+    BoomerLit itself must keep `flow_shift=args.flow_shift` -- that is the training
+    schedule. Only the two SamplePreviewCallback constructions take the resolved
+    sample shift, so scope the check to those blocks.
+    """
+    import inspect
+
+    import train
+
+    source = inspect.getsource(train.main)
+    blocks = source.split("SamplePreviewCallback(")[1:]
+    assert len(blocks) == 2, f"expected 2 preview callbacks, found {len(blocks)}"
+    for block in blocks:
+        construction = block[:block.index("))")]
+        assert "flow_shift=sample_flow_shift" in construction
+        assert "flow_shift=args.flow_shift" not in construction
+
+    # The training schedule is untouched.
+    assert "flow_shift=args.flow_shift" in source
+
+    parser = train.build_parser()
+    assert parser.parse_args(["--flow-shift", "1.5"]).sample_flow_shift is None
+    assert parser.parse_args(
+        ["--flow-shift", "1.5", "--sample-flow-shift", "5"]
+    ).sample_flow_shift == 5.0
