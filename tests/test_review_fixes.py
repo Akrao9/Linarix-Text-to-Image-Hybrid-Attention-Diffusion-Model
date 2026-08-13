@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import sys
 from pathlib import Path
 
@@ -395,7 +396,6 @@ def test_sampler_recovers_multi_layer_qwen_readout_from_the_checkpoint() -> None
     """v8 concatenates 3 Qwen layers; sampling single-layer builds a 1/3-width tensor."""
     import argparse
 
-    import importlib.util
     spec = importlib.util.spec_from_file_location(
         "sample_latent_dit", ROOT / "tools" / "sample_latent_dit.py"
     )
@@ -476,3 +476,25 @@ def test_preview_and_offline_samplers_agree_on_stork_derivative_order() -> None:
     for block in blocks:
         construction = block[:block.index("))")]
         assert "stork_derivative_order=args.sample_stork_derivative_order" in construction
+
+
+def test_stork_substep_defaults_follow_the_flow_matching_ablation() -> None:
+    """s=9, not 50/100.
+
+    Substeps are free in NFE terms but NOT in accuracy terms: the RKG loop
+    Taylor-extrapolates velocity from a single stored model_output, so error
+    accumulates with s. STORK's ablation finds 9 optimal for conditional flow matching;
+    the scheduler's 50 and the SANA example's INTRA_S=100 are general defaults.
+    """
+    import inspect
+
+    import train
+    from boomer.sampling import sample_latent
+
+    assert inspect.signature(sample_latent).parameters["stork_substeps"].default == 9
+    assert train.build_parser().parse_args([]).sample_stork_substeps == 9
+
+    # The offline tool builds its parser inline in main(), so read the source.
+    source = (ROOT / "tools" / "sample_latent_dit.py").read_text()
+    block = source[source.index('"--stork-substeps"'):]
+    assert "default=9," in block[:200], "offline sampler still defaults to the old value"

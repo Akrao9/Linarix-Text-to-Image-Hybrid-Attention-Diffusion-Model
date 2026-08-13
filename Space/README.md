@@ -4,7 +4,7 @@ emoji: 🎨
 colorFrom: indigo
 colorTo: purple
 sdk: gradio
-sdk_version: 6.19.0
+sdk_version: 6.20.0
 app_file: app.py
 python_version: 3.11
 pinned: false
@@ -14,8 +14,6 @@ models:
   - Akrao9/Linarix-v1
   - Qwen/Qwen3.5-2B
   - mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers
-preload_from_hub:
-  - Akrao9/Linarix-v1
 ---
 
 # Linarix-v1 — Text to Image Demo
@@ -29,8 +27,8 @@ Interactive demo for [Akrao9/Linarix-v1](https://huggingface.co/Akrao9/Linarix-v
 1. Create a new **Gradio** Space on Hugging Face.
 2. Upload the contents of this `Space/` folder (or point the Space repo here).
 3. In **Settings → Hardware**, select **ZeroGPU** (requires HF PRO for hosting). This allocates a shared **NVIDIA RTX Pro 6000 Blackwell** GPU (48 GB via `@spaces.GPU(size="large")`).
-4. **No secret is required** — Qwen3.5-2B is not gated. Optionally add an `HF_TOKEN` secret (Settings → Secrets) to lift anonymous download rate limits.
-5. Restart the Space after the first build (model + VAE + text encoder download can take a few minutes).
+4. **Required secret:** add `HF_TOKEN` (Settings → Secrets) with a token that can read gated `Akrao9/Linarix-v1`. Spaces `preload_from_hub` cannot auth gated/private repos, so the model is downloaded at runtime via `snapshot_download(token=...)`.
+5. Restart / Factory rebuild the Space after setting the secret (model + VAE + text encoder download can take a few minutes on first boot).
 
 ## Local test
 

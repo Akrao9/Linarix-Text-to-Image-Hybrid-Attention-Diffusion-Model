@@ -3023,7 +3023,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Which weights the preview samples: EMA shadow (default) or live training weights.")
     p.add_argument("--sample-steps", type=int, default=32, help="Inference steps per preview image.")
     p.add_argument("--sample-sampler", choices=["stork2", "stork4", "euler", "heun"], default="stork2")
-    p.add_argument("--sample-stork-substeps", type=int, default=5)
+    p.add_argument("--sample-stork-substeps", type=int, default=9,
+                   help="STORK intra-step RK micro-steps (STORKScheduler s). Not extra model forwards -- the loop Taylor-extrapolates velocity from ONE stored model_output, which is why more is not better: approximation error accumulates with s. The STORK paper's ablation finds s=9 optimal for conditional flow matching (beating 5, 14, 24, 54, 104). The scheduler's own 50 and the SANA example's INTRA_S=100 are general defaults, not the published flow-matching recipe.")
     p.add_argument("--sample-cfg-scale", type=float, default=4.0)
     p.add_argument("--sample-cfg-rescale", type=float, default=0.5)
     p.add_argument("--sample-cfg-interval-low", type=float, default=0.1)

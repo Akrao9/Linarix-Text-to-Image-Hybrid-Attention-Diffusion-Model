@@ -208,10 +208,9 @@ def main() -> None:
     parser.add_argument(
         "--stork-substeps",
         type=int,
-        default=50,
+        default=9,
         help=(
-            "STORK intra-step RK micro-steps (STORKScheduler s). "
-            "Not extra model forwards; internal integration per inference step. Default 50 matches STORKScheduler."
+            "STORK intra-step RK micro-steps (STORKScheduler s). Not extra model forwards -- the loop Taylor-extrapolates velocity from ONE stored model_output, which is why more is not better: approximation error accumulates with s. The STORK paper's ablation finds s=9 optimal for conditional flow matching (beating 5, 14, 24, 54, 104). The scheduler's own 50 and the SANA example's INTRA_S=100 are general defaults, not the published flow-matching recipe."
         ),
     )
     parser.add_argument("--cfg-scale", type=float, default=1.0, help="Classifier-free guidance scale. 1 disables CFG.")

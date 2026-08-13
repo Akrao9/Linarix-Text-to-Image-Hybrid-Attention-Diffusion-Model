@@ -62,10 +62,10 @@ EXAMPLE_PROMPTS: list[tuple[str, str]] = [
 
 
 def _hf_token() -> str | None:
-    """Return HF token from Space secrets if set; None otherwise.
+    """Return HF token from Space secrets / env if set; None otherwise.
 
-    Linarix-v1's text encoder (Qwen3.5-2B) is NOT gated, so a token is optional —
-    it is only used to lift anonymous rate limits / access private mirrors.
+    Linarix-v1 itself is gated, so Spaces must set an ``HF_TOKEN`` secret whose
+    owner can read ``Akrao9/Linarix-v1``. Qwen3.5-2B / DC-AE are public.
     """
     for key in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGING_HUB_TOKEN"):
         value = os.environ.get(key, "").strip()
@@ -75,6 +75,21 @@ def _hf_token() -> str | None:
 
 
 _hf = _hf_token()
+if not _hf:
+    raise RuntimeError(
+        f"{MODEL_ID} is gated. Add an HF_TOKEN Space secret "
+        "(Settings → Secrets) with read access to that repo, then restart."
+    )
+
+# Make the token available to every huggingface_hub / transformers / diffusers call.
+os.environ.setdefault("HF_TOKEN", _hf)
+os.environ.setdefault("HUGGING_FACE_HUB_TOKEN", _hf)
+try:
+    from huggingface_hub import login as _hf_login
+
+    _hf_login(token=_hf, add_to_git_credential=False)
+except Exception as exc:  # noqa: BLE001 — non-fatal; explicit token= still used below
+    print(f"Warning: huggingface_hub.login failed ({exc!r}); continuing with token= kwarg.", flush=True)
 
 print(f"Loading Linarix pipeline from {MODEL_ID} ...", flush=True)
 _model_dir = Path(
