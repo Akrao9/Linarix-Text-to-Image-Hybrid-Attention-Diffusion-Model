@@ -64,7 +64,9 @@ def main() -> None:
         dtype=args.dtype,
         instruction=QwenConnectorConfig.instruction,
         max_text_tokens=args.max_length,
-        pad_to_max_length=True,
+        # False to match training: encode_qwen_text_fixed zero-pads to max_length
+        # afterwards, so the saved cache keeps the same fixed shape either way.
+        pad_to_max_length=False,
     )
     encoder = QwenReferenceEncoder(qwen_config, hf_token=hf_token)
     encoder.load()

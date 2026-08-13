@@ -117,7 +117,12 @@ def load_condition_from_prompt(
             dtype=cache_config.dtype,
             instruction=QwenConnectorConfig.instruction,
             max_text_tokens=cache_config.max_length,
-            pad_to_max_length=True,
+            # Match training (train.py's resident encoder leaves this at the False
+            # default): pad to the batch's longest, then let encode_qwen_text_fixed
+            # zero-pad the tail to max_length. Forcing a static 320 would run Qwen over
+            # ~5x the tokens for a typical prompt, and would fill the masked tail with
+            # real pad-token states instead of the exact zeros the cached corpus carries.
+            pad_to_max_length=False,
         )
         encoder = QwenReferenceEncoder(qwen_config, hf_token=hf_token)
         encoder.load()
