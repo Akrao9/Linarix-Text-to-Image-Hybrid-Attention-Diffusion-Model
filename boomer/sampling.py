@@ -180,7 +180,11 @@ def sample_latent(
     cfg_rescale: float = 0.0,
     sampler: str = "stork2",
     flow_shift: float = 1.0,
-    stork_derivative_order: int = 2,
+    # 1, not 2: STORK's own SANA integration builds flow models as
+    # `flow_STORK-4-1st` (solver_order=4, derivative_order=1). The 2 that used to
+    # sit here was the scheduler's general-purpose default, and it silently made
+    # training previews disagree with tools/sample_latent_dit.py, which passes 1.
+    stork_derivative_order: int = 1,
     stork_substeps: int = 50,
     cfg_interval: tuple[float, float] = (0.0, 1.0),
     cond_input: torch.Tensor | None = None,

@@ -445,3 +445,34 @@ def test_preview_flow_shift_defaults_to_training_but_is_overridable() -> None:
     assert parser.parse_args(
         ["--flow-shift", "1.5", "--sample-flow-shift", "5"]
     ).sample_flow_shift == 5.0
+
+
+def test_preview_and_offline_samplers_agree_on_stork_derivative_order() -> None:
+    """Three call sites had two different values; previews silently got the wrong one.
+
+    STORK's own SANA integration builds flow models as `flow_STORK-4-1st`, i.e.
+    derivative_order=1. sampling.py defaulted to 2, the offline tool passed 1, and the
+    preview callback passed nothing -- so W&B previews used a different integrator than
+    the images the offline sampler produced from the same weights.
+    """
+    import inspect
+
+    import train
+    from boomer.sampling import sample_latent
+
+    assert inspect.signature(sample_latent).parameters[
+        "stork_derivative_order"
+    ].default == 1
+
+    parser = train.build_parser()
+    assert parser.parse_args([]).sample_stork_derivative_order == 1
+    assert parser.parse_args(
+        ["--sample-stork-derivative-order", "2"]
+    ).sample_stork_derivative_order == 2
+
+    source = inspect.getsource(train.main)
+    blocks = source.split("SamplePreviewCallback(")[1:]
+    assert len(blocks) == 2
+    for block in blocks:
+        construction = block[:block.index("))")]
+        assert "stork_derivative_order=args.sample_stork_derivative_order" in construction

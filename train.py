@@ -1538,6 +1538,7 @@ class SamplePreviewCallback(Callback):
         steps: int,
         sampler: str,
         stork_substeps: int,
+        stork_derivative_order: int = 1,
         cfg_scale: float,
         cfg_rescale: float,
         cfg_interval: tuple[float, float],
@@ -1565,6 +1566,7 @@ class SamplePreviewCallback(Callback):
         self.steps = steps
         self.sampler = sampler
         self.stork_substeps = stork_substeps
+        self.stork_derivative_order = stork_derivative_order
         self.cfg_scale = cfg_scale
         self.cfg_rescale = cfg_rescale
         self.cfg_interval = cfg_interval
@@ -1699,6 +1701,7 @@ class SamplePreviewCallback(Callback):
                         sampler=self.sampler,
                         flow_shift=self.flow_shift,
                         stork_substeps=self.stork_substeps,
+                        stork_derivative_order=self.stork_derivative_order,
                         cfg_interval=self.cfg_interval,
                     )
                 latent = denormalize_latent(latent.float(), self.latent_mean, self.latent_std)
@@ -1760,6 +1763,7 @@ class CondSamplePreviewCallback(Callback):
         steps: int,
         sampler: str,
         stork_substeps: int,
+        stork_derivative_order: int = 1,
         cfg_scale: float,
         cfg_rescale: float,
         cfg_interval: tuple[float, float],
@@ -1784,6 +1788,7 @@ class CondSamplePreviewCallback(Callback):
         self.steps = steps
         self.sampler = sampler
         self.stork_substeps = stork_substeps
+        self.stork_derivative_order = stork_derivative_order
         self.cfg_scale = cfg_scale
         self.cfg_rescale = cfg_rescale
         self.cfg_interval = cfg_interval
@@ -1950,6 +1955,7 @@ class CondSamplePreviewCallback(Callback):
                         sampler=self.sampler,
                         flow_shift=self.flow_shift,
                         stork_substeps=self.stork_substeps,
+                        stork_derivative_order=self.stork_derivative_order,
                         cfg_interval=self.cfg_interval,
                         cond_input=cond_all[i : i + 1],
                         image_cfg_scale=self.image_cfg_scale,
@@ -3025,6 +3031,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sample-seed", type=int, default=0, help="Fixed seed so previews are comparable across steps.")
     p.add_argument("--sample-vae-id", default=CacheConfig.vae_id, help="DC-AE decoder id for previews.")
     p.add_argument("--sample-scaling-factor", type=float, default=CacheConfig.scaling_factor)
+    p.add_argument("--sample-stork-derivative-order", type=int, default=1,
+                   choices=[1, 2, 3],
+                   help="Taylor order for the preview STORK sampler. 1 is what "
+                        "STORK's own flow-matching integration uses; previews "
+                        "previously inherited the scheduler's general default of 2.")
     p.add_argument("--sample-flow-shift", type=float, default=None,
                    help="Flow shift for the preview sampler. Defaults to --flow-shift, "
                         "which is the TRAINING value -- MONET's reference trains at a low "
@@ -3466,6 +3477,7 @@ def main() -> None:
             steps=args.sample_steps,
             sampler=args.sample_sampler,
             stork_substeps=args.sample_stork_substeps,
+            stork_derivative_order=args.sample_stork_derivative_order,
             cfg_scale=args.sample_cfg_scale,
             cfg_rescale=args.sample_cfg_rescale,
             cfg_interval=(args.sample_cfg_interval_low, args.sample_cfg_interval_high),
@@ -3495,6 +3507,7 @@ def main() -> None:
             steps=args.sample_steps,
             sampler=args.sample_sampler,
             stork_substeps=args.sample_stork_substeps,
+            stork_derivative_order=args.sample_stork_derivative_order,
             cfg_scale=args.sample_cfg_scale,
             cfg_rescale=args.sample_cfg_rescale,
             cfg_interval=(args.sample_cfg_interval_low, args.sample_cfg_interval_high),
