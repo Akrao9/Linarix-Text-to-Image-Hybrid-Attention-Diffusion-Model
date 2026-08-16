@@ -244,3 +244,110 @@ def test_dataset_validation() -> None:
         FineT2IStreamingDataset(short_prob=1.5)
     with pytest.raises(ValueError, match="data_dir_weights"):
         FineT2IStreamingDataset(data_dir="a,b", data_dir_weights="1")
+
+
+def _synthetic_tar(count: int = 3) -> bytes:
+    """A minimal WebDataset shard: one .jpg + one .json per sample."""
+    import io
+    import json
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        for i in range(count):
+            image = Image.new("RGB", (32, 32), color=(i * 10, 0, 0))
+            jpg = io.BytesIO()
+            image.save(jpg, format="JPEG")
+            payloads = (
+                (f"s{i}.jpg", jpg.getvalue()),
+                (f"s{i}.json", json.dumps({"prompt": f"cap {i}"}).encode()),
+            )
+            for name, blob in payloads:
+                info = tarfile.TarInfo(name)
+                info.size = len(blob)
+                tf.addfile(info, io.BytesIO(blob))
+    return buf.getvalue()
+
+
+def test_repo_shards_stream_through_hf_filesystem_not_a_curl_pipe() -> None:
+    """Repo-relative shards open via HfFileSystem range reads (monet-direct's
+    transport). The curl pipe bounded the WHOLE transfer with --max-time, so a
+    lazily-consumed 1024px shard was killed mid-read every time."""
+    import io
+
+    opened: list[str] = []
+    closed: list[bool] = []
+
+    class _Handle(io.BytesIO):
+        def close(self) -> None:
+            closed.append(True)
+            super().close()
+
+    class _FS:
+        def open(self, path: str, mode: str):
+            opened.append(path)
+            assert mode == "rb"
+            return _Handle(_synthetic_tar())
+
+    ds = FineT2IStreamingDataset(
+        repo_id="ma-xu/fine-t2i",
+        resolution=32,
+        shuffle_buffer=0,
+        caption_mode="short",
+        data_files=["curated/train-000092.tar"],
+    )
+    ds._fs = _FS()
+
+    records = [r for r in ds._iter_shard("curated/train-000092.tar") if r is not None]
+
+    assert len(records) == 3
+    assert {r.caption for r in records} == {f"cap {i}" for i in range(3)}
+    # fsspec path is datasets/<repo_id>/<path-in-repo>, as monet-direct builds it.
+    assert opened == ["datasets/ma-xu/fine-t2i/curated/train-000092.tar"]
+    assert closed, "shard handle must be closed when the generator finishes"
+
+
+def test_shard_url_never_embeds_the_bearer_token() -> None:
+    """webdataset puts the pipe command into every OSError it raises, so an
+    interpolated token is printed in plaintext on each shard error."""
+    ds = FineT2IStreamingDataset(
+        repo_id="ma-xu/fine-t2i",
+        hf_token="hf_TOTALLYSECRETVALUE",
+        resolution=32,
+    )
+    url = ds._shard_url("curated/train-000092.tar")
+
+    assert "hf_TOTALLYSECRETVALUE" not in url
+    assert "$BOOMER_HF_BEARER" in url
+    # --max-time is a ceiling on the entire transfer; it must not come back.
+    assert "--max-time" not in url
+    assert "--connect-timeout" in url and "--speed-time" in url
+
+
+def test_transient_error_drops_the_cached_filesystem() -> None:
+    """A dead HTTP client would otherwise fail every later shard identically."""
+    ds = FineT2IStreamingDataset(
+        repo_id="ma-xu/fine-t2i",
+        resolution=32,
+        shuffle_buffer=0,
+        data_files=["a.tar", "b.tar"],
+        stream_reconnect_max_retries=5,
+        stream_reconnect_backoff=0.0,
+    )
+    ds._fs = object()
+    seen: list[object] = []
+
+    def fake_iter(path: str):
+        seen.append(ds._fs)
+        raise OSError("Connection reset by peer")
+        yield  # pragma: no cover - generator marker
+
+    ds._iter_shard = fake_iter  # type: ignore[method-assign]
+
+    stream = ds._stream_files_forever(["a.tar", "b.tar"], seed_offset=0, tag="t")
+    with pytest.raises(RuntimeError, match="transient errors"):
+        for _ in range(50):
+            next(stream)
+
+    assert seen[0] is not None
+    assert seen[1] is None, "cached HfFileSystem must be dropped after a transient error"

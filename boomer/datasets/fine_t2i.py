@@ -289,6 +289,7 @@ class FineT2IStreamingDataset(IterableDataset):
     stream_reconnect_backoff: float = 5.0
     # Best-effort GC cadence for long-lived workers holding ~3 MB pixel records.
     memory_trim_every: int = 256
+    _fs: Any = field(init=False, repr=False, default=None)  # lazy HfFileSystem
     _caption_rng: random.Random = field(init=False, repr=False)
     _sources: tuple[str, ...] = field(init=False, repr=False, default=())
     _weights: tuple[float, ...] | None = field(init=False, repr=False, default=None)
@@ -390,11 +391,7 @@ class FineT2IStreamingDataset(IterableDataset):
     def _shard_url(self, path: str) -> str:
         """Local path as-is; HF repo-relative path -> authenticated curl pipe URL
         (same convention as ``resolve_wds_urls`` so webdataset can stream it)."""
-        if (
-            os.path.isabs(path)
-            or path.startswith(("hf://", "http://", "https://", "pipe:"))
-            or os.path.exists(path)
-        ):
+        if not self._is_repo_relative(path):
             return path
         from huggingface_hub import hf_hub_url
 
@@ -423,21 +420,67 @@ class FineT2IStreamingDataset(IterableDataset):
             )
         return url
 
+    @staticmethod
+    def _is_repo_relative(path: str) -> bool:
+        """Whether ``path`` names a file inside the HF repo (vs a local file or URL)."""
+        return not (
+            os.path.isabs(path)
+            or path.startswith(("hf://", "http://", "https://", "pipe:"))
+            or os.path.exists(path)
+        )
+
+    def _hf_filesystem(self):
+        if self._fs is None:
+            from huggingface_hub import HfFileSystem
+
+            self._fs = HfFileSystem(token=self._token())
+        return self._fs
+
     # -- per-shard iteration -------------------------------------------------- #
     def _iter_shard(self, path: str) -> Iterator[T2IRecord | None]:
         """Yield decoded records (or None for filtered rows) from one tar shard."""
         import webdataset as wds
 
-        url = self._shard_url(path)
-        # We already sliced shards by (rank, worker); disable WDS's own splitters
-        # so a single-URL open is not emptied by split_by_worker.
-        dataset = wds.WebDataset(
-            [url],
-            shardshuffle=False,
-            nodesplitter=None,
-            workersplitter=None,
-        ).decode()
-        for sample in dataset:
+        handle = None
+        if self._is_repo_relative(path):
+            # Same transport monet-direct uses: an fsspec HTTP-range stream through
+            # huggingface_hub's own client, instead of a `pipe:curl` subprocess.
+            # Three things this buys over the curl pipe, all of which bit us:
+            #   * the read deadline is per-socket-read (HF_HUB_DOWNLOAD_TIMEOUT, set in
+            #     __iter__), not a ceiling on the whole transfer, so a shard consumed
+            #     lazily over many minutes is not killed mid-stream;
+            #   * the token is a Python argument, so it cannot reach a command line,
+            #     an exception string, or the log;
+            #   * a dropped connection resumes with an HTTP Range read rather than
+            #     restarting the shard.
+            handle = self._hf_filesystem().open(
+                f"datasets/{self.repo_id}/{path}", "rb"
+            )
+            samples = wds.filters.decode()(
+                wds.tariterators.group_by_keys(
+                    wds.tariterators.tar_file_expander(
+                        [{"url": path, "stream": handle}]
+                    )
+                )
+            )
+        else:
+            # Locals and explicit URLs keep the plain webdataset open. We already
+            # sliced shards by (rank, worker); disable WDS's own splitters so a
+            # single-URL open is not emptied by split_by_worker.
+            samples = wds.WebDataset(
+                [self._shard_url(path)],
+                shardshuffle=False,
+                nodesplitter=None,
+                workersplitter=None,
+            ).decode()
+        try:
+            yield from self._records_from_samples(samples)
+        finally:
+            if handle is not None:
+                handle.close()
+
+    def _records_from_samples(self, samples: Any) -> Iterator[T2IRecord | None]:
+        for sample in samples:
             # webdataset may keep extension keys (jpg/json) or strip them; normalize.
             example = dict(sample)
             if self.image_key not in example:
@@ -524,6 +567,12 @@ class FineT2IStreamingDataset(IterableDataset):
                         raise
                     reconnects += 1
                     transient_skips += 1
+                    # The cached HfFileSystem may hold a dead HTTP client (the classic
+                    # "client has been closed" mode); drop it so the next shard open
+                    # builds a fresh filesystem instead of failing identically forever.
+                    # Same reset monet-direct does, and the reason its stream survives
+                    # a network blip that would otherwise burn the whole retry budget.
+                    self._fs = None
                     if reconnects > self.stream_reconnect_max_retries:
                         raise RuntimeError(
                             f"[t2i-direct] {reconnects} consecutive transient errors "
