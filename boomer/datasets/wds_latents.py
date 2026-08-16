@@ -894,8 +894,14 @@ def resolve_wds_urls(paths: str | Iterable[str], *, hf_token: str | bool | None 
                 url = hf_hub_url(resolved.repo_id, resolved.path_in_repo, repo_type="dataset")
                 resolved_token = get_token() if hf_token is True else hf_token
                 if resolved_token:
-                    header = shlex.quote(f"Authorization:Bearer {resolved_token}")
-                    url = f"pipe:curl -s -L -H {header} {shlex.quote(url)}"
+                    # Env var, not interpolation: webdataset puts the whole pipe
+                    # command into every OSError it raises, so an inlined bearer
+                    # token is printed in plaintext on each shard error.
+                    os.environ["BOOMER_HF_BEARER"] = resolved_token
+                    url = (
+                        'pipe:curl -s -L -H "Authorization:Bearer $BOOMER_HF_BEARER" '
+                        f"{shlex.quote(url)}"
+                    )
                 urls.append(url)
         else:
             matches = sorted(glob.glob(raw)) if any(char in raw for char in "*?[]") else []

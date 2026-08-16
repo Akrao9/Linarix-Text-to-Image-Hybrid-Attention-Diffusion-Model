@@ -407,8 +407,14 @@ def hf_wds_urls(source_glob: str, token: str | bool | None) -> list[str]:
 
     resolved_token = get_token() if token is True else token
     if resolved_token:
-        header = shlex.quote(f"Authorization:Bearer {resolved_token}")
-        return [f"pipe:curl -sSL --fail --retry 5 --retry-delay 2 --speed-limit 1 --speed-time 60 -H {header} {shlex.quote(url)}" for url in urls]
+        # Env var, not interpolation: webdataset embeds the pipe command in every
+        # OSError it raises, which prints an inlined bearer token in plaintext.
+        os.environ["BOOMER_HF_BEARER"] = resolved_token
+        return [
+            "pipe:curl -sSL --fail --retry 5 --retry-delay 2 --speed-limit 1 --speed-time 60"
+            f' -H "Authorization:Bearer $BOOMER_HF_BEARER" {shlex.quote(url)}'
+            for url in urls
+        ]
     return urls
 
 
@@ -436,9 +442,12 @@ def hf_wds_urls_from_list_file(list_file: str | Path, token: str | bool | None) 
 
     resolved_token = get_token() if token is True else token
     if resolved_token:
-        header = shlex.quote(f"Authorization:Bearer {resolved_token}")
+        # See hf_wds_urls: the token goes through the environment so shard errors
+        # cannot print it.
+        os.environ["BOOMER_HF_BEARER"] = resolved_token
         return [
-            f"pipe:curl -sSL --fail --retry 5 --retry-delay 2 --speed-limit 1 --speed-time 60 -H {header} {shlex.quote(url)}"
+            "pipe:curl -sSL --fail --retry 5 --retry-delay 2 --speed-limit 1 --speed-time 60"
+            f' -H "Authorization:Bearer $BOOMER_HF_BEARER" {shlex.quote(url)}'
             if url.startswith("http://") or url.startswith("https://")
             else url
             for url in urls

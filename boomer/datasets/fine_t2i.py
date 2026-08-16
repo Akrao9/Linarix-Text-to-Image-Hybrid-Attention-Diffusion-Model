@@ -401,8 +401,26 @@ class FineT2IStreamingDataset(IterableDataset):
         url = hf_hub_url(self.repo_id, path, repo_type="dataset")
         token = self._token()
         if token:
-            header = shlex.quote(f"Authorization:Bearer {token}")
-            return f"pipe:curl -s -L --max-time {int(self.download_timeout_s)} -H {header} {shlex.quote(url)}"
+            # The token goes through the environment, NOT into the command string.
+            # webdataset embeds the whole pipe command in every OSError it raises, so
+            # an interpolated bearer token is printed in plaintext on each shard error
+            # -- and shard errors are routine here. `$BOOMER_HF_BEARER` is expanded by
+            # the shell that gopen spawns (shell=True), so the secret never appears in
+            # the command, the exception, or the log.
+            os.environ["BOOMER_HF_BEARER"] = token
+            # --max-time is a deadline on the WHOLE transfer, which is wrong for a
+            # lazily-consumed stream: webdataset reads a shard as training eats it, so
+            # the pipe legitimately stays open for minutes and curl killed every shard
+            # at the deadline with exit 28. Bound the handshake instead, and abort only
+            # on a genuinely stalled socket (< 1 KiB/s sustained for the same window).
+            timeout = max(1, int(self.download_timeout_s))
+            return (
+                "pipe:curl -s -L"
+                f" --connect-timeout {timeout}"
+                f" --speed-limit 1024 --speed-time {timeout}"
+                ' -H "Authorization:Bearer $BOOMER_HF_BEARER"'
+                f" {shlex.quote(url)}"
+            )
         return url
 
     # -- per-shard iteration -------------------------------------------------- #
