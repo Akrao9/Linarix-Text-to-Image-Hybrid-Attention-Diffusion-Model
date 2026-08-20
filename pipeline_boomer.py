@@ -67,7 +67,62 @@ def _reset_cuda_peak() -> None:
 
 
 # ── bundled-code loading ──────────────────────────────────────────────────────
-def _find_bundled_file(filename: str, snapshot_dir: str | None = None) -> Path:
+def _repo_and_revision_from_cache(path: Path) -> tuple[str, str] | None:
+    """Recover ``(repo_id, revision)`` from a huggingface_hub snapshot path.
+
+    Cache layout is ``<cache>/models--<owner>--<name>/snapshots/<sha>/...``.
+    """
+    parts = Path(path).resolve().parts
+    for index, part in enumerate(parts):
+        if (
+            part.startswith("models--")
+            and index + 2 < len(parts)
+            and parts[index + 1] == "snapshots"
+        ):
+            return part[len("models--") :].replace("--", "/"), parts[index + 2]
+    return None
+
+
+def _fetch_bundled_from_hub(
+    snapshot_dir: Path, filename: str, token: str | None
+) -> Path | None:
+    """Pull this snapshot's own sibling code when the local download skipped it.
+
+    ``DiffusionPipeline.from_pretrained`` builds allow_patterns from the components in
+    model_index.json, and that filter is narrower than the component folder: sibling
+    modules land in the repo but never reach the cache, so the first generate dies.
+    Fetch them from the SAME repo at the SAME revision, which keeps the never-borrow
+    guarantee -- this cannot pick up code from another model.
+    """
+    found = _repo_and_revision_from_cache(snapshot_dir)
+    if found is None:
+        return None  # local directory, not a hub cache; nothing to fetch
+    repo_id, revision = found
+    from huggingface_hub import snapshot_download
+
+    logger.info(f"{filename} not in the local snapshot; fetching it from {repo_id}")
+    local = Path(
+        snapshot_download(
+            repo_id,
+            revision=revision,
+            token=token,
+            # STORKScheduler.py imports STORK_constants as a sibling package, so the
+            # constants must come along or loading it fails a step later.
+            allow_patterns=[
+                "*.py", "STORK_constants/*",
+                "transformer/*.py", "transformer/STORK_constants/*",
+            ],
+        )
+    )
+    for candidate in (local / filename, local / "transformer" / filename):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _find_bundled_file(
+    filename: str, snapshot_dir: str | None = None, token: str | None = None
+) -> Path:
     """Find code shipped in this model snapshot; never borrow it from another repo.
 
     ``snapshot_dir`` is the repo root under BoomerPipeline.from_pretrained, but plain
@@ -85,6 +140,10 @@ def _find_bundled_file(filename: str, snapshot_dir: str | None = None) -> Path:
     for path in candidates:
         if path.is_file():
             return path
+    if snapshot_dir:
+        fetched = _fetch_bundled_from_hub(Path(snapshot_dir), filename, token)
+        if fetched is not None:
+            return fetched
     searched = ", ".join(str(c.parent) for c in candidates)
     raise FileNotFoundError(
         f"{filename} is missing from this model snapshot (searched {searched}). "
@@ -93,8 +152,10 @@ def _find_bundled_file(filename: str, snapshot_dir: str | None = None) -> Path:
     )
 
 
-def _load_bundled_module(name: str, filename: str, snapshot_dir: str | None = None) -> Any:
-    path = _find_bundled_file(filename, snapshot_dir)
+def _load_bundled_module(
+    name: str, filename: str, snapshot_dir: str | None = None, token: str | None = None
+) -> Any:
+    path = _find_bundled_file(filename, snapshot_dir, token)
     module_name = f"boomer_export_{name}_{abs(hash(str(path.resolve())))}"
     if module_name in sys.modules:
         return sys.modules[module_name]
@@ -108,8 +169,8 @@ def _load_bundled_module(name: str, filename: str, snapshot_dir: str | None = No
 
 
 # ── STORK scheduler (Tan et al. 2025, arXiv:2505.24210) ──────────────────────
-def _find_stork_file(snapshot_dir: str | None = None) -> Path:
-    return _find_bundled_file("STORKScheduler.py", snapshot_dir)
+def _find_stork_file(snapshot_dir: str | None = None, token: str | None = None) -> Path:
+    return _find_bundled_file("STORKScheduler.py", snapshot_dir, token)
 
 
 def _make_stork_scheduler(
@@ -120,8 +181,9 @@ def _make_stork_scheduler(
     derivative_order: int,
     substeps: int,
     snapshot_dir: str | None = None,
+    token: str | None = None,
 ) -> Any:
-    stork_path = _find_stork_file(snapshot_dir)
+    stork_path = _find_stork_file(snapshot_dir, token)
     spec = importlib.util.spec_from_file_location("boomer_export_stork", stork_path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Could not load bundled STORK scheduler at {stork_path}")
@@ -230,7 +292,7 @@ class BoomerPipeline(DiffusionPipeline):
         dtype = next(self.transformer.parameters()).dtype
         logger.info(f"Loading text encoder from {self._te_repo} ...")
         qwen = _load_bundled_module(
-            "qwen_connector", "qwen_connector.py", self._snapshot_dir
+            "qwen_connector", "qwen_connector.py", self._snapshot_dir, self._hf_token
         )
         dtype_name = {
             torch.bfloat16: "bf16",
@@ -418,6 +480,7 @@ class BoomerPipeline(DiffusionPipeline):
             solver_order=int(sampler.removeprefix("stork")),
             derivative_order=derivative_order, substeps=substeps,
             snapshot_dir=self._snapshot_dir,
+            token=self._hf_token,
         )
         gen    = torch.Generator(device=device).manual_seed(seed)
         cfg    = self.transformer.config

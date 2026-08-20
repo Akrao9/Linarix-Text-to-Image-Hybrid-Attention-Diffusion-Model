@@ -298,6 +298,48 @@ def test_pipeline_only_loads_code_from_its_own_snapshot(tmp_path, monkeypatch) -
         pipeline._find_bundled_file("not_there.py", str(tmp_path))
 
 
+def test_missing_snapshot_code_is_fetched_from_the_same_repo(tmp_path, monkeypatch) -> None:
+    """diffusers' allow_patterns is narrower than the component folder.
+
+    Sibling modules land in the repo but never reach the cache, so the pipeline must
+    fetch them itself -- from the same repo at the same revision, never another model.
+    """
+    pipeline = _load_pipeline_module(monkeypatch)
+    cache = tmp_path / "hub" / "models--Akrao9--Linarix-v2" / "snapshots" / "abc123"
+    (cache / "transformer").mkdir(parents=True)
+
+    assert pipeline._repo_and_revision_from_cache(cache / "transformer") == (
+        "Akrao9/Linarix-v2", "abc123",
+    )
+
+    calls = {}
+
+    def fake_snapshot_download(repo_id, **kwargs):
+        calls.update(repo_id=repo_id, **kwargs)
+        (cache / "qwen_connector.py").write_text("VALUE = 9\n")
+        return str(cache)
+
+    hub = types.ModuleType("huggingface_hub")
+    hub.snapshot_download = fake_snapshot_download
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+
+    found = pipeline._find_bundled_file(
+        "qwen_connector.py", str(cache / "transformer"), "tok"
+    )
+    assert found == cache / "qwen_connector.py"
+    assert calls["repo_id"] == "Akrao9/Linarix-v2"
+    assert calls["revision"] == "abc123"          # pinned: never a different commit
+    assert "STORK_constants/*" in calls["allow_patterns"]
+
+
+def test_local_directory_load_never_triggers_a_download(tmp_path, monkeypatch) -> None:
+    """A plain local export is not a hub cache; a miss there must stay a clean error."""
+    pipeline = _load_pipeline_module(monkeypatch)
+    assert pipeline._repo_and_revision_from_cache(tmp_path) is None
+    with pytest.raises(FileNotFoundError, match="missing from this model snapshot"):
+        pipeline._find_bundled_file("qwen_connector.py", str(tmp_path))
+
+
 def test_bundled_lookup_survives_a_transformer_subfolder_snapshot_dir(
     tmp_path, monkeypatch
 ) -> None:
