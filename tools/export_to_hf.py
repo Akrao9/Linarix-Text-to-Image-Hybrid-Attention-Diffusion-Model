@@ -248,7 +248,7 @@ def _resolve_metadata(ckpt: dict, args: argparse.Namespace) -> ExportMetadata:
         steps=int(choose("steps", 20)),
         stork_derivative_order=int(choose("stork_derivative_order", 1)),
         stork_substeps=int(choose("stork_substeps", 14)),
-        cfg_scale=float(choose("cfg_scale", 3.0)),
+        cfg_scale=float(choose("cfg_scale", 4.0)),
         cfg_rescale=float(choose("cfg_rescale", 0.5)),
         cfg_interval_low=float(choose("cfg_interval_low", 0.1)),
         cfg_interval_high=float(choose("cfg_interval_high", 0.9)),
@@ -350,7 +350,7 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--stork-derivative-order", type=int, default=1)
     parser.add_argument("--stork-substeps", type=int, default=14)
-    parser.add_argument("--cfg-scale", type=float, default=3.0)
+    parser.add_argument("--cfg-scale", type=float, default=4.0)
     parser.add_argument("--cfg-rescale", type=float, default=0.5)
     parser.add_argument("--cfg-interval-low", type=float, default=0.1)
     parser.add_argument("--cfg-interval-high", type=float, default=0.9)

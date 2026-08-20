@@ -105,7 +105,7 @@ def test_export_recovers_v8_text_contract_from_checkpoint() -> None:
     # Recommended exported inference defaults, independent of an old preview config.
     assert (meta.sampler, meta.steps) == ("stork4", 20)
     assert (meta.stork_derivative_order, meta.stork_substeps) == (1, 14)
-    assert (meta.cfg_scale, meta.cfg_rescale) == (3.0, 0.5)
+    assert (meta.cfg_scale, meta.cfg_rescale) == (4.0, 0.5)
     assert (meta.cfg_interval_low, meta.cfg_interval_high) == (0.1, 0.9)
 
 
