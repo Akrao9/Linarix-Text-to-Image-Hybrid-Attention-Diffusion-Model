@@ -104,7 +104,7 @@ def test_export_recovers_v8_text_contract_from_checkpoint() -> None:
     assert meta.flow_shift == 5.0
     # Recommended exported inference defaults, independent of an old preview config.
     assert (meta.sampler, meta.steps) == ("stork4", 20)
-    assert (meta.stork_derivative_order, meta.stork_substeps) == (1, 9)
+    assert (meta.stork_derivative_order, meta.stork_substeps) == (1, 14)
     assert (meta.cfg_scale, meta.cfg_rescale) == (3.0, 0.5)
     assert (meta.cfg_interval_low, meta.cfg_interval_high) == (0.1, 0.9)
 
@@ -206,7 +206,7 @@ def test_hf_pipeline_uses_shared_qwen_and_current_sampling_contract() -> None:
     assert "pad_to_max_length=False" in source
     assert 'cfg.get("_sampler", "stork4")' in source
     assert 'cfg.get("_steps", 20)' in source
-    assert 'cfg.get("_stork_substeps", 9)' in source
+    assert 'cfg.get("_stork_substeps", 14)' in source
     assert "cfg_interval_low" in source and "cfg_interval_high" in source
     assert 'hf_hub_download("akrao9/Boomer-T2I"' not in source
 

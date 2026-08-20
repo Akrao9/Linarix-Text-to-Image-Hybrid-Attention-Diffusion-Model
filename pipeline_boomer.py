@@ -192,7 +192,7 @@ class BoomerPipeline(DiffusionPipeline):
         self.default_sampler = cfg.get("_sampler", "stork4")
         self.default_steps = int(cfg.get("_steps", 20))
         self.default_stork_derivative_order = int(cfg.get("_stork_derivative_order", 1))
-        self.default_stork_substeps = int(cfg.get("_stork_substeps", 9))
+        self.default_stork_substeps = int(cfg.get("_stork_substeps", 14))
         self.default_cfg_scale = float(cfg.get("_cfg_scale", 3.0))
         self.default_cfg_rescale = float(cfg.get("_cfg_rescale", 0.5))
         self.default_cfg_interval = (
