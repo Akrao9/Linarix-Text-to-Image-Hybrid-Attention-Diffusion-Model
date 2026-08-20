@@ -5,6 +5,9 @@ Produces the exact layout ``BoomerPipeline`` expects:
     <out>/
       transformer/config.json
       transformer/model.safetensors
+      transformer/modeling_boomer_fla.py
+      transformer/qwen_connector.py    (mirrored: see _mirror_runtime_code_into_component)
+      transformer/STORKScheduler.py    (+ transformer/STORK_constants/)
       pipeline_boomer.py
       modeling_boomer_fla.py
       qwen_connector.py        (same implementation used by training)
@@ -145,6 +148,30 @@ def _copy_stork(out_dir: Path, stork_dir: Path | None) -> None:
         "STORKScheduler.py / STORK_constants not found; refusing to create an export "
         "whose default sampler cannot load. Pass --stork-dir explicitly."
     )
+
+
+def _mirror_runtime_code_into_component(out_dir: Path, tf_dir: Path) -> None:
+    """Duplicate the pipeline's sibling code inside ``transformer/``.
+
+    ``BoomerPipeline.from_pretrained`` snapshot-downloads the whole repo, so root copies
+    suffice there. Plain ``DiffusionPipeline.from_pretrained`` does not: it builds
+    allow_patterns from the components in model_index.json plus a few known top-level
+    files, so root-level ``qwen_connector.py`` / ``STORKScheduler.py`` /
+    ``STORK_constants/`` are never downloaded and the first generate dies looking for
+    them. ``transformer/`` IS a declared component, so anything inside it comes along.
+
+    ~116 KB duplicated, against a multi-GB weight file -- cheap insurance for the load
+    path the model card actually documents.
+    """
+    for name in ("qwen_connector.py", "STORKScheduler.py"):
+        source = out_dir / name
+        if source.is_file():
+            shutil.copy2(source, tf_dir / name)
+    constants = out_dir / "STORK_constants"
+    if constants.is_dir():
+        shutil.copytree(constants, tf_dir / "STORK_constants", dirs_exist_ok=True)
+    print("[mirror] copied qwen_connector.py + STORK into transformer/ so plain "
+          "DiffusionPipeline.from_pretrained downloads them")
 
 
 def _parse_layers(value: Any) -> tuple[int, ...] | None:
@@ -519,6 +546,7 @@ def main() -> None:
     # layout. The root copy is for pipeline_boomer.py's sibling import in its override path.
     shutil.copy2(REPO_ROOT / "modeling_boomer_fla.py", tf_dir / "modeling_boomer_fla.py")
     _copy_stork(out_dir, Path(args.stork_dir) if args.stork_dir else None)
+    _mirror_runtime_code_into_component(out_dir, tf_dir)
     try:
         import diffusers
         diffusers_version = diffusers.__version__

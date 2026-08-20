@@ -211,6 +211,31 @@ def test_stork_export_fails_closed_and_requires_constants(tmp_path, monkeypatch)
         export._copy_stork(tmp_path / "out", incomplete)
 
 
+def test_runtime_code_is_mirrored_into_the_transformer_component(tmp_path) -> None:
+    """Plain DiffusionPipeline.from_pretrained only downloads declared components.
+
+    Root-level qwen_connector.py / STORKScheduler.py / STORK_constants are filtered out
+    of the snapshot, so a hub load fails at the first generate even though a local-dir
+    load succeeds. transformer/ is a declared component, so mirroring there ships them.
+    """
+    export = _load_export_module()
+    out_dir = tmp_path / "repo"
+    tf_dir = out_dir / "transformer"
+    tf_dir.mkdir(parents=True)
+    (out_dir / "qwen_connector.py").write_text("# connector\n")
+    (out_dir / "STORKScheduler.py").write_text("# scheduler\n")
+    (out_dir / "STORK_constants").mkdir()
+    (out_dir / "STORK_constants" / "recf.mat").write_bytes(b"\x00")
+
+    export._mirror_runtime_code_into_component(out_dir, tf_dir)
+
+    assert (tf_dir / "qwen_connector.py").is_file()
+    assert (tf_dir / "STORKScheduler.py").is_file()
+    assert (tf_dir / "STORK_constants" / "recf.mat").is_file()
+    # Root copies stay: BoomerPipeline.from_pretrained resolves siblings from there.
+    assert (out_dir / "qwen_connector.py").is_file()
+
+
 def test_exported_qwen_connector_is_standalone() -> None:
     source = (ROOT / "boomer" / "models" / "qwen_connector.py").read_text()
     assert "if TYPE_CHECKING:" in source
