@@ -31,6 +31,17 @@ import spaces
 import torch
 from huggingface_hub import snapshot_download
 
+# Environment banner. The Spaces base image ships torch pre-installed, so the build
+# log only says "Requirement already satisfied" and never names a version -- but the
+# exact torch/CUDA/Python triple is what any compiled wheel (causal-conv1d, FLA) has
+# to be built against, so print it where it is actually visible.
+print(
+    f"env: python {sys.version_info.major}.{sys.version_info.minor} | "
+    f"torch {torch.__version__} | cuda {torch.version.cuda} | "
+    f"gradio {gr.__version__}",
+    flush=True,
+)
+
 MODEL_ID = os.environ.get("BOOMER_MODEL_ID", "Akrao9/Linarix-v2")
 
 DEFAULT_PROMPT = (
