@@ -304,6 +304,27 @@ bidirectional GDN-2 mixers, substitutive joint-attention refresh layers
 `{meta.te_repo}` read from {readout}. Images use frozen DC-AE f32c32 latents and render at
 {config['latent_size'] * 32}px (latent {config['latent_size']}x{config['latent_size']}).
 
+## Usage
+
+> **Requires `diffusers >= 0.38.0`** — earlier versions have a `trust_remote_code` RCE
+> ([advisory](https://github.com/huggingface/diffusers/security/advisories/GHSA-98h9-4798-4q5v)).
+> For production, pin a commit hash with `revision=` so the remote code cannot change
+> under you.
+
+### Install
+
+```bash
+pip install -U "diffusers>=0.38.0" transformers accelerate safetensors torchvision scipy
+pip install "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@{FLA_PIN}"
+```
+
+FLA is **required**, not optional: the GDN-2 mixers and Block AttnRes need this exact
+build. Image attention runs on PyTorch SDPA by design — `flash-attn` is not used and
+installing it changes nothing. The STORK scheduler is bundled with this repo
+(Tan et al. 2025, arXiv:2505.24210); no separate install.
+
+### Generate
+
 ```python
 import torch
 from diffusers import DiffusionPipeline
@@ -315,14 +336,48 @@ pipe = DiffusionPipeline.from_pretrained(
     torch_dtype=torch.bfloat16,
 ).to("cuda")
 
-image = pipe("a lighthouse on a rocky cliff above crashing waves")[0]
-image.save("out.png")
+image = pipe("a lighthouse on a rocky cliff above crashing waves at golden hour")[0]
+image.save("output.png")
 ```
 
-Requires: `torch diffusers transformers accelerate safetensors` and the AttnRes-capable
-FLA build used for export:
-`pip install "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@{FLA_PIN}"`.
-The STORK scheduler is bundled (Tan et al. 2025, arXiv:2505.24210).
+Every sampler setting defaults to the value this model was tuned and showcased at
+({meta.sampler.upper()}, {meta.steps} steps, `cfg_scale={meta.cfg_scale}`,
+`flow_shift={meta.flow_shift}`), so passing nothing reproduces the grid above. Override
+only what you want to change:
+
+```python
+image = pipe(
+    "a quiet cobblestone street in an old European town, evening",
+    seed=42,          # None (default) draws a fresh seed each call
+    cfg_scale=3.0,    # lower = softer, less saturated; raise for prompt adherence
+    steps=32,         # more steps buy little past the default
+)[0]
+```
+
+The transformer weights come from this repo. The DC-AE VAE and `{meta.te_repo}` text
+encoder are fetched from their upstream repos on first use — run `hf auth login` first
+if this repo is gated for you.
+
+### Batched inference
+
+Pass a list of prompts to generate a batch in one call:
+
+```python
+images = pipe([
+    "a lighthouse above crashing waves",
+    "a red fox in fresh snow",
+    "a steam locomotive on a stone bridge",
+])
+images[0].save("a.png")
+```
+
+Two things matter for throughput. **VAE slicing is on by default**, decoding one image
+at a time so batched-decode peak memory stays flat; toggle with
+`pipe.disable_vae_slicing()`, or add `pipe.enable_vae_tiling()` for large images on low
+VRAM (both work before the VAE is lazily loaded). And **keep components resident** on
+the GPU when benchmarking — the default `offload_text_encoder=True` moves the text
+encoder to CPU after each call, which is the right trade for VRAM but adds per-call
+transfer overhead that dominates small batches.
 
 ## Samples
 

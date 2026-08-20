@@ -373,6 +373,38 @@ def test_model_card_numbers_the_showcase_prompts_it_ships(tmp_path) -> None:
         assert f"{index}. {prompt}" in card
 
 
+def test_model_card_usage_matches_the_exported_contract(tmp_path) -> None:
+    """The Usage section must not hardcode values the export resolves per checkpoint.
+
+    A card that names a stale text encoder, sampler or repo id sends every downloader
+    down a path that does not match the weights they just fetched.
+    """
+    export = _load_export_module()
+    meta = export._resolve_metadata(
+        {
+            "train_args": {"text_encoder_id": "Qwen/Qwen3.5-4B"},
+            "config": {"text_seq_len": 320},
+        },
+        _args(),
+    )
+    config = {
+        "hidden_dim": 1152, "depth": 28, "ddt_decoder_depth": 6,
+        "latent_size": 32, "refresh_layers": (7, 11, 15, 21),
+    }
+    export._write_model_card(tmp_path, "Linarix-v2", "Akrao9/Linarix-v2", config, meta)
+    card = (tmp_path / "README.md").read_text()
+    assert '"Akrao9/Linarix-v2"' in card
+    assert meta.te_repo in card
+    assert export.FLA_PIN in card
+    # Superseded model/sampler names must never reappear in a v8 card.
+    for stale in ("Qwen3.5-2B", "STORK-2", "Linarix-v1"):
+        assert stale not in card
+    # causal-conv1d serves the Qwen text encoder's conv layers, not the GDN mixer;
+    # naming it a GDN fast path sends people after an unrelated (and unavailable) wheel.
+    assert "causal-conv1d" not in card
+    assert "flash-attn" in card and "not used" in card
+
+
 def test_exported_and_loaded_weights_filenames_agree() -> None:
     """The exporter writes model.safetensors and the loader must look for it.
 
