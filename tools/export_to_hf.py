@@ -55,6 +55,7 @@ if str(REPO_ROOT) not in sys.path:
 from boomer.checkpoint_utils import load_checkpoint, select_model_state  # noqa: E402
 from boomer.models.boomer_fla_dit import migrate_glumbconv_state_dict  # noqa: E402
 from boomer.models.qwen_connector import DEFAULT_INSTRUCTION  # noqa: E402
+from boomer.showcase_prompts import SHOWCASE_PROMPTS  # noqa: E402
 from modeling_boomer_fla import BoomerFLADiT, BoomerFLADiTConfig  # noqa: E402
 
 FLA_PIN = "3c4c54ae7397d37130d7101edd0f4eb596af896d"
@@ -267,6 +268,9 @@ def _write_model_card(
         if meta.text_encoder_layers
         else f"layer {meta.text_encoder_layer}"
     )
+    prompt_list = "\n".join(
+        f"{index}. {prompt}" for index, prompt in enumerate(SHOWCASE_PROMPTS, 1)
+    )
     card = f"""---
 license: apache-2.0
 library_name: diffusers
@@ -319,17 +323,7 @@ All {config['latent_size'] * 32}px, EMA weights, {meta.sampler.upper()} / {meta.
 `cfg_interval=[{meta.cfg_interval_low}, {meta.cfg_interval_high}]`, and
 `flow_shift={meta.flow_shift}`. Prompts (left→right, top→bottom):
 
-1. a misty pine forest at dawn, sunbeams through the trees
-2. a calm lake reflecting autumn mountains, golden hour
-3. a lavender field under a dramatic stormy sky
-4. a lighthouse on a rocky cliff above crashing waves
-5. a close-up portrait of a young woman, natural window light
-6. an old craftsman working at a wooden workbench, warm lamplight
-7. a red fox standing in fresh snow, looking at the camera
-8. a pair of swans on a still pond at sunrise
-9. a steam locomotive crossing a stone bridge
-10. a quiet cobblestone street in an old European town, evening
-11. a rustic bowl of strawberries on a linen cloth
+{prompt_list}
 """
     (out_dir / "README.md").write_text(card)
 

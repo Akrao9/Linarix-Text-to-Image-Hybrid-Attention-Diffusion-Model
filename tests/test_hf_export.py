@@ -329,6 +329,28 @@ def test_generated_hf_loader_is_strict() -> None:
     assert "model = model.to(dtype=requested_dtype)" in generated
 
 
+def test_model_card_numbers_the_showcase_prompts_it_ships(tmp_path) -> None:
+    """The card's numbered list must come from the same tuple the grid cell renders.
+
+    A hardcoded list drifts silently: the card describes twelve images the showcase
+    does not contain, and nothing fails until a reader compares them.
+    """
+    export = _load_export_module()
+    from boomer.showcase_prompts import SHOWCASE_PROMPTS
+
+    meta = export._resolve_metadata(
+        {"train_args": {}, "config": {"text_seq_len": 320}}, _args()
+    )
+    config = {
+        "hidden_dim": 1152, "depth": 28, "ddt_decoder_depth": 6,
+        "latent_size": 32, "refresh_layers": (7, 11, 15, 21),
+    }
+    export._write_model_card(tmp_path, "Linarix-v2", "Akrao9/Linarix-v2", config, meta)
+    card = (tmp_path / "README.md").read_text()
+    for index, prompt in enumerate(SHOWCASE_PROMPTS, 1):
+        assert f"{index}. {prompt}" in card
+
+
 def test_exported_and_loaded_weights_filenames_agree() -> None:
     """The exporter writes model.safetensors and the loader must look for it.
 
