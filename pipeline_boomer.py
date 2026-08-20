@@ -68,17 +68,28 @@ def _reset_cuda_peak() -> None:
 
 # ── bundled-code loading ──────────────────────────────────────────────────────
 def _find_bundled_file(filename: str, snapshot_dir: str | None = None) -> Path:
-    """Find code shipped in this model snapshot; never borrow it from another repo."""
+    """Find code shipped in this model snapshot; never borrow it from another repo.
+
+    ``snapshot_dir`` is the repo root under BoomerPipeline.from_pretrained, but plain
+    ``DiffusionPipeline.from_pretrained`` loads the transformer by handing its own
+    subfolder to the modeling file, so it arrives as ``<root>/transformer``. Both
+    spellings must resolve, and the parent is still inside the same snapshot, so this
+    does not weaken the never-borrow guarantee. The __file__ fallback covers diffusers'
+    modules cache, where the pipeline is copied alongside its siblings.
+    """
     candidates: list[Path] = []
     if snapshot_dir:
-        candidates.append(Path(snapshot_dir) / filename)
+        root = Path(snapshot_dir)
+        candidates += [root / filename, root.parent / filename]
     candidates.append(Path(__file__).resolve().parent / filename)
     for path in candidates:
         if path.is_file():
             return path
+    searched = ", ".join(str(c.parent) for c in candidates)
     raise FileNotFoundError(
-        f"{filename} is missing from this model snapshot. Re-export the checkpoint; "
-        "using code from another cached model could silently change inference."
+        f"{filename} is missing from this model snapshot (searched {searched}). "
+        "Re-export the checkpoint; using code from another cached model could "
+        "silently change inference."
     )
 
 

@@ -251,6 +251,23 @@ def test_pipeline_only_loads_code_from_its_own_snapshot(tmp_path, monkeypatch) -
         pipeline._find_bundled_file("not_there.py", str(tmp_path))
 
 
+def test_bundled_lookup_survives_a_transformer_subfolder_snapshot_dir(
+    tmp_path, monkeypatch
+) -> None:
+    """Plain DiffusionPipeline.from_pretrained reports <root>/transformer as the root.
+
+    qwen_connector.py and STORKScheduler.py sit at the repo root, so searching only the
+    reported directory fails at first generation with a missing-file error.
+    """
+    pipeline = _load_pipeline_module(monkeypatch)
+    (tmp_path / "qwen_connector.py").write_text("VALUE = 5\n")
+    (tmp_path / "transformer").mkdir()
+    found = pipeline._find_bundled_file(
+        "qwen_connector.py", str(tmp_path / "transformer")
+    )
+    assert found == tmp_path / "qwen_connector.py"
+
+
 def test_hf_pipeline_applies_cfg_only_inside_exported_interval(monkeypatch) -> None:
     pipeline = _load_pipeline_module(monkeypatch)
 
