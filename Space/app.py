@@ -1,4 +1,4 @@
-"""Linarix-v1 — Hugging Face Space demo (ZeroGPU / RTX Pro 6000 Blackwell + Gradio)."""
+"""Linarix-v2 — Hugging Face Space demo (ZeroGPU / RTX Pro 6000 Blackwell + Gradio)."""
 
 from __future__ import annotations
 
@@ -31,29 +31,31 @@ import spaces
 import torch
 from huggingface_hub import snapshot_download
 
-MODEL_ID = os.environ.get("BOOMER_MODEL_ID", "Akrao9/Linarix-v1")
+MODEL_ID = os.environ.get("BOOMER_MODEL_ID", "Akrao9/Linarix-v2")
 
 DEFAULT_PROMPT = (
     "a lighthouse on a rocky cliff above crashing waves at golden hour, "
     "dramatic stormy sky, cinematic photography"
 )
 
+# Drawn from boomer/showcase_prompts.py (the set numbered under the model card's
+# sample grid), expanded with the descriptive phrasing this model responds best to.
 EXAMPLE_PROMPTS: list[tuple[str, str]] = [
     (
-        "Misty Forest",
-        "a misty pine forest at dawn, sunbeams streaming through the tall trees, soft volumetric light, atmospheric and serene.",
+        "Mountain Village",
+        "a snow-covered mountain village at blue hour, warm light glowing from every window, smoke rising from chimneys, deep alpine dusk.",
     ),
     (
-        "Autumn Lake",
-        "a calm mountain lake at golden hour mirroring snow-dusted peaks and blazing autumn foliage, crisp reflections, ultra-clear air.",
+        "Desert Canyon",
+        "a desert canyon at sunset, towering layered red rock walls carved by wind, long shadows across the canyon floor, warm directional light.",
     ),
     (
-        "Steam Locomotive",
-        "a vintage steam locomotive crossing a tall stone arch bridge over a river valley, billowing smoke, late afternoon sunlight, cinematic wide shot.",
+        "Night Motorcycle",
+        "a vintage motorcycle parked on a rain-slicked city street at night, neon signs reflecting in the wet asphalt, chrome catching the light, cinematic.",
     ),
     (
-        "Old European Street",
-        "a quiet cobblestone street in an old European town at dusk, warm glowing windows, wet stones reflecting lamplight, moody and atmospheric.",
+        "Venetian Canal",
+        "a narrow canal in Venice in late afternoon, weathered pastel facades leaning over still green water, laundry strung between shutters, golden side light.",
     ),
 ]
 
@@ -61,8 +63,8 @@ EXAMPLE_PROMPTS: list[tuple[str, str]] = [
 def _hf_token() -> str | None:
     """Return HF token from Space secrets / env if set; None otherwise.
 
-    Linarix-v1 itself is gated, so Spaces must set an ``HF_TOKEN`` secret whose
-    owner can read ``Akrao9/Linarix-v1``. Qwen3.5 / DC-AE are public.
+    Linarix-v2 itself is gated, so Spaces must set an ``HF_TOKEN`` secret whose
+    owner can read ``Akrao9/Linarix-v2``. Qwen3.5 / DC-AE are public.
     """
     for key in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGING_HUB_TOKEN"):
         value = os.environ.get(key, "").strip()
@@ -231,10 +233,10 @@ def reset_form() -> tuple[str, None, str, float]:
 def build_ui() -> gr.Blocks:
     example_rows = [[text, -1, DEFAULT_STEPS, DEFAULT_CFG] for _, text in EXAMPLE_PROMPTS]
 
-    with gr.Blocks(title="Linarix-v1") as demo:
+    with gr.Blocks(title="Linarix-v2") as demo:
         gr.Markdown(
             """
-            # Linarix-v1 — Text to Image
+            # Linarix-v2 — Text to Image
             """
             f"""Generate **{MODEL_RESOLUTION}×{MODEL_RESOLUTION}** images from text with a
             **~{MODEL_PARAMS_M:.0f}M-parameter** GatedDeltaNet-2/DDT model using Block
