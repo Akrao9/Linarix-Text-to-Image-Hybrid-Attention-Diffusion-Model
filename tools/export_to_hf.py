@@ -74,26 +74,33 @@ def _strip_prefixes(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
 def _fold_extra_input_channels(
     state: dict[str, torch.Tensor], latent_channels: int, extra: int
 ) -> dict[str, torch.Tensor]:
-    """Slice the inpaint-reserved (always-zero) extra channels off x_embedder."""
+    """Slice the inpaint-reserved (always-zero) extra channels off every patch embedder.
+
+    A DDT split (``ddt_decoder_depth > 0``) gives the velocity decoder its own
+    ``decoder_x_embedder``, and the model zero-inits the reserved columns on both
+    (boomer_fla_dit.py:2557-2559). Folding only the encoder's leaves the decoder at
+    latent_channels+extra and the strict round-trip fails on shape.
+    """
     if extra <= 0:
         return state
-    weight = state.get("x_embedder.weight")
-    if weight is None:
-        return state
-    in_ch = weight.shape[1]
-    if in_ch == latent_channels:
-        return state  # already folded
-    if in_ch != latent_channels + extra:
-        raise SystemExit(
-            f"x_embedder in_channels={in_ch} != latent_channels+extra="
-            f"{latent_channels + extra}; refusing to guess the fold."
-        )
     folded = dict(state)
-    # Linear: [hidden, in_ch]; Conv2d: [hidden, in_ch, k, k]. Slice dim=1 either way.
-    folded["x_embedder.weight"] = weight[:, :latent_channels].contiguous().clone()
-    nonzero = float(weight[:, latent_channels:].abs().max())
-    print(f"[fold] x_embedder {in_ch}->{latent_channels} input channels "
-          f"(dropped columns abs-max={nonzero:.3e}; expected ~0)")
+    for name in ("x_embedder.weight", "decoder_x_embedder.weight"):
+        weight = state.get(name)
+        if weight is None:
+            continue  # dense (non-DDT) checkpoints have no decoder embedder
+        in_ch = weight.shape[1]
+        if in_ch == latent_channels:
+            continue  # already folded
+        if in_ch != latent_channels + extra:
+            raise SystemExit(
+                f"{name} in_channels={in_ch} != latent_channels+extra="
+                f"{latent_channels + extra}; refusing to guess the fold."
+            )
+        # Linear: [hidden, in_ch]; Conv2d: [hidden, in_ch, k, k]. Slice dim=1 either way.
+        folded[name] = weight[:, :latent_channels].contiguous().clone()
+        nonzero = float(weight[:, latent_channels:].abs().max())
+        print(f"[fold] {name.removesuffix('.weight')} {in_ch}->{latent_channels} input "
+              f"channels (dropped columns abs-max={nonzero:.3e}; expected ~0)")
     return folded
 
 

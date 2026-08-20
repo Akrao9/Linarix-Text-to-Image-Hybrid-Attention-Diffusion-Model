@@ -132,6 +132,30 @@ def test_export_metadata_explicit_overrides_win() -> None:
     assert (meta.cfg_interval_low, meta.cfg_interval_high) == (0.0, 1.0)
 
 
+def test_fold_strips_reserved_channels_from_the_ddt_decoder_embedder() -> None:
+    """A DDT split has a second patch embedder; folding only the encoder's breaks export.
+
+    Both carry the same zero-initialised inpaint-reserved columns, so a v8 checkpoint
+    fails the strict round-trip on decoder_x_embedder's shape if it is skipped.
+    """
+    export = _load_export_module()
+    state = {
+        "x_embedder.weight": torch.randn(1152, 65),
+        "decoder_x_embedder.weight": torch.randn(1152, 65),
+        "blocks.0.weight": torch.randn(4, 4),
+    }
+    folded = export._fold_extra_input_channels(state, latent_channels=32, extra=33)
+    assert folded["x_embedder.weight"].shape == (1152, 32)
+    assert folded["decoder_x_embedder.weight"].shape == (1152, 32)
+    assert torch.equal(folded["blocks.0.weight"], state["blocks.0.weight"])
+    # Dense checkpoints have no decoder embedder; its absence must not be an error.
+    dense = export._fold_extra_input_channels(
+        {"x_embedder.weight": torch.randn(1152, 65)}, latent_channels=32, extra=33
+    )
+    assert dense["x_embedder.weight"].shape == (1152, 32)
+    assert "decoder_x_embedder.weight" not in dense
+
+
 def test_max_text_length_follows_text_seq_len_not_train_args() -> None:
     """The cached-text path auto-detects text_seq_len and leaves the CLI flag stale.
 
