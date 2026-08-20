@@ -12,15 +12,24 @@ license: other
 short_description: 1024px text-to-image with Linarix-v1 (GDN-2) on ZeroGPU
 models:
   - Akrao9/Linarix-v1
-  - Qwen/Qwen3.5-2B
+  - Qwen/Qwen3.5-4B
   - mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers
 ---
 
 # Linarix-v1 — Text to Image Demo
 
-Interactive demo for [Akrao9/Linarix-v1](https://huggingface.co/Akrao9/Linarix-v1): a ~712M-param 1024×1024 text-to-image flow-matching model with GatedDeltaNet-2 (Flash Linear Attention) and Q/K-RMSNorm full-attention layers every 4th block.
+Interactive demo for [Akrao9/Linarix-v1](https://huggingface.co/Akrao9/Linarix-v1):
+a Boomer v8 flow-matching model with a bidirectional GatedDeltaNet-2 semantic encoder,
+substitutive joint-attention refresh layers, Block AttnRes, and a full-attention DDT
+velocity decoder. The app reads the resolution and inference defaults from the exported
+checkpoint instead of duplicating them here.
 
-**Capabilities:** strong on landscapes, scenic/architectural scenes, **rigid man-made structures** (lighthouses, locomotives, bridges), and composed portraits (use descriptive prompts; **CFG 4.0**). Eyes/iris are the remaining frontier and exact object counts are seed-driven. Text conditioning via **Qwen3.5-2B**; decode via **DC-AE f32c32**; sampling via **STORK-2**.
+**Capabilities:** strong on landscapes, scenic/architectural scenes, **rigid man-made
+structures** (lighthouses, locomotives, bridges), and composed portraits. Text
+conditioning uses **Qwen3.5-4B layers 9/18/27** with per-layer RMS normalization and
+feature concatenation; decode uses **DC-AE f32c32**; the current export defaults to
+**STORK-4**, 20 steps, derivative order 1, 9 RKG substeps, CFG 3.0/0.5, and a [0.1, 0.9]
+guidance interval.
 
 ## Space setup
 
@@ -57,7 +66,9 @@ Set **`python_version: 3.11`** in this README (Spaces default is 3.10). After ch
 
 ## Notes
 
-- Uses `@spaces.GPU(size="large", duration=150)` — RTX Pro 6000 Blackwell 48 GB tier — for 32-step STORK-2 at 1024px ([Tan et al., 2025](https://arxiv.org/abs/2505.24210)).
+- Uses `@spaces.GPU(size="large", duration=150)` — RTX Pro 6000 Blackwell 48 GB tier —
+  for STORK-4 generation ([Tan et al., 2025](https://arxiv.org/abs/2505.24210)).
 - Example prompts run generation on click (`run_on_click=True`).
-- **CFG 4.0** is the recommended default; higher (5+) over-saturates and hardens fine detail. For exact object counts, sweep a few seeds.
-- VAE and Qwen3.5-2B are fetched from their upstream repos on first startup.
+- **CFG 3.0** with rescale 0.5 and guidance interval [0.1, 0.9] is the exported
+  default. For exact object counts, sweep a few seeds.
+- VAE and Qwen3.5-4B are fetched from their upstream repos on first startup.

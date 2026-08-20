@@ -7,6 +7,7 @@ Produces the exact layout ``BoomerPipeline`` expects:
       transformer/diffusion_pytorch_model.safetensors
       pipeline_boomer.py
       modeling_boomer_fla.py
+      qwen_connector.py        (same implementation used by training)
       STORKScheduler.py        (+ STORK_constants/)
       model_index.json
       README.md
@@ -41,7 +42,9 @@ import dataclasses
 import json
 import shutil
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -53,6 +56,8 @@ from boomer.checkpoint_utils import load_checkpoint, select_model_state  # noqa:
 from boomer.models.boomer_fla_dit import migrate_glumbconv_state_dict  # noqa: E402
 from boomer.models.qwen_connector import DEFAULT_INSTRUCTION  # noqa: E402
 from modeling_boomer_fla import BoomerFLADiT, BoomerFLADiTConfig  # noqa: E402
+
+FLA_PIN = "3c4c54ae7397d37130d7101edd0f4eb596af896d"
 
 
 def _strip_prefixes(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -113,18 +118,148 @@ def _copy_stork(out_dir: Path, stork_dir: Path | None) -> None:
     candidates = [stork_dir] if stork_dir else []
     candidates += [Path("/content/STORK"), REPO_ROOT.parent / "STORK", REPO_ROOT / "STORK"]
     for cand in candidates:
-        if cand and (cand / "STORKScheduler.py").exists():
+        if (
+            cand
+            and (cand / "STORKScheduler.py").is_file()
+            and (cand / "STORK_constants").is_dir()
+        ):
             shutil.copy2(cand / "STORKScheduler.py", out_dir / "STORKScheduler.py")
             if (cand / "STORK_constants").is_dir():
                 shutil.copytree(cand / "STORK_constants", out_dir / "STORK_constants",
                                 dirs_exist_ok=True)
             print(f"[stork] bundled STORKScheduler.py + STORK_constants from {cand}")
             return
-    print("[stork] WARNING: STORKScheduler.py / STORK_constants not found — the STORK "
-          "sampler will not load from this repo. Pass --stork-dir explicitly.")
+    raise SystemExit(
+        "STORKScheduler.py / STORK_constants not found; refusing to create an export "
+        "whose default sampler cannot load. Pass --stork-dir explicitly."
+    )
 
 
-def _write_model_card(out_dir: Path, model_name: str, repo_id: str, config: dict) -> None:
+def _parse_layers(value: Any) -> tuple[int, ...] | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        parsed = tuple(int(item.strip()) for item in value.split(",") if item.strip())
+    else:
+        parsed = tuple(int(item) for item in value)
+    return parsed or None
+
+
+@dataclass(frozen=True)
+class ExportMetadata:
+    te_repo: str
+    text_encoder_layer: int
+    text_encoder_layers: tuple[int, ...] | None
+    instruction: str | None
+    max_text_length: int
+    vae_repo: str
+    flow_shift: float
+    scaling_factor: float
+    latent_mean: float
+    latent_std: float
+    sampler: str
+    steps: int
+    stork_derivative_order: int
+    stork_substeps: int
+    cfg_scale: float
+    cfg_rescale: float
+    cfg_interval_low: float
+    cfg_interval_high: float
+
+
+def _resolve_metadata(ckpt: dict, args: argparse.Namespace) -> ExportMetadata:
+    """Recover the inference contract from the checkpoint, with explicit CLI wins.
+
+    Model architecture lives in ``checkpoint['config']`` but text/sampler choices are
+    trainer arguments. Silently replacing Qwen3.5-4B layers 9/18/27 with the old 2B
+    last-layer default produces valid shapes only for old checkpoints and garbage (or a
+    width error) for v8, so this resolution is intentionally centralized and exported.
+    """
+    train_args = ckpt.get("train_args") or {}
+    model_config = ckpt.get("config") or {}
+
+    def choose(name: str, default: Any, *checkpoint_names: str) -> Any:
+        explicit = getattr(args, name, None)
+        if explicit is not None:
+            return explicit
+        for checkpoint_name in checkpoint_names or (name,):
+            value = train_args.get(checkpoint_name)
+            if value is not None:
+                return value
+            value = model_config.get(checkpoint_name)
+            if value is not None:
+                return value
+        return default
+
+    layers = _parse_layers(choose("text_encoder_layers", None, "text_encoder_layers"))
+    instruction = getattr(args, "instruction", None)
+    if instruction is None:
+        instruction = (
+            DEFAULT_INSTRUCTION if bool(train_args.get("text_encoder_instruction", True)) else None
+        )
+    flow_shift = choose("flow_shift", 3.0, "sample_flow_shift", "flow_shift")
+    # argparse stores optional sample_flow_shift as None in older checkpoints.
+    if flow_shift is None:
+        flow_shift = train_args.get("flow_shift", 3.0)
+
+    # `config['text_seq_len']` is the authority, NOT train_args: it sizes the learned
+    # `null_text_embedding` parameter, and on the cached-text path train.py auto-detects
+    # it from a record (train.py:2421) and leaves --text-encoder-max-length and
+    # --text-seq-len at their unrelated defaults. Exporting a shorter value makes the
+    # pipeline slice the null caption (`token_num=text_emb.shape[-2]`), so CFG's uncond
+    # branch silently loses trained null tokens.
+    max_text_length = getattr(args, "max_text_length", None)
+    if max_text_length is None:
+        max_text_length = model_config.get("text_seq_len")
+        trained = train_args.get("text_encoder_max_length")
+        if max_text_length is None:
+            raise SystemExit(
+                "Checkpoint config has no 'text_seq_len'; pass --max-text-length explicitly."
+            )
+        if trained is not None and int(trained) != int(max_text_length):
+            print(
+                f"[metadata] note: train_args text_encoder_max_length={trained} disagrees "
+                f"with config text_seq_len={max_text_length}; using text_seq_len, which is "
+                "the length the null caption parameter was trained at."
+            )
+
+    meta = ExportMetadata(
+        te_repo=str(choose("te_repo", "Qwen/Qwen3.5-4B", "text_encoder_id")),
+        text_encoder_layer=int(choose("text_encoder_layer", -2, "text_encoder_layer")),
+        text_encoder_layers=layers,
+        instruction=instruction,
+        max_text_length=int(max_text_length),
+        vae_repo=str(choose("vae_repo", "mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers")),
+        flow_shift=float(flow_shift),
+        scaling_factor=float(
+            choose("scaling_factor", 0.41407, "sample_scaling_factor", "edit_scaling_factor")
+        ),
+        latent_mean=float(choose("latent_mean", 0.0, "latent_mean")),
+        latent_std=float(choose("latent_std", 1.0, "latent_std")),
+        sampler=str(choose("sampler", "stork4")),
+        steps=int(choose("steps", 20)),
+        stork_derivative_order=int(choose("stork_derivative_order", 1)),
+        stork_substeps=int(choose("stork_substeps", 9)),
+        cfg_scale=float(choose("cfg_scale", 3.0)),
+        cfg_rescale=float(choose("cfg_rescale", 0.5)),
+        cfg_interval_low=float(choose("cfg_interval_low", 0.1)),
+        cfg_interval_high=float(choose("cfg_interval_high", 0.9)),
+    )
+    if not 0.0 <= meta.cfg_interval_low <= meta.cfg_interval_high <= 1.0:
+        raise SystemExit("CFG interval must satisfy 0 <= low <= high <= 1")
+    if meta.sampler not in {"stork2", "stork4"}:
+        raise SystemExit("HF export currently supports --sampler stork2 or stork4")
+    return meta
+
+
+def _write_model_card(
+    out_dir: Path, model_name: str, repo_id: str, config: dict, meta: ExportMetadata
+) -> None:
+    readout = (
+        f"layers {list(meta.text_encoder_layers)} (per-layer RMSNorm + concatenation)"
+        if meta.text_encoder_layers
+        else f"layer {meta.text_encoder_layer}"
+    )
     card = f"""---
 license: apache-2.0
 library_name: diffusers
@@ -140,8 +275,12 @@ tags:
 # {model_name}
 
 A {config['hidden_dim']}-dim / {config['depth']}-layer flow-matching text-to-image DiT
-(GDN-2 linear-attention mixer with periodic full image attention), DC-AE f32c32 latents,
-Qwen text conditioning. Renders at {config['latent_size'] * 32}px (latent {config['latent_size']}x{config['latent_size']}).
+with a {config['depth'] - config['ddt_decoder_depth']}-layer semantic encoder and
+{config['ddt_decoder_depth']}-layer full-attention DDT velocity decoder. The encoder uses
+bidirectional GDN-2 mixers, substitutive joint-attention refresh layers
+{config.get('refresh_layers')}, and Block AttnRes. Text conditioning is
+`{meta.te_repo}` read from {readout}. Images use frozen DC-AE f32c32 latents and render at
+{config['latent_size'] * 32}px (latent {config['latent_size']}x{config['latent_size']}).
 
 ```python
 import torch
@@ -154,19 +293,24 @@ pipe = DiffusionPipeline.from_pretrained(
     torch_dtype=torch.bfloat16,
 ).to("cuda")
 
-image = pipe("a lighthouse on a rocky cliff above crashing waves", cfg_scale=4.0)[0]
+image = pipe("a lighthouse on a rocky cliff above crashing waves")[0]
 image.save("out.png")
 ```
 
-Requires: `torch diffusers transformers accelerate safetensors` and
-`flash-linear-attention` (`pip install git+https://github.com/fla-org/flash-linear-attention.git`).
+Requires: `torch diffusers transformers accelerate safetensors` and the AttnRes-capable
+FLA build used for export:
+`pip install "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@{FLA_PIN}"`.
 The STORK scheduler is bundled (Tan et al. 2025, arXiv:2505.24210).
 
 ## Samples
 
 ![{model_name} samples](showcase.png)
 
-All {config['latent_size'] * 32}px, EMA weights, STORK-2 / 32 steps, `cfg_scale=4.0`, `cfg_rescale=0.5`. Prompts (left→right, top→bottom):
+All {config['latent_size'] * 32}px, EMA weights, {meta.sampler.upper()} / {meta.steps} steps,
+`derivative_order={meta.stork_derivative_order}`, `substeps={meta.stork_substeps}`,
+`cfg_scale={meta.cfg_scale}`, `cfg_rescale={meta.cfg_rescale}`,
+`cfg_interval=[{meta.cfg_interval_low}, {meta.cfg_interval_high}]`, and
+`flow_shift={meta.flow_shift}`. Prompts (left→right, top→bottom):
 
 1. a misty pine forest at dawn, sunbeams through the trees
 2. a calm lake reflecting autumn mountains, golden hour
@@ -190,14 +334,25 @@ def main() -> None:
     parser.add_argument("--weights", default="ema", choices=["ema", "auto", "model"])
     parser.add_argument("--repo-id", default="Akrao9/Linarix-v1")
     parser.add_argument("--model-name", default="Linarix-v1")
-    parser.add_argument("--te-repo", default="Qwen/Qwen3.5-2B")
-    parser.add_argument("--vae-repo", default="mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers")
-    parser.add_argument("--instruction", default=DEFAULT_INSTRUCTION)
-    parser.add_argument("--max-text-length", type=int, default=320)
-    parser.add_argument("--flow-shift", type=float, default=3.0)
-    parser.add_argument("--scaling-factor", type=float, default=0.41407)
-    parser.add_argument("--latent-mean", type=float, default=0.0)
-    parser.add_argument("--latent-std", type=float, default=1.0)
+    # None means recover from checkpoint train_args. Explicit values always win.
+    parser.add_argument("--te-repo", default=None)
+    parser.add_argument("--text-encoder-layer", type=int, default=None)
+    parser.add_argument("--text-encoder-layers", default=None, help="Comma-separated readout layers.")
+    parser.add_argument("--vae-repo", default=None)
+    parser.add_argument("--instruction", default=None)
+    parser.add_argument("--max-text-length", type=int, default=None)
+    parser.add_argument("--flow-shift", type=float, default=None)
+    parser.add_argument("--scaling-factor", type=float, default=None)
+    parser.add_argument("--latent-mean", type=float, default=None)
+    parser.add_argument("--latent-std", type=float, default=None)
+    parser.add_argument("--sampler", choices=["stork2", "stork4"], default="stork4")
+    parser.add_argument("--steps", type=int, default=20)
+    parser.add_argument("--stork-derivative-order", type=int, default=1)
+    parser.add_argument("--stork-substeps", type=int, default=9)
+    parser.add_argument("--cfg-scale", type=float, default=3.0)
+    parser.add_argument("--cfg-rescale", type=float, default=0.5)
+    parser.add_argument("--cfg-interval-low", type=float, default=0.1)
+    parser.add_argument("--cfg-interval-high", type=float, default=0.9)
     parser.add_argument("--stork-dir", default=None, help="Dir holding STORKScheduler.py + STORK_constants/.")
     # bf16 by default: it's the inference dtype (the pipeline loads with
     # torch_dtype=bfloat16), so fp32 storage only doubles the download for no
@@ -214,6 +369,16 @@ def main() -> None:
 
     print(f"[load] {args.checkpoint}")
     ckpt = load_checkpoint(args.checkpoint)
+    metadata = _resolve_metadata(ckpt, args)
+    print(
+        "[metadata] "
+        f"text={metadata.te_repo} layers={metadata.text_encoder_layers or metadata.text_encoder_layer} "
+        f"max_length={metadata.max_text_length}; {metadata.sampler} steps={metadata.steps} "
+        f"d={metadata.stork_derivative_order} s={metadata.stork_substeps} "
+        f"cfg={metadata.cfg_scale}/{metadata.cfg_rescale} "
+        f"interval=[{metadata.cfg_interval_low},{metadata.cfg_interval_high}] "
+        f"flow_shift={metadata.flow_shift}"
+    )
     train_cfg = ckpt.get("config") or {}
     if not train_cfg:
         raise SystemExit("Checkpoint has no embedded 'config'; cannot build the model config.")
@@ -243,28 +408,33 @@ def main() -> None:
 
     # ── round-trip verify: the written architecture must accept the weights exactly ──
     model = BoomerFLADiT(BoomerFLADiTConfig(**config))
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    missing = [m for m in missing if "rope" not in m and "inv_freq" not in m]  # non-persistent buffers
-    print(f"[verify] round-trip load: missing={len(missing)} unexpected={len(unexpected)}")
-    if missing:
-        print("  missing[:10]   :", missing[:10])
-    if unexpected:
-        print("  unexpected[:10]:", unexpected[:10])
-    if missing or unexpected:
-        raise SystemExit("Round-trip mismatch — refusing to export a broken model. See lists above.")
+    try:
+        model.load_state_dict(state, strict=True)
+    except RuntimeError as exc:
+        raise SystemExit(f"Round-trip mismatch — refusing to export a broken model:\n{exc}") from exc
     print("[verify] OK — all denoise-path weights map 1:1.")
 
     # ── write transformer/ ──
     config_json = dict(config)
     config_json.update({
-        "_latent_mean": args.latent_mean,
-        "_latent_std": args.latent_std,
-        "_scaling_factor": args.scaling_factor,
-        "_flow_shift": args.flow_shift,
-        "_max_text_length": args.max_text_length,
-        "_vae_repo": args.vae_repo,
-        "_te_repo": args.te_repo,
-        "_instruction": args.instruction,
+        "_latent_mean": metadata.latent_mean,
+        "_latent_std": metadata.latent_std,
+        "_scaling_factor": metadata.scaling_factor,
+        "_flow_shift": metadata.flow_shift,
+        "_max_text_length": metadata.max_text_length,
+        "_vae_repo": metadata.vae_repo,
+        "_te_repo": metadata.te_repo,
+        "_text_encoder_layer": metadata.text_encoder_layer,
+        "_text_encoder_layers": metadata.text_encoder_layers,
+        "_instruction": metadata.instruction,
+        "_sampler": metadata.sampler,
+        "_steps": metadata.steps,
+        "_stork_derivative_order": metadata.stork_derivative_order,
+        "_stork_substeps": metadata.stork_substeps,
+        "_cfg_scale": metadata.cfg_scale,
+        "_cfg_rescale": metadata.cfg_rescale,
+        "_cfg_interval_low": metadata.cfg_interval_low,
+        "_cfg_interval_high": metadata.cfg_interval_high,
     })
     (tf_dir / "config.json").write_text(json.dumps(config_json, indent=2))
 
@@ -276,6 +446,7 @@ def main() -> None:
     # ── copy code + scheduler + card ──
     for fname in ("pipeline_boomer.py", "modeling_boomer_fla.py"):
         shutil.copy2(REPO_ROOT / fname, out_dir / fname)
+    shutil.copy2(REPO_ROOT / "boomer" / "models" / "qwen_connector.py", out_dir / "qwen_connector.py")
     # diffusers loads the `transformer` component (declared in model_index.json) by
     # resolving its class relative to the transformer/ subfolder under trust_remote_code,
     # so the modeling file MUST also live there — matching the working akrao9/Boomer-T2I
@@ -295,7 +466,7 @@ def main() -> None:
         "_diffusers_version": diffusers_version,
         "transformer": ["modeling_boomer_fla", "BoomerFLADiT"],
     }, indent=2))
-    _write_model_card(out_dir, args.model_name, args.repo_id, config)
+    _write_model_card(out_dir, args.model_name, args.repo_id, config, metadata)
     print(f"[done] repo assembled at {out_dir}")
 
     if not args.push:

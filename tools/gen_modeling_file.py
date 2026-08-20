@@ -75,6 +75,7 @@ def _boomer_from_pretrained(cls, pretrained_model_name_or_path: str,
     from pathlib import Path
     from safetensors.torch import load_file
 
+    requested_dtype = kwargs.pop("torch_dtype", None) or kwargs.pop("dtype", None)
     path = Path(pretrained_model_name_or_path)
     if subfolder:
         path = path / subfolder
@@ -85,7 +86,14 @@ def _boomer_from_pretrained(cls, pretrained_model_name_or_path: str,
 
     model = cls(model_config)
     sd = load_file(str(path / "diffusion_pytorch_model.safetensors"))
-    model.load_state_dict(sd, strict=False)
+    # Export verification already guarantees an exact denoise-path state dict. Keep
+    # loading strict here too: silently accepting a stale config or truncated upload
+    # produces plausible but invalid images and is much harder to diagnose than a clear
+    # load-time error. RoPE tables are non-persistent buffers and therefore absent from
+    # both sides of strict state-dict matching by design.
+    model.load_state_dict(sd, strict=True)
+    if requested_dtype is not None:
+        model = model.to(dtype=requested_dtype)
 
     # Attach inference metadata so BoomerPipeline.__init__ can read without a separate file.
     model._boomer_cfg = {k: v for k, v in cfg_raw.items() if k.startswith("_")}

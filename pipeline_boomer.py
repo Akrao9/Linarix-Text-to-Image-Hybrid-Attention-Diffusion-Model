@@ -66,47 +66,39 @@ def _reset_cuda_peak() -> None:
         torch.cuda.reset_peak_memory_stats()
 
 
-# ── STORK scheduler (Tan et al. 2025, arXiv:2505.24210; solver_order=2 → STORK-2) ─
-def _find_stork_file(snapshot_dir: str | None = None) -> Path:
-    """Search for STORKScheduler.py across all known locations."""
+# ── bundled-code loading ──────────────────────────────────────────────────────
+def _find_bundled_file(filename: str, snapshot_dir: str | None = None) -> Path:
+    """Find code shipped in this model snapshot; never borrow it from another repo."""
     candidates: list[Path] = []
-
-    # 1. Snapshot directory passed in from from_pretrained
     if snapshot_dir:
-        candidates.append(Path(snapshot_dir) / "STORKScheduler.py")
-
-    # 2. Same directory as this pipeline file (diffusers modules cache)
-    candidates.append(Path(__file__).resolve().parent / "STORKScheduler.py")
-
-    # 3. Entire HF hub cache — covers all downloaded model snapshots
-    hub_root = Path.home() / ".cache" / "huggingface" / "hub"
-    if hub_root.exists():
-        candidates.extend(hub_root.rglob("STORKScheduler.py"))
-
-    # 4. Common Colab / local paths
-    candidates += [
-        Path("/content/STORK/STORKScheduler.py"),
-        Path("/content/Boomer/STORKScheduler.py"),
-        Path("/content/Boomer/STORK/STORKScheduler.py"),
-    ]
-
-    for p in candidates:
-        if p.is_file():
-            return p
-
-    # Last resort: download directly from the model repo on HuggingFace
-    try:
-        from huggingface_hub import hf_hub_download
-        downloaded = hf_hub_download("akrao9/Boomer-T2I", "STORKScheduler.py")
-        return Path(downloaded)
-    except Exception:
-        pass
-
+        candidates.append(Path(snapshot_dir) / filename)
+    candidates.append(Path(__file__).resolve().parent / filename)
+    for path in candidates:
+        if path.is_file():
+            return path
     raise FileNotFoundError(
-        "STORKScheduler.py not found. Either:\n"
-        "  !git clone https://github.com/ZT220501/STORK.git /content/STORK\n"
-        "or ensure the model repo is accessible and retry."
+        f"{filename} is missing from this model snapshot. Re-export the checkpoint; "
+        "using code from another cached model could silently change inference."
     )
+
+
+def _load_bundled_module(name: str, filename: str, snapshot_dir: str | None = None) -> Any:
+    path = _find_bundled_file(filename, snapshot_dir)
+    module_name = f"boomer_export_{name}_{abs(hash(str(path.resolve())))}"
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not create an import spec for {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+# ── STORK scheduler (Tan et al. 2025, arXiv:2505.24210) ──────────────────────
+def _find_stork_file(snapshot_dir: str | None = None) -> Path:
+    return _find_bundled_file("STORKScheduler.py", snapshot_dir)
 
 
 def _make_stork_scheduler(
@@ -119,9 +111,16 @@ def _make_stork_scheduler(
     snapshot_dir: str | None = None,
 ) -> Any:
     stork_path = _find_stork_file(snapshot_dir)
-    spec   = importlib.util.spec_from_file_location("STORKScheduler", stork_path)
+    spec = importlib.util.spec_from_file_location("boomer_export_stork", stork_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load bundled STORK scheduler at {stork_path}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)  # type: ignore[union-attr]
+    # STORKScheduler imports its sibling STORK_constants package by name.
+    parent = str(stork_path.parent)
+    if parent not in sys.path:
+        sys.path.insert(0, parent)
+    sys.modules["boomer_export_stork"] = module
+    spec.loader.exec_module(module)
 
     scheduler = module.STORKScheduler(
         shift=flow_shift,
@@ -135,55 +134,6 @@ def _make_stork_scheduler(
     scheduler.dt_list = scheduler.dt_list.to(device=device)
     scheduler.sigmas  = scheduler.sigmas.to(device=device)
     return scheduler
-
-
-# ── text encoding ──────────────────────────────────────────────────────────────
-@torch.inference_mode()
-def _encode_prompts(tokenizer, text_encoder, prompts, max_length, device, dtype, instruction=None):
-    # Qwen readout (instruction set): reproduce the training QwenReferenceEncoder exactly —
-    # prepend the instruction, render through the chat template, then read the decoder's
-    # post-final-norm last_hidden_state, right-padded/truncated to max_length. This MUST
-    # match how the CaptionEmbedder was trained, or prompt-following degrades badly.
-    if instruction:
-        rendered = []
-        for prompt in prompts:
-            messages = [{"role": "user", "content": f"{instruction}\n\n{prompt}"}]
-            rendered.append(
-                tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-            )
-        # Qwen3.5 is a VL model: its AutoProcessor.__call__ is (images, text, ...), so the
-        # text MUST be passed as text=; positionally it gets treated as images and the
-        # processor tries to fetch_images() the chat string. Fall back to positional for
-        # plain tokenizers that don't accept text=.
-        tok_kwargs = dict(max_length=max_length, padding="max_length",
-                          truncation=True, return_tensors="pt")
-        try:
-            tokens = tokenizer(text=rendered, **tok_kwargs)
-        except TypeError:
-            tokens = tokenizer(rendered, **tok_kwargs)
-        ids  = tokens["input_ids"].to(device)
-        mask = tokens["attention_mask"].to(device)
-        out  = text_encoder(ids, attention_mask=mask, output_hidden_states=True,
-                            use_cache=False, return_dict=True)
-        hidden = out.last_hidden_state
-        # Right-padding keeps valid tokens at the front, so a head slice is safe.
-        return hidden[:, :max_length].to(dtype=dtype), mask[:, :max_length]
-
-    # Legacy (no instruction, e.g. gemma): plain tokenize + last_hidden_state.
-    token_kwargs = dict(max_length=max_length, padding="max_length",
-                        truncation=True, return_tensors="pt")
-    try:
-        tokens = tokenizer(text=prompts, **token_kwargs)
-    except TypeError:
-        tokens = tokenizer(prompts, **token_kwargs)
-
-    ids  = tokens["input_ids"].to(device)
-    mask = tokens["attention_mask"].to(device)
-    out  = text_encoder(ids, attention_mask=mask)
-    hidden = out[0] if isinstance(out, tuple) else out.last_hidden_state
-
-    idx = [0] + list(range(-max_length + 1, 0))
-    return hidden[:, idx].to(dtype=dtype), mask[:, idx]
 
 
 # ── latent helpers ─────────────────────────────────────────────────────────────
@@ -222,12 +172,25 @@ class BoomerPipeline(DiffusionPipeline):
         self.scaling_factor  = cfg.get("_scaling_factor",  0.41407)
         self.flow_shift      = cfg.get("_flow_shift",      1.5)
         self.max_text_length = cfg.get("_max_text_length", 300)
-        # Instruction prefix for the Qwen readout (None => legacy plain-tokenize path).
         self.instruction     = cfg.get("_instruction",     None)
+        self.text_encoder_layer = int(cfg.get("_text_encoder_layer", -1))
+        layers = cfg.get("_text_encoder_layers")
+        self.text_encoder_layers = tuple(int(layer) for layer in layers) if layers else None
         self._vae_repo       = cfg.get("_vae_repo",  "mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers")
-        self._te_repo        = cfg.get("_te_repo",   "google/gemma-4-E2B-it")
+        self._te_repo        = cfg.get("_te_repo",   "Qwen/Qwen3.5-4B")
+        self.default_sampler = cfg.get("_sampler", "stork4")
+        self.default_steps = int(cfg.get("_steps", 20))
+        self.default_stork_derivative_order = int(cfg.get("_stork_derivative_order", 1))
+        self.default_stork_substeps = int(cfg.get("_stork_substeps", 9))
+        self.default_cfg_scale = float(cfg.get("_cfg_scale", 3.0))
+        self.default_cfg_rescale = float(cfg.get("_cfg_rescale", 0.5))
+        self.default_cfg_interval = (
+            float(cfg.get("_cfg_interval_low", 0.1)),
+            float(cfg.get("_cfg_interval_high", 0.9)),
+        )
         self._hf_token       = None
         self._snapshot_dir   = getattr(transformer, "_snapshot_dir", None)
+        self._encode_qwen_text_fixed = None
         self.last_run_stats  = BoomerRunStats()
         # VAE memory savers. Slicing decodes one image at a time so batched-decode peak
         # memory stays flat (diffusers best practice: ~free for batches, no single-image
@@ -253,23 +216,38 @@ class BoomerPipeline(DiffusionPipeline):
     def _ensure_text_encoder(self):
         if self.text_encoder is not None:
             return
-        from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
         dtype = next(self.transformer.parameters()).dtype
         logger.info(f"Loading text encoder from {self._te_repo} ...")
-        try:
-            self.tokenizer = AutoProcessor.from_pretrained(self._te_repo, token=self._hf_token)
-        except (ImportError, OSError, ValueError):
-            self.tokenizer = AutoTokenizer.from_pretrained(self._te_repo, token=self._hf_token)
-        if hasattr(self.tokenizer, "padding_side"):
-            self.tokenizer.padding_side = "right"
-        elif hasattr(self.tokenizer, "tokenizer"):
-            self.tokenizer.tokenizer.padding_side = "right"
-        te = AutoModelForCausalLM.from_pretrained(
-            self._te_repo, torch_dtype=dtype, token=self._hf_token,
+        qwen = _load_bundled_module(
+            "qwen_connector", "qwen_connector.py", self._snapshot_dir
         )
-        self.text_encoder = (te.get_decoder() if hasattr(te, "get_decoder") else te).to(
-            self._execution_device
-        ).eval()
+        dtype_name = {
+            torch.bfloat16: "bf16",
+            torch.float16: "fp16",
+            torch.float32: "fp32",
+        }.get(dtype)
+        if dtype_name is None:
+            raise TypeError(f"Unsupported text-encoder dtype: {dtype}")
+        qwen_config = qwen.QwenConnectorConfig(
+            qwen_model_id=self._te_repo,
+            readout_layer=self.text_encoder_layer,
+            readout_layers=self.text_encoder_layers,
+            instruction=self.instruction,
+            max_text_tokens=self.max_text_length,
+            pad_to_max_length=False,
+            dtype=dtype_name,
+        )
+        encoder = qwen.QwenReferenceEncoder(qwen_config, hf_token=self._hf_token)
+        encoder.load()
+        expected = int(self.transformer.config.text_dim)
+        if encoder.readout_dim != expected:
+            raise RuntimeError(
+                f"Qwen readout emits {encoder.readout_dim} features but the transformer "
+                f"expects text_dim={expected}. Export metadata is inconsistent with its "
+                "checkpoint."
+            )
+        self.text_encoder = encoder.to(self._execution_device).eval()
+        self._encode_qwen_text_fixed = qwen.encode_qwen_text_fixed
 
     # ── VAE memory savers (deferred to the lazily-loaded VAE) ──────────────────
     def _apply_vae_memory_savers(self) -> None:
@@ -345,11 +323,15 @@ class BoomerPipeline(DiffusionPipeline):
     def __call__(
         self,
         prompt: Union[str, List[str]],
-        steps: int = 32,
+        steps: int | None = None,
         seed: int | None = None,
-        cfg_scale: float = 4.0,
-        cfg_rescale: float = 0.5,
-        substeps: int = 5,
+        cfg_scale: float | None = None,
+        cfg_rescale: float | None = None,
+        sampler: str | None = None,
+        derivative_order: int | None = None,
+        substeps: int | None = None,
+        cfg_interval_low: float | None = None,
+        cfg_interval_high: float | None = None,
         offload_text_encoder: bool = True,
         **kwargs,
     ) -> BoomerOutput:
@@ -357,14 +339,30 @@ class BoomerPipeline(DiffusionPipeline):
         Parameters
         ----------
         prompt       : str or list[str]
-        steps        : denoising steps (32 recommended with STORK-2)
+        steps        : denoising steps (exported default: 20)
         seed         : random seed — None (default) picks a random seed each call
-        cfg_scale    : classifier-free guidance scale (4.0 recommended)
-        cfg_rescale  : CFG variance rescale (0.5 recommended)
-        substeps     : STORK-2 internal RK micro-steps
+        sampler      : ``stork2`` or ``stork4`` (exported default: STORK-4)
+        substeps     : STORK internal RKG substeps (exported default: 9)
         offload_text_encoder : unload text encoder after encoding to free VRAM
         """
         import random
+        steps = self.default_steps if steps is None else int(steps)
+        cfg_scale = self.default_cfg_scale if cfg_scale is None else float(cfg_scale)
+        cfg_rescale = self.default_cfg_rescale if cfg_rescale is None else float(cfg_rescale)
+        sampler = self.default_sampler if sampler is None else sampler
+        derivative_order = (
+            self.default_stork_derivative_order
+            if derivative_order is None else int(derivative_order)
+        )
+        substeps = self.default_stork_substeps if substeps is None else int(substeps)
+        interval = (
+            self.default_cfg_interval[0] if cfg_interval_low is None else float(cfg_interval_low),
+            self.default_cfg_interval[1] if cfg_interval_high is None else float(cfg_interval_high),
+        )
+        if sampler not in {"stork2", "stork4"}:
+            raise ValueError("sampler must be 'stork2' or 'stork4'")
+        if not 0.0 <= interval[0] <= interval[1] <= 1.0:
+            raise ValueError("CFG interval must satisfy 0 <= low <= high <= 1")
         if seed is None:
             seed = random.randint(0, 2**32 - 1)
         logger.info(f"seed={seed}")
@@ -381,10 +379,13 @@ class BoomerPipeline(DiffusionPipeline):
             _reset_cuda_peak()
         self._ensure_text_encoder()
         self.text_encoder.to(device)
-        text_emb, attn_mask = _encode_prompts(
-            self.tokenizer, self.text_encoder, prompts,
-            self.max_text_length, device, dtype, instruction=self.instruction,
+        if self._encode_qwen_text_fixed is None:
+            raise RuntimeError("Qwen text encoder loaded without its fixed-length encoder")
+        text_emb, attn_mask = self._encode_qwen_text_fixed(
+            self.text_encoder, prompts, self.max_text_length
         )
+        text_emb = text_emb.to(device=device, dtype=dtype)
+        attn_mask = attn_mask.to(device=device)
         if track_vram:
             run_stats.peak_encode_gb = _cuda_peak_gb()
         if offload_text_encoder:
@@ -403,7 +404,8 @@ class BoomerPipeline(DiffusionPipeline):
         )
         sched = _make_stork_scheduler(
             steps=steps, device=device, flow_shift=self.flow_shift,
-            solver_order=2, derivative_order=1, substeps=substeps,
+            solver_order=int(sampler.removeprefix("stork")),
+            derivative_order=derivative_order, substeps=substeps,
             snapshot_dir=self._snapshot_dir,
         )
         gen    = torch.Generator(device=device).manual_seed(seed)
@@ -414,13 +416,19 @@ class BoomerPipeline(DiffusionPipeline):
         )
         for step in range(steps):
             sigma  = sched.sigmas[step].to(device=device, dtype=dtype)
-            lb     = latent.repeat(2, 1, 1, 1)
-            tb     = sigma.expand(batch * 2)
-            txtb   = torch.cat([uncond_emb, text_emb], dim=0)
-            mskb   = torch.cat([uncond_mask, attn_mask], dim=0)
-            uv, cv = self.transformer(lb, tb, txtb, mskb).chunk(2)
-            guided = uv + cfg_scale * (cv - uv)
-            if cfg_rescale > 0.0:
+            in_interval = interval[0] <= float(sigma) <= interval[1]
+            if cfg_scale == 1.0 or not in_interval:
+                guided = self.transformer(
+                    latent, sigma.expand(batch), text_emb, attn_mask
+                )
+            else:
+                lb     = latent.repeat(2, 1, 1, 1)
+                tb     = sigma.expand(batch * 2)
+                txtb   = torch.cat([uncond_emb, text_emb], dim=0)
+                mskb   = torch.cat([uncond_mask, attn_mask], dim=0)
+                uv, cv = self.transformer(lb, tb, txtb, mskb).chunk(2)
+                guided = uv + cfg_scale * (cv - uv)
+            if cfg_rescale > 0.0 and cfg_scale != 1.0 and in_interval:
                 sc     = cv.std(dim=(1, 2, 3), keepdim=True)
                 sg     = guided.std(dim=(1, 2, 3), keepdim=True)
                 guided = (cfg_rescale * guided * (sc / sg.clamp_min(1e-5))

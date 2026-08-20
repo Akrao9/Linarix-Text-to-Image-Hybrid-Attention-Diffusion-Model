@@ -1,6 +1,6 @@
-"""Qwen3.5-2B -> Boomer conditioning connector.
+"""Qwen3.5 -> Boomer conditioning connector.
 
-A frozen, multimodal **Qwen/Qwen3.5-2B** (Apache-2.0) encodes a prompt together
+A frozen, multimodal **Qwen3.5** encoder (Apache-2.0) encodes a prompt together
 with an optional reference image. A trained **Perceiver resampler** then maps its
 hidden states into a fixed number of conditioning tokens shaped exactly like the
 Gemma embeddings Boomer was designed around -- ``[B, N, text_dim]`` plus an
@@ -16,21 +16,22 @@ Design notes
   **cached offline** during training (run Qwen once per image, never in the loop).
 
 Provenance: the *generator* (DiT) is what carries the "trained only on licensed
-data" claim. Qwen3.5-2B (Apache-2.0) and DC-AE (MIT) are licensed *tools*; ship a
+data" claim. Qwen3.5 (Apache-2.0) and DC-AE (MIT) are licensed *tools*; ship a
 NOTICE/ATTRIBUTIONS file crediting both.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 import torch
 from torch import nn
 
-from boomer.models.boomer_fla_dit import BoomerFLADiT, BoomerFLADiTConfig
+if TYPE_CHECKING:
+    from boomer.models.boomer_fla_dit import BoomerFLADiTConfig
 
-DEFAULT_QWEN_ID = "Qwen/Qwen3.5-2B"
+DEFAULT_QWEN_ID = "Qwen/Qwen3.5-4B"
 
 # Steering prefix: shapes which attributes Qwen's hidden states emphasise. This is
 # the main lever for getting identity/material/geometry into the conditioning.
@@ -80,7 +81,7 @@ def _rms_norm_fp32(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
 
 class QwenReferenceEncoder(nn.Module):
-    """Frozen Qwen3.5-2B wrapper returning hidden states for the resampler.
+    """Frozen Qwen3.5 wrapper returning hidden states for the resampler.
 
     ``forward`` returns ``(hidden_states [B, L, D_qwen], pad_mask [B, L])`` where
     ``pad_mask`` is 1 for valid tokens. The model is loaded lazily so the module is
@@ -600,7 +601,7 @@ class PerceiverConnector(nn.Module):
 
 
 class ReferenceConditionedBoomer(nn.Module):
-    """Qwen3.5-2B encoder + Perceiver connector + BoomerFLADiT (from-scratch generator).
+    """Qwen3.5 encoder + Perceiver connector + BoomerFLADiT (from-scratch generator).
 
     Training contract mirrors ``BoomerFLADiT.forward`` but takes raw prompts/images
     (or cached Qwen hidden states) instead of precomputed text embeddings.
@@ -613,6 +614,11 @@ class ReferenceConditionedBoomer(nn.Module):
         hf_token: str | bool | None = None,
     ) -> None:
         super().__init__()
+        # Keep the text-encoding half of this file standalone: the HF exporter copies
+        # it beside pipeline_boomer.py so inference and training share one exact Qwen
+        # implementation without requiring the ``boomer`` package in the snapshot.
+        from boomer.models.boomer_fla_dit import BoomerFLADiT
+
         if connector_config.out_dim != dit_config.text_dim:
             raise ValueError(
                 f"connector out_dim={connector_config.out_dim} must equal "

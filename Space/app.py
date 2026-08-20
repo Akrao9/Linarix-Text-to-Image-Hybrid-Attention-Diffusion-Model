@@ -32,9 +32,6 @@ import torch
 from huggingface_hub import snapshot_download
 
 MODEL_ID = os.environ.get("BOOMER_MODEL_ID", "Akrao9/Linarix-v1")
-DEFAULT_STEPS = 32
-DEFAULT_CFG = 4.0
-DEFAULT_CFG_RESCALE = 0.5
 
 DEFAULT_PROMPT = (
     "a lighthouse on a rocky cliff above crashing waves at golden hour, "
@@ -65,7 +62,7 @@ def _hf_token() -> str | None:
     """Return HF token from Space secrets / env if set; None otherwise.
 
     Linarix-v1 itself is gated, so Spaces must set an ``HF_TOKEN`` secret whose
-    owner can read ``Akrao9/Linarix-v1``. Qwen3.5-2B / DC-AE are public.
+    owner can read ``Akrao9/Linarix-v1``. Qwen3.5 / DC-AE are public.
     """
     for key in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGING_HUB_TOKEN"):
         value = os.environ.get(key, "").strip()
@@ -110,9 +107,16 @@ pipe._hf_token = _hf
 
 print("Pre-loading VAE on cuda ...", flush=True)
 pipe._ensure_vae()
-print("Pre-loading text encoder (Qwen3.5-2B) on cuda ...", flush=True)
+print(f"Pre-loading text encoder ({pipe._te_repo}) on cuda ...", flush=True)
 pipe._ensure_text_encoder()
 print("Model ready.", flush=True)
+
+MODEL_RESOLUTION = int(pipe.transformer.config.latent_size) * 32
+MODEL_PARAMS_M = sum(parameter.numel() for parameter in pipe.transformer.parameters()) / 1e6
+MODEL_SAMPLER = str(pipe.default_sampler).upper()
+DEFAULT_STEPS = int(pipe.default_steps)
+DEFAULT_CFG = float(pipe.default_cfg_scale)
+DEFAULT_CFG_RESCALE = float(pipe.default_cfg_rescale)
 
 
 def _resolve_seed(seed: float | int | None) -> int:
@@ -215,7 +219,7 @@ def generate_image(
 
     status = (
         f"Done — seed {resolved_seed}, steps {step_count}, CFG {cfg:.1f}. "
-        f"1024×1024px via STORK-2.\n{stats_line}"
+        f"{MODEL_RESOLUTION}×{MODEL_RESOLUTION}px via {MODEL_SAMPLER}.\n{stats_line}"
     )
     return image, status
 
@@ -231,10 +235,12 @@ def build_ui() -> gr.Blocks:
         gr.Markdown(
             """
             # Linarix-v1 — Text to Image
-            Generate **1024×1024** images from text with a **~712M** GatedDeltaNet-2
-            (linear-attention) diffusion model. **Strong on landscapes, scenic and
+            """
+            f"""Generate **{MODEL_RESOLUTION}×{MODEL_RESOLUTION}** images from text with a
+            **~{MODEL_PARAMS_M:.0f}M-parameter** GatedDeltaNet-2/DDT model using Block
+            AttnRes and substitutive joint-attention refreshes. **Strong on landscapes, scenic and
             man-made structures, and composed portraits** — use descriptive prompts;
-            **CFG 4.0** is the sweet spot. For exact object counts, try a few seeds.
+            **CFG {DEFAULT_CFG:.1f}** is the default. For exact object counts, try a few seeds.
             Runs on **ZeroGPU** (NVIDIA RTX Pro 6000 Blackwell, 48 GB). First run may
             take a minute while a GPU is allocated.
             """
