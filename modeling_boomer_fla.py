@@ -3130,7 +3130,15 @@ def _boomer_from_pretrained(cls, pretrained_model_name_or_path: str,
     model_config = BoomerFLADiTConfig(**cfg_clean)
 
     model = cls(model_config)
-    sd = load_file(str(path / "diffusion_pytorch_model.safetensors"))
+    # Current exports write model.safetensors; Linarix-v1 and other already-published
+    # snapshots use the diffusers-conventional name, so keep reading both.
+    for weights_name in ("model.safetensors", "diffusion_pytorch_model.safetensors"):
+        weights = path / weights_name
+        if weights.is_file():
+            break
+    else:
+        raise FileNotFoundError(f"no model.safetensors in {path}")
+    sd = load_file(str(weights))
     # Export verification already guarantees an exact denoise-path state dict. Keep
     # loading strict here too: silently accepting a stale config or truncated upload
     # produces plausible but invalid images and is much harder to diagnose than a clear

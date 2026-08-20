@@ -327,3 +327,16 @@ def test_generated_hf_loader_is_strict() -> None:
     assert "model.load_state_dict(sd, strict=True)" in generated
     assert 'kwargs.pop("torch_dtype", None)' in generated
     assert "model = model.to(dtype=requested_dtype)" in generated
+
+
+def test_exported_and_loaded_weights_filenames_agree() -> None:
+    """The exporter writes model.safetensors and the loader must look for it.
+
+    The two live in different files with no shared constant, so a rename on one side
+    only surfaces as a load failure against a freshly pushed repo. Linarix-v1 is
+    already published under the old diffusers name, so that must still load.
+    """
+    generated = (ROOT / "modeling_boomer_fla.py").read_text()
+    exporter = (ROOT / "tools" / "export_to_hf.py").read_text()
+    assert 'tf_dir / "model.safetensors"' in exporter
+    assert '"model.safetensors", "diffusion_pytorch_model.safetensors"' in generated

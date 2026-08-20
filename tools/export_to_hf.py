@@ -4,7 +4,7 @@ Produces the exact layout ``BoomerPipeline`` expects:
 
     <out>/
       transformer/config.json
-      transformer/diffusion_pytorch_model.safetensors
+      transformer/model.safetensors
       pipeline_boomer.py
       modeling_boomer_fla.py
       qwen_connector.py        (same implementation used by training)
@@ -446,8 +446,7 @@ def main() -> None:
     (tf_dir / "config.json").write_text(json.dumps(config_json, indent=2))
 
     from safetensors.torch import save_file
-    save_file(state, str(tf_dir / "diffusion_pytorch_model.safetensors"),
-              metadata={"format": "pt"})
+    save_file(state, str(tf_dir / "model.safetensors"), metadata={"format": "pt"})
     print(f"[write] transformer/ ({len(state)} tensors, {args.save_dtype} dtype)")
 
     # ── copy code + scheduler + card ──
