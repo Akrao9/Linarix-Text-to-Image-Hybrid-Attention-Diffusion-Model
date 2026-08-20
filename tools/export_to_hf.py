@@ -60,6 +60,10 @@ from modeling_boomer_fla import BoomerFLADiT, BoomerFLADiTConfig  # noqa: E402
 
 FLA_PIN = "3c4c54ae7397d37130d7101edd0f4eb596af896d"
 
+# Sampler-side flow shift for the published defaults, deliberately independent of the
+# training shift (see _resolve_metadata). Override per-export with --flow-shift.
+DEFAULT_SAMPLE_FLOW_SHIFT = 5.0
+
 
 def _strip_prefixes(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Drop torch.compile / Lightning wrappers so keys match the bare BoomerFLADiT."""
@@ -205,10 +209,17 @@ def _resolve_metadata(ckpt: dict, args: argparse.Namespace) -> ExportMetadata:
         instruction = (
             DEFAULT_INSTRUCTION if bool(train_args.get("text_encoder_instruction", True)) else None
         )
-    flow_shift = choose("flow_shift", 3.0, "sample_flow_shift", "flow_shift")
-    # argparse stores optional sample_flow_shift as None in older checkpoints.
+    # The inference shift is NOT the training shift. `--flow-shift` biases which
+    # timesteps training SAMPLES; the scheduler's shift reshapes the sigma schedule at
+    # generation time, and the best value for one is unrelated to the other. Falling
+    # back to train_args["flow_shift"] published the training value (3.0) as an
+    # inference default, which reproduces nothing anyone actually sampled. Recover only
+    # from --sample-flow-shift, the inference-side trainer arg.
+    flow_shift = getattr(args, "flow_shift", None)
     if flow_shift is None:
-        flow_shift = train_args.get("flow_shift", 3.0)
+        flow_shift = train_args.get("sample_flow_shift")
+    if flow_shift is None:
+        flow_shift = DEFAULT_SAMPLE_FLOW_SHIFT
 
     # `config['text_seq_len']` is the authority, NOT train_args: it sizes the learned
     # `null_text_embedding` parameter, and on the cached-text path train.py auto-detects

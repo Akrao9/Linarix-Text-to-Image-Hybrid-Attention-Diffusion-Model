@@ -156,6 +156,28 @@ def test_fold_strips_reserved_channels_from_the_ddt_decoder_embedder() -> None:
     assert "decoder_x_embedder.weight" not in dense
 
 
+def test_inference_flow_shift_never_falls_back_to_the_training_shift() -> None:
+    """--flow-shift (training timestep bias) and the sampler shift are different knobs.
+
+    Recovering the training value as an inference default publishes a schedule nobody
+    sampled at, and it looks recovered rather than guessed in the metadata line.
+    """
+    export = _load_export_module()
+    trained_only = export._resolve_metadata(
+        {"train_args": {"flow_shift": 3.0}, "config": {"text_seq_len": 320}}, _args()
+    )
+    assert trained_only.flow_shift == export.DEFAULT_SAMPLE_FLOW_SHIFT != 3.0
+    # The inference-side trainer arg is still honoured when the run recorded one.
+    recorded = export._resolve_metadata(
+        {
+            "train_args": {"flow_shift": 3.0, "sample_flow_shift": 2.5},
+            "config": {"text_seq_len": 320},
+        },
+        _args(),
+    )
+    assert recorded.flow_shift == 2.5
+
+
 def test_max_text_length_follows_text_seq_len_not_train_args() -> None:
     """The cached-text path auto-detects text_seq_len and leaves the CLI flag stale.
 
