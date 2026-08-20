@@ -9,7 +9,7 @@ app_file: app.py
 python_version: 3.11
 pinned: false
 license: other
-short_description: 1024px text-to-image with Linarix-v2 (GDN-2 / DDT) on ZeroGPU
+short_description: 1024px text-to-image with Linarix-v2 (GDN-2) on ZeroGPU
 models:
   - Akrao9/Linarix-v2
   - Qwen/Qwen3.5-4B
