@@ -312,12 +312,23 @@ class FineT2IStreamingDataset(IterableDataset):
     # move on, rather than failing the run. Cost is bounded at this many rows (~1.2 MB
     # each; the tar is sequential, so a rejected row's jpg bytes are already on the
     # wire before its json is readable). 0 disables the check.
-    max_screened_per_shard: int = 200
+    # 64, not a few hundred: MONET's shards are resolution-HOMOGENEOUS (a barren shard
+    # is barren from row 1), so a longer look costs bandwidth and learns nothing. At
+    # ~1.2 MB/row this is ~77 MB to reject a shard instead of ~234 MB, and with ~7
+    # barren shards per usable one at min_short_side=1024 that is the difference
+    # between ~0.5 GB and ~1.6 GB of waste per usable shard.
+    max_screened_per_shard: int = 64
     # Consecutive barren shards tolerated while the pass has yielded NOTHING. This is
     # the real "this source cannot work" signal -- one bad shard is data, twenty in a
     # row with no output is a filter no partition of this source satisfies. Bounds the
     # damage at max_barren_shards * max_screened_per_shard rows. 0 disables.
-    max_barren_shards: int = 20
+    #
+    # 50, not 20: measured on MONET at min_short_side=1024, ~88% of shards are barren,
+    # so a run of 20 happens by chance with probability 0.88^20 ~ 8% per source per
+    # worker at the start of a pass -- and `yielded` resets every pass, so that die is
+    # rolled again each epoch. 0.88^50 is ~0.2%. The check must fire on a source that
+    # truly cannot work, never on an unlucky shuffle.
+    max_barren_shards: int = 50
     # fsspec ReadAheadCache fetch unit. Every tarfile read that misses the cache asks
     # HF for `stream_block_size + 10 KiB` in ONE Range request. At the fsspec default
     # (5 MiB) HF closed the connection ~1.8 MB in once many streams ran in parallel
