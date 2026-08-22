@@ -312,11 +312,19 @@ class FineT2IStreamingDataset(IterableDataset):
     # move on, rather than failing the run. Cost is bounded at this many rows (~1.2 MB
     # each; the tar is sequential, so a rejected row's jpg bytes are already on the
     # wire before its json is readable). 0 disables the check.
-    # 64, not a few hundred: MONET's shards are resolution-HOMOGENEOUS (a barren shard
-    # is barren from row 1), so a longer look costs bandwidth and learns nothing. At
-    # ~1.2 MB/row this is ~77 MB to reject a shard instead of ~234 MB, and with ~7
-    # barren shards per usable one at min_short_side=1024 that is the difference
-    # between ~0.5 GB and ~1.6 GB of waste per usable shard.
+    # 64: cheap enough that skipping costs ~77 MB rather than ~234 MB at ~1.2 MB/row.
+    #
+    # CAVEAT, measured: this screens the HEAD of a shard, and MONET orders rows so the
+    # small images come first -- laion/0-0/000045.tar reads as barren over its first
+    # 200 rows yet holds 653 rows >=1024 near its tail. So a head screen UNDERSTATES a
+    # partially-usable shard and will skip it. That is the right trade when the
+    # alternative is streaming 3.6 GB for a 6% yield, but it means this knob must not
+    # be read as "this shard has nothing".
+    #
+    # For a genuinely filtered mix, do not tune this -- use the metadata instead. Every
+    # MONET shard has a sibling .parquet, and a projected read of one column
+    # (`least_dimension`) takes ~1.4s and gives the shard's exact yield without
+    # touching the tar. That is exact where this is a heuristic.
     max_screened_per_shard: int = 64
     # Consecutive barren shards tolerated while the pass has yielded NOTHING. This is
     # the real "this source cannot work" signal -- one bad shard is data, twenty in a
