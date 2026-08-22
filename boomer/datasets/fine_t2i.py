@@ -67,6 +67,17 @@ _CAPTION_MODES = ("sample", "short", "enhanced")
 _EPOCH_END = object()
 
 
+class UnusableSourceError(RuntimeError):
+    """A mix source whose rows never pass the record filters.
+
+    Its own type, not a bare RuntimeError, because it is raised inside the shard
+    loop's transient-error handler. `_is_transient_stream_error` classifies partly by
+    substring ("connection", "read error", ...), so a plain RuntimeError carrying a
+    prose explanation could be mistaken for a retryable network blip and swallowed --
+    turning a loud configuration error back into the silent hang it exists to report.
+    """
+
+
 @dataclass(frozen=True)
 class T2IRecord:
     """One t2i sample: square uint8 CHW pixels + caption."""
@@ -289,6 +300,16 @@ class FineT2IStreamingDataset(IterableDataset):
     stream_reconnect_backoff: float = 5.0
     # Best-effort GC cadence for long-lived workers holding ~3 MB pixel records.
     memory_trim_every: int = 256
+    # Records one source may screen out CONSECUTIVELY, from the start of a pass,
+    # before we call it unusable. A source whose rows all fail the record filters is
+    # not merely slow: _stream_files_forever skips None internally, so the
+    # _interleave_sources `next()` on that source never returns and the worker streams
+    # it forever at full line rate, producing nothing. The only other backstop is
+    # "zero usable rows in a complete pass", which is unreachable when a pass is tens
+    # of shards of several GB. This is what silently hung the first 1024 monet-image
+    # run: cc12m is 0% and megalith10m 2% at min_short_side=1024, together 25% of the
+    # mix. 0 disables the check.
+    max_screened_without_accept: int = 2000
     # fsspec ReadAheadCache fetch unit. Every tarfile read that misses the cache asks
     # HF for `stream_block_size + 10 KiB` in ONE Range request. At the fsspec default
     # (5 MiB) HF closed the connection ~1.8 MB in once many streams ran in parallel
@@ -322,6 +343,8 @@ class FineT2IStreamingDataset(IterableDataset):
             raise ValueError("memory_trim_every must be >= 0")
         if self.stream_block_size <= 0:
             raise ValueError("stream_block_size must be > 0")
+        if self.max_screened_without_accept < 0:
+            raise ValueError("max_screened_without_accept must be >= 0")
         self._sources = _parse_sources(self.data_dir)
         self._weights = _parse_weights(self.data_dir_weights, len(self._sources))
         if len(self._sources) > 1 and self.data_files is not None:
@@ -563,6 +586,7 @@ class FineT2IStreamingDataset(IterableDataset):
             order = list(files)
             random.Random(self.seed + seed_offset + epoch).shuffle(order)
             yielded = 0
+            screened = 0  # rows inspected this pass, accepted or filtered out
             transient_skips = 0
             for path in order:
                 try:
@@ -573,7 +597,24 @@ class FineT2IStreamingDataset(IterableDataset):
                         except StopIteration:
                             break
                         reconnects = 0
+                        screened += 1
                         if record is None:
+                            if (
+                                yielded == 0
+                                and self.max_screened_without_accept > 0
+                                and screened >= self.max_screened_without_accept
+                            ):
+                                raise UnusableSourceError(
+                                    f"[{self.log_tag}] screened {screened} rows from "
+                                    f"{tag} without a single one passing the record "
+                                    f"filters (min_short_side={self.min_short_side}, "
+                                    f"min_aesthetic={self.min_aesthetic}). A source "
+                                    "that never yields cannot participate in a mix: "
+                                    "the interleaver blocks on it and the worker "
+                                    "streams it forever without producing a batch. "
+                                    "Drop this source from the mix, or relax the "
+                                    "filter it cannot satisfy."
+                                )
                             continue
                         rows += 1
                         yielded += 1
@@ -581,7 +622,7 @@ class FineT2IStreamingDataset(IterableDataset):
                         if self.memory_trim_every > 0 and rows % self.memory_trim_every == 0:
                             gc.collect()
                 except Exception as exc:  # noqa: BLE001 - classify transient vs fatal
-                    if not _is_transient_stream_error(exc):
+                    if isinstance(exc, UnusableSourceError) or not _is_transient_stream_error(exc):
                         raise
                     reconnects += 1
                     transient_skips += 1

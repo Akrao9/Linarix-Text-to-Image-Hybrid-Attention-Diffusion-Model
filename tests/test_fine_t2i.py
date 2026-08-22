@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT))
 from boomer.datasets.fine_t2i import (  # noqa: E402
     FineT2IStreamingDataset,
     T2IRecord,
+    UnusableSourceError,
     collate_t2i_records,
     t2i_example_to_record,
 )
@@ -354,3 +355,62 @@ def test_transient_error_drops_the_cached_filesystem() -> None:
 
     assert seen[0] is not None
     assert seen[1] is None, "cached HfFileSystem must be dropped after a transient error"
+
+
+def test_source_that_filters_every_row_raises_instead_of_streaming_forever():
+    """The failure that silently hung the first 1024 monet-image run.
+
+    cc12m is 0% and megalith10m 2% at min_short_side=1024, and _stream_files_forever
+    skips None internally -- so the interleaver's next() on such a source never
+    returns and the worker downloads at full line rate forever, producing no batch and
+    no error. It must fail loudly and name the filter instead.
+    """
+    ds = FineT2IStreamingDataset(
+        repo_id="ma-xu/fine-t2i",
+        resolution=32,
+        shuffle_buffer=0,
+        # every synthetic row is 1200x800, so nothing can clear a 4096 short side
+        min_short_side=4096,
+        max_screened_without_accept=5,
+    )
+    ds._fs = None
+    ds._iter_shard = lambda path: iter([None] * 50)  # type: ignore[method-assign]
+
+    stream = ds._stream_files_forever(["a.tar"], seed_offset=0, tag="cc12m")
+    with pytest.raises(UnusableSourceError) as excinfo:
+        next(stream)
+
+    msg = str(excinfo.value)
+    assert "cc12m" in msg, msg
+    assert "min_short_side=4096" in msg, msg
+
+
+def test_unusable_source_is_not_mistaken_for_a_transient_network_error():
+    """It is raised inside the transient-error handler, which classifies by substring.
+
+    A retry classification here would swallow the guard and restore the hang.
+    """
+    from boomer.datasets.wds_latents import _is_transient_stream_error
+
+    exc = UnusableSourceError(
+        "[t2i-direct] screened 2000 rows from cc12m without a single one passing "
+        "the record filters (min_short_side=1024, min_aesthetic=None)."
+    )
+    assert not _is_transient_stream_error(exc)
+
+
+def test_the_guard_does_not_fire_on_a_merely_selective_source():
+    """A source that accepts rarely is slow, not broken; it must keep streaming."""
+    rec = t2i_example_to_record(_example(), resolution=32, caption_mode="short")
+    assert rec is not None
+
+    ds = FineT2IStreamingDataset(
+        repo_id="ma-xu/fine-t2i", resolution=32, shuffle_buffer=0,
+        max_screened_without_accept=100,
+    )
+    ds._fs = None
+    # 99 rejects, then an accept: under the threshold, so no raise.
+    ds._iter_shard = lambda path: iter([None] * 99 + [rec])  # type: ignore[method-assign]
+
+    got = next(ds._stream_files_forever(["a.tar"], seed_offset=0, tag="picky"))
+    assert got is rec
