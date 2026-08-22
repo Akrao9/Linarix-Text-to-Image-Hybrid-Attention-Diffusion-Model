@@ -685,6 +685,20 @@ class FineT2IStreamingDataset(IterableDataset):
         )
 
         if self._weights is not None:
+            # A mix holds ONE open HF stream per source for the worker's lifetime, so
+            # concurrent connections = num_workers * len(sources). Measured against
+            # huggingface.co from a single Colab IP:
+            #     14 workers x 2 sources = 28 streams -> fine, for a whole 1024 run
+            #     14 workers x 6 sources = 84 streams -> HF resets connections
+            # The resets land on the LOW-WEIGHT sources first: _interleave_sources
+            # draws a source per record, so a w=0.1 stream is touched once every ~10
+            # records and its keep-alive goes idle long enough for the far end to hang
+            # up. The next read on it raises ECONNRESET, huggingface_hub burns its
+            # retry budget with exponential backoff, and no worker ever fills a batch.
+            # Keep num_workers * len(sources) under ~28, and prefer fewer workers over
+            # fewer sources -- the mix ratio is a training decision, the worker count
+            # is not (4 workers still sustains ~17 samples/s, well over what training
+            # consumes).
             mix_rng = random.Random((self.seed + 2) * 100019 + offset)
             stream: Iterator[Any] = self._interleave_sources(
                 offset=offset, stride=stride, rng=mix_rng
