@@ -284,9 +284,12 @@ def test_repo_shards_stream_through_hf_filesystem_not_a_curl_pipe() -> None:
             super().close()
 
     class _FS:
-        def open(self, path: str, mode: str):
+        def open(self, path: str, mode: str, block_size: int | None = None):
             opened.append(path)
             assert mode == "rb"
+            # A 5 MiB (fsspec default) read-ahead made HF truncate the response
+            # mid-body under parallel streams; the range read must stay bounded.
+            assert block_size == 1 << 20, block_size
             return _Handle(_synthetic_tar())
 
     ds = FineT2IStreamingDataset(

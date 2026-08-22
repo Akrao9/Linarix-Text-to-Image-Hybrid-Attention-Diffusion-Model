@@ -1141,6 +1141,7 @@ class BoomerData(pl.LightningDataModule):
         pin_memory: bool = True,
         prefetch_factor: int = 2,
         persistent_workers: bool | None = None,
+        stream_block_size: int = 1 << 20,
         download_max_retries: int = 2,
         max_consecutive_skips: int = 8,
         parquet_read_batch_size: int = 32,
@@ -1225,6 +1226,7 @@ class BoomerData(pl.LightningDataModule):
         self.pin_memory = pin_memory
         self.prefetch_factor = prefetch_factor
         self.persistent_workers = persistent_workers
+        self.stream_block_size = stream_block_size
         self.download_max_retries = download_max_retries
         self.max_consecutive_skips = max_consecutive_skips
         self.parquet_read_batch_size = parquet_read_batch_size
@@ -1273,6 +1275,7 @@ class BoomerData(pl.LightningDataModule):
                 min_aesthetic=self.monet_min_aesthetic,
                 max_nsfw=self.monet_max_nsfw,
                 max_watermark=self.monet_max_watermark,
+                stream_block_size=self.stream_block_size,
                 rank=rank,
                 world_size=world,
             )
@@ -1294,6 +1297,7 @@ class BoomerData(pl.LightningDataModule):
                 short_prob=self.t2i_short_prob,
                 min_short_side=self.t2i_min_short_side,
                 min_aesthetic=self.t2i_min_aesthetic,
+                stream_block_size=self.stream_block_size,
                 rank=rank,
                 world_size=world,
             )
@@ -2553,6 +2557,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Pin CPU batches for faster async GPU transfer (CUDA only).")
     p.add_argument("--prefetch-factor", type=int, default=2,
                    help="Batches prefetched per worker when --num-workers > 0.")
+    p.add_argument("--stream-block-size-mib", type=int, default=1,
+                   help="hf:// range-read block for the image-streaming loaders "
+                        "(monet-image-direct / t2i-direct). Each cache miss requests "
+                        "this much in one Range GET. Above ~2 MiB, HF truncates the "
+                        "response under many parallel streams and huggingface_hub "
+                        "re-fetches the whole range with backoff, stalling the run.")
     p.add_argument("--persistent-workers", action=bo, default=None,
                    help="Keep DataLoader workers alive between epochs. Default: on when --num-workers > 0.")
     p.add_argument("--parquet-read-batch-size", type=int, default=32,
@@ -3470,6 +3480,7 @@ def main() -> None:
         shard_shuffle=args.wds_shard_shuffle,
         pin_memory=args.pin_memory,
         prefetch_factor=args.prefetch_factor,
+        stream_block_size=max(1, args.stream_block_size_mib) << 20,
         persistent_workers=args.persistent_workers,
         download_max_retries=args.wds_download_max_retries,
         max_consecutive_skips=args.wds_max_consecutive_skips,

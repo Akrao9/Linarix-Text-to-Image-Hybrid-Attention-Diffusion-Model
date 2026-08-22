@@ -317,16 +317,14 @@ class MonetImageStreamingDataset(FineT2IStreamingDataset):
 
         handle = None
         if path.startswith("hf://"):
-            handle = self._hf_filesystem().open(path.removeprefix("hf://"), "rb")
+            handle = self._open_hf_stream(path.removeprefix("hf://"))
             samples = wds.tariterators.group_by_keys(
                 wds.tariterators.tar_file_expander(
                     [{"url": path, "stream": handle}]
                 )
             )
         elif self._is_repo_relative(path):
-            handle = self._hf_filesystem().open(
-                f"datasets/{self.repo_id}/{path}", "rb"
-            )
+            handle = self._open_hf_stream(f"datasets/{self.repo_id}/{path}")
             samples = wds.tariterators.group_by_keys(
                 wds.tariterators.tar_file_expander(
                     [{"url": path, "stream": handle}]

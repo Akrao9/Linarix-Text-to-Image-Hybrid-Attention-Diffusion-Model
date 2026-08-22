@@ -289,6 +289,15 @@ class FineT2IStreamingDataset(IterableDataset):
     stream_reconnect_backoff: float = 5.0
     # Best-effort GC cadence for long-lived workers holding ~3 MB pixel records.
     memory_trim_every: int = 256
+    # fsspec ReadAheadCache fetch unit. Every tarfile read that misses the cache asks
+    # HF for `stream_block_size + 10 KiB` in ONE Range request. At the fsspec default
+    # (5 MiB) HF closed the connection ~1.8 MB in once many streams ran in parallel
+    # ("peer closed connection without sending complete message body"), and
+    # huggingface_hub retried the whole range from byte zero with exponential backoff
+    # -- re-downloading the same bytes instead of making progress, so no worker ever
+    # accumulated a batch. A smaller block lands in one shot; the extra requests are
+    # free for a loader that only needs ~10 samples/s.
+    stream_block_size: int = 1 << 20
     # Subclasses can reuse the streaming engine while keeping diagnostics honest.
     log_tag: str = "t2i-direct"
     _fs: Any = field(init=False, repr=False, default=None)  # lazy HfFileSystem
@@ -311,6 +320,8 @@ class FineT2IStreamingDataset(IterableDataset):
             raise ValueError("stream_reconnect_max_retries must be >= 0")
         if self.memory_trim_every < 0:
             raise ValueError("memory_trim_every must be >= 0")
+        if self.stream_block_size <= 0:
+            raise ValueError("stream_block_size must be > 0")
         self._sources = _parse_sources(self.data_dir)
         self._weights = _parse_weights(self.data_dir_weights, len(self._sources))
         if len(self._sources) > 1 and self.data_files is not None:
@@ -438,6 +449,12 @@ class FineT2IStreamingDataset(IterableDataset):
             self._fs = HfFileSystem(token=self._token())
         return self._fs
 
+    def _open_hf_stream(self, hf_path: str):
+        """Range-read stream over a repo file, with our own read-ahead block size."""
+        return self._hf_filesystem().open(
+            hf_path, "rb", block_size=self.stream_block_size
+        )
+
     # -- per-shard iteration -------------------------------------------------- #
     def _iter_shard(self, path: str) -> Iterator[T2IRecord | None]:
         """Yield decoded records (or None for filtered rows) from one tar shard."""
@@ -455,9 +472,7 @@ class FineT2IStreamingDataset(IterableDataset):
             #     an exception string, or the log;
             #   * a dropped connection resumes with an HTTP Range read rather than
             #     restarting the shard.
-            handle = self._hf_filesystem().open(
-                f"datasets/{self.repo_id}/{path}", "rb"
-            )
+            handle = self._open_hf_stream(f"datasets/{self.repo_id}/{path}")
             samples = wds.filters.decode()(
                 wds.tariterators.group_by_keys(
                     wds.tariterators.tar_file_expander(
