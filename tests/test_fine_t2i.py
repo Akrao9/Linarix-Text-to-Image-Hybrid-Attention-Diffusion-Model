@@ -357,32 +357,62 @@ def test_transient_error_drops_the_cached_filesystem() -> None:
     assert seen[1] is None, "cached HfFileSystem must be dropped after a transient error"
 
 
-def test_source_that_filters_every_row_raises_instead_of_streaming_forever():
-    """The failure that silently hung the first 1024 monet-image run.
+def test_barren_shard_is_skipped_not_fatal():
+    """One 0% shard is data, not a config error: MONET buckets by resolution, so a
+    usable source can still hand a worker a shard where nothing clears the filter."""
+    rec = t2i_example_to_record(_example(), resolution=32, caption_mode="short")
+    shards = {"bad.tar": [None] * 500, "good.tar": [rec]}
 
-    cc12m is 0% and megalith10m 2% at min_short_side=1024, and _stream_files_forever
-    skips None internally -- so the interleaver's next() on such a source never
-    returns and the worker downloads at full line rate forever, producing no batch and
-    no error. It must fail loudly and name the filter instead.
+    ds = FineT2IStreamingDataset(
+        repo_id="ma-xu/fine-t2i", resolution=32, shuffle_buffer=0,
+        max_screened_per_shard=10, max_barren_shards=20,
+    )
+    ds._fs = None
+    ds._iter_shard = lambda path: iter(shards[path])  # type: ignore[method-assign]
+
+    got = next(ds._stream_files_forever(["bad.tar", "good.tar"], seed_offset=0, tag="s"))
+    assert got is rec, "a barren shard must be abandoned and the next one tried"
+
+
+def test_source_with_no_usable_partition_raises_instead_of_streaming_forever():
+    """The failure that hung the 1024 monet-image runs, now bounded.
+
+    _stream_files_forever skips None internally, so the interleaver's next() on a
+    source that never yields would never return and the worker would download at full
+    line rate forever, producing no batch and no error.
     """
     ds = FineT2IStreamingDataset(
-        repo_id="ma-xu/fine-t2i",
-        resolution=32,
-        shuffle_buffer=0,
-        # every synthetic row is 1200x800, so nothing can clear a 4096 short side
+        repo_id="ma-xu/fine-t2i", resolution=32, shuffle_buffer=0,
         min_short_side=4096,
-        max_screened_without_accept=5,
+        max_screened_per_shard=5, max_barren_shards=3,
     )
     ds._fs = None
     ds._iter_shard = lambda path: iter([None] * 50)  # type: ignore[method-assign]
 
-    stream = ds._stream_files_forever(["a.tar"], seed_offset=0, tag="cc12m")
+    stream = ds._stream_files_forever(["a.tar", "b.tar", "c.tar"], seed_offset=0, tag="cc12m")
     with pytest.raises(UnusableSourceError) as excinfo:
         next(stream)
 
     msg = str(excinfo.value)
     assert "cc12m" in msg, msg
     assert "min_short_side=4096" in msg, msg
+
+
+def test_a_yield_resets_the_barren_shard_streak():
+    """Occasional barren shards must never accumulate into a false fatal."""
+    rec = t2i_example_to_record(_example(), resolution=32, caption_mode="short")
+    shards = {"bad.tar": [None] * 50, "good.tar": [rec]}
+    ds = FineT2IStreamingDataset(
+        repo_id="ma-xu/fine-t2i", resolution=32, shuffle_buffer=0,
+        max_screened_per_shard=5, max_barren_shards=2,
+    )
+    ds._fs = None
+    ds._iter_shard = lambda path: iter(list(shards[path]))  # type: ignore[method-assign]
+
+    # bad, good, bad, good, bad: the streak never reaches 2 unbroken with no output.
+    order = ["bad.tar", "good.tar", "bad.tar", "good.tar", "bad.tar"]
+    got = list(islice(ds._stream_files_forever(order, seed_offset=0, tag="mixed"), 2))
+    assert all(g is rec for g in got)
 
 
 def test_unusable_source_is_not_mistaken_for_a_transient_network_error():
@@ -406,7 +436,7 @@ def test_the_guard_does_not_fire_on_a_merely_selective_source():
 
     ds = FineT2IStreamingDataset(
         repo_id="ma-xu/fine-t2i", resolution=32, shuffle_buffer=0,
-        max_screened_without_accept=100,
+        max_screened_per_shard=100,
     )
     ds._fs = None
     # 99 rejects, then an accept: under the threshold, so no raise.

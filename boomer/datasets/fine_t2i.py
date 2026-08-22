@@ -300,16 +300,24 @@ class FineT2IStreamingDataset(IterableDataset):
     stream_reconnect_backoff: float = 5.0
     # Best-effort GC cadence for long-lived workers holding ~3 MB pixel records.
     memory_trim_every: int = 256
-    # Records one source may screen out CONSECUTIVELY, from the start of a pass,
-    # before we call it unusable. A source whose rows all fail the record filters is
-    # not merely slow: _stream_files_forever skips None internally, so the
-    # _interleave_sources `next()` on that source never returns and the worker streams
-    # it forever at full line rate, producing nothing. The only other backstop is
-    # "zero usable rows in a complete pass", which is unreachable when a pass is tens
-    # of shards of several GB. This is what silently hung the first 1024 monet-image
-    # run: cc12m is 0% and megalith10m 2% at min_short_side=1024, together 25% of the
-    # mix. 0 disables the check.
-    max_screened_without_accept: int = 2000
+    # Rows one SHARD may screen out before we abandon it. A shard whose rows all fail
+    # the record filters is not merely slow: _stream_files_forever skips None
+    # internally, so the _interleave_sources `next()` on that source never returns and
+    # the worker streams the shard forever at full line rate, producing nothing. This
+    # is what silently hung the first 1024 monet-image runs.
+    #
+    # A barren shard is a data property, not a config error -- MONET buckets by
+    # resolution, so at min_short_side=1024 a source can be 90% usable partitions and
+    # still hand a worker a shard that is 0%. So skip it like a transient error and
+    # move on, rather than failing the run. Cost is bounded at this many rows (~1.2 MB
+    # each; the tar is sequential, so a rejected row's jpg bytes are already on the
+    # wire before its json is readable). 0 disables the check.
+    max_screened_per_shard: int = 200
+    # Consecutive barren shards tolerated while the pass has yielded NOTHING. This is
+    # the real "this source cannot work" signal -- one bad shard is data, twenty in a
+    # row with no output is a filter no partition of this source satisfies. Bounds the
+    # damage at max_barren_shards * max_screened_per_shard rows. 0 disables.
+    max_barren_shards: int = 20
     # fsspec ReadAheadCache fetch unit. Every tarfile read that misses the cache asks
     # HF for `stream_block_size + 10 KiB` in ONE Range request. At the fsspec default
     # (5 MiB) HF closed the connection ~1.8 MB in once many streams ran in parallel
@@ -343,8 +351,10 @@ class FineT2IStreamingDataset(IterableDataset):
             raise ValueError("memory_trim_every must be >= 0")
         if self.stream_block_size <= 0:
             raise ValueError("stream_block_size must be > 0")
-        if self.max_screened_without_accept < 0:
-            raise ValueError("max_screened_without_accept must be >= 0")
+        if self.max_screened_per_shard < 0:
+            raise ValueError("max_screened_per_shard must be >= 0")
+        if self.max_barren_shards < 0:
+            raise ValueError("max_barren_shards must be >= 0")
         self._sources = _parse_sources(self.data_dir)
         self._weights = _parse_weights(self.data_dir_weights, len(self._sources))
         if len(self._sources) > 1 and self.data_files is not None:
@@ -587,10 +597,12 @@ class FineT2IStreamingDataset(IterableDataset):
             random.Random(self.seed + seed_offset + epoch).shuffle(order)
             yielded = 0
             screened = 0  # rows inspected this pass, accepted or filtered out
+            barren_shards = 0  # consecutive shards abandoned with nothing accepted
             transient_skips = 0
             for path in order:
                 try:
                     shard = self._iter_shard(path)
+                    screened_here = 0
                     while True:
                         try:
                             record = next(shard)
@@ -598,26 +610,46 @@ class FineT2IStreamingDataset(IterableDataset):
                             break
                         reconnects = 0
                         screened += 1
+                        screened_here += 1
                         if record is None:
                             if (
+                                self.max_screened_per_shard <= 0
+                                or screened_here < self.max_screened_per_shard
+                            ):
+                                continue
+                            # Barren shard: abandon it the way a transient error would,
+                            # so one unusable shard costs a bounded read instead of
+                            # parking the worker on it forever.
+                            barren_shards += 1
+                            print(
+                                f"[{self.log_tag}] {path}: {screened_here} rows, none "
+                                f"passed the record filters (min_short_side="
+                                f"{self.min_short_side}, min_aesthetic="
+                                f"{self.min_aesthetic}); skipping shard "
+                                f"({barren_shards} barren in a row)",
+                                flush=True,
+                            )
+                            if (
                                 yielded == 0
-                                and self.max_screened_without_accept > 0
-                                and screened >= self.max_screened_without_accept
+                                and self.max_barren_shards > 0
+                                and barren_shards >= self.max_barren_shards
                             ):
                                 raise UnusableSourceError(
-                                    f"[{self.log_tag}] screened {screened} rows from "
-                                    f"{tag} without a single one passing the record "
-                                    f"filters (min_short_side={self.min_short_side}, "
-                                    f"min_aesthetic={self.min_aesthetic}). A source "
-                                    "that never yields cannot participate in a mix: "
-                                    "the interleaver blocks on it and the worker "
-                                    "streams it forever without producing a batch. "
-                                    "Drop this source from the mix, or relax the "
-                                    "filter it cannot satisfy."
+                                    f"[{self.log_tag}] {barren_shards} consecutive "
+                                    f"shards of {tag} yielded nothing "
+                                    f"({screened} rows screened, 0 passed "
+                                    f"min_short_side={self.min_short_side}, "
+                                    f"min_aesthetic={self.min_aesthetic}). No "
+                                    "partition of this source satisfies the filter, "
+                                    "so the interleaver would block on it forever. "
+                                    "Drop it from the mix, restrict the glob to "
+                                    "partitions that do satisfy the filter, or relax "
+                                    "the filter."
                                 )
-                            continue
+                            break
                         rows += 1
                         yielded += 1
+                        barren_shards = 0
                         yield record
                         if self.memory_trim_every > 0 and rows % self.memory_trim_every == 0:
                             gc.collect()
