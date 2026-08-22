@@ -343,6 +343,22 @@ def test_main_rejects_t2i_resolution_latent_size_mismatch() -> None:
         _run_main(["--t2i-direct", "--latent-size", "16", "--t2i-resolution", "1024"])
 
 
+def test_main_rejects_monet_image_resolution_latent_size_mismatch() -> None:
+    with pytest.raises(SystemExit, match="--latent-size 32"):
+        _run_main([
+            "--monet-image-direct", "--cache-wds", "x.tar",
+            "--latent-size", "16", "--monet-image-resolution", "1024",
+        ])
+
+
+def test_main_rejects_monet_image_plus_t2i() -> None:
+    with pytest.raises(SystemExit, match="cannot combine"):
+        _run_main([
+            "--monet-image-direct", "--t2i-direct", "--cache-wds", "x.tar",
+            "--latent-size", "32",
+        ])
+
+
 def test_main_requires_cache_wds_without_t2i_direct() -> None:
     with pytest.raises(SystemExit, match="--cache-wds is required"):
         _run_main(["--monet-direct"])

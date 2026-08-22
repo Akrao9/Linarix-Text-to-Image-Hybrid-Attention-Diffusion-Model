@@ -100,6 +100,10 @@ from boomer.datasets.monet_direct import (  # noqa: E402
     MonetDirectStreamingDataset,
     collate_monet_records,
 )
+from boomer.datasets.monet_image_direct import (  # noqa: E402
+    MonetImageStreamingDataset,
+    collate_monet_image_records,
+)
 from boomer.datasets.wds_latents import (  # noqa: E402
     ParquetStreamingLatentCacheDataset,
     PrefetchingWdsLatentCacheDataset,
@@ -321,7 +325,7 @@ class BoomerLit(pl.LightningModule):
             vae = load_vae(cfg, hf_token=self._hf_token)
             vae.requires_grad_(False)
             vae.eval()
-            print(f"[edit-direct] DC-AE {cfg.vae_id} resident (frozen, bf16, "
+            print(f"[pixel-direct] DC-AE {cfg.vae_id} resident (frozen, bf16, "
                   f"scaling={cfg.scaling_factor})", flush=True)
             self._vae_box.append(vae)
         vae = self._vae_box[0]
@@ -559,8 +563,8 @@ class BoomerLit(pl.LightningModule):
         if x0 is None:
             pixels = batch.get("pixels")
             if pixels is not None:
-                # --t2i-direct: the batch carries a single image; encode it to x0
-                # with the resident frozen DC-AE (plain t2i, no cond_input).
+                # --t2i-direct / --monet-image-direct: the batch carries a single
+                # image; encode it to x0 with the frozen DC-AE (no cond_input).
                 x0 = self.encode_pixels(pixels)
             else:
                 # --edit-direct: the batch carries a pixel pair; encode both sides
@@ -574,7 +578,7 @@ class BoomerLit(pl.LightningModule):
 
         text = batch.get("text_embedding")
         if text is None:
-            # --monet-direct: the batch carries raw captions; encode them on-GPU with
+            # Direct pixel/MONET paths carry raw captions; encode them on-GPU with
             # the resident frozen Qwen encoder (no cached text in the stream).
             text, mask = self.encode_captions(batch["caption"])
         else:
@@ -1145,6 +1149,9 @@ class BoomerData(pl.LightningDataModule):
         parquet_range_size_mib: int = 64,
         captions_only: bool = False,
         monet_direct: bool = False,
+        monet_image_direct: bool = False,
+        monet_image_resolution: int = 1024,
+        monet_image_min_short_side: int = 0,
         monet_latent_key: str = MONET_LATENT_KEY,
         monet_caption_keys: tuple[str, ...] = MONET_CAPTION_KEYS,
         monet_caption_probs: Any = None,  # CSV / ';'-grouped str, tuple, or None
@@ -1175,6 +1182,9 @@ class BoomerData(pl.LightningDataModule):
         super().__init__()
         self.captions_only = captions_only
         self.monet_direct = monet_direct
+        self.monet_image_direct = monet_image_direct
+        self.monet_image_resolution = monet_image_resolution
+        self.monet_image_min_short_side = monet_image_min_short_side
         self.edit_direct = edit_direct
         self.edit_resolution = edit_resolution
         self.edit_min_o_score = edit_min_o_score
@@ -1247,6 +1257,27 @@ class BoomerData(pl.LightningDataModule):
         return None, None
 
     def _dataset(self, *, seed_salt: int = 0):
+        if self.monet_image_direct:
+            rank, world = self._trainer_rank_world()
+            dataset = MonetImageStreamingDataset(
+                paths=self.cache_wds,
+                hf_token=self.hf_token,
+                resolution=self.monet_image_resolution,
+                shuffle_buffer=self.shuffle_buffer,
+                seed=self.seed + seed_salt,
+                caption_keys=self.monet_caption_keys,
+                caption_probs=self.monet_caption_probs,
+                glob_weights=self.monet_weights,
+                dino_key=self.monet_dino_key,
+                min_short_side=self.monet_image_min_short_side,
+                min_aesthetic=self.monet_min_aesthetic,
+                max_nsfw=self.monet_max_nsfw,
+                max_watermark=self.monet_max_watermark,
+                rank=rank,
+                world_size=world,
+            )
+            dataset.prepare_shards()
+            return dataset
         if self.t2i_direct:
             rank, world = self._trainer_rank_world()
             return FineT2IStreamingDataset(
@@ -1335,7 +1366,7 @@ class BoomerData(pl.LightningDataModule):
         # download). Parquet range-streaming and local globs use multiple workers
         # (datasets shards parquet files across workers automatically).
         parquet = (
-            self.monet_direct or self.edit_direct or self.t2i_direct
+            self.monet_direct or self.monet_image_direct or self.edit_direct or self.t2i_direct
             or is_parquet_cache(self.cache_wds)
         )
         if parquet:
@@ -1391,7 +1422,8 @@ class BoomerData(pl.LightningDataModule):
             batch_size=self.batch_size,
             num_workers=workers,
             collate_fn=(
-                collate_t2i_records if self.t2i_direct
+                collate_monet_image_records if self.monet_image_direct
+                else collate_t2i_records if self.t2i_direct
                 else collate_edit_records if self.edit_direct
                 else collate_monet_records if self.monet_direct
                 else collate_latent_records
@@ -2547,6 +2579,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--monet-direct", action=bo, default=False,
                    help="Stream jasperai/monet parquet shards directly: latents from the "
                         "dataset, text encoded on the fly (skips the caching pipeline).")
+    p.add_argument("--monet-image-direct", action=bo, default=False,
+                   help="Stream MONET WebDataset tar shards directly: full-resolution jpg "
+                        "pixels are DC-AE encoded on the fly and json captions are encoded "
+                        "by Qwen. --cache-wds must point at comma-separated MONET *.tar "
+                        "globs; --monet-weights/caption-probs retain their usual meaning.")
+    p.add_argument("--monet-image-resolution", type=int, default=1024,
+                   help="Square output resolution for --monet-image-direct (resize short "
+                        "side, then center crop).")
+    p.add_argument("--monet-image-min-short-side", type=int, default=0,
+                   help="Drop native MONET images below this short-side size before resize; "
+                        "0 keeps and upscales them, matching nano-t2i's 1024 recipe.")
     p.add_argument("--cache-captions-only", action=bo, default=False,
                    help="Boomer WDS/parquet caches: IGNORE the cached text/text_mask "
                         "columns (parquet never even downloads them) and encode the raw "
@@ -3054,7 +3097,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "that can exceed Blackwell's per-SM resource limits.")
     p.add_argument("--compile-vae", action="store_true",
                    help="torch.compile the frozen DC-AE ENCODER (default off). Only "
-                        "matters for the on-the-fly encode paths (--t2i-direct / "
+                        "matters for the on-the-fly encode paths (--monet-image-direct / "
+                        "--t2i-direct / "
                         "--edit-direct), where the VAE runs eager and can dominate step "
                         "time. Keep --edit-encode-chunk a divisor of --batch-size so "
                         "every chunk has one shape and Inductor compiles one graph.")
@@ -3081,6 +3125,36 @@ def main() -> None:
             "Use only one per-timestep loss weighting: --timestep-weight "
             "(Sana sqrt(1+sigma^2)/sigma) OR --min-snr-gamma, not both."
         )
+    # --monet-image-direct: MONET's full-resolution jpgs, encoded on the fly.
+    if args.monet_image_direct:
+        conflicts = [
+            name for name, on in (
+                ("--monet-direct", args.monet_direct),
+                ("--t2i-direct", args.t2i_direct),
+                ("--edit-direct", args.edit_direct),
+                ("--fill-training", args.fill_training),
+                ("--cache-captions-only", args.cache_captions_only),
+            ) if on
+        ]
+        if conflicts:
+            raise SystemExit(
+                "--monet-image-direct streams plain MONET images on the fly; it cannot "
+                f"combine with {', '.join(conflicts)}."
+            )
+        if args.latent_size * 32 != args.monet_image_resolution:
+            raise SystemExit(
+                f"--monet-image-resolution {args.monet_image_resolution} needs "
+                f"--latent-size {args.monet_image_resolution // 32} (DC-AE f32), got "
+                f"--latent-size {args.latent_size}."
+            )
+        if args.wds_shuffle_buffer > 512:
+            print(
+                f"[monet-image-direct] clamping --wds-shuffle-buffer "
+                f"{args.wds_shuffle_buffer} -> 512 (1024px pixel records are ~3 MB each)",
+                flush=True,
+            )
+            args.wds_shuffle_buffer = 512
+
     # --t2i-direct: plain single-image on-the-fly t2i. Cannot combine with the
     # latent-cache / captions-only / conditioning phases (it streams raw pixels
     # and builds no cond_input). Checked first so a conflicting combo errors on
@@ -3089,6 +3163,7 @@ def main() -> None:
         conflicts = [
             name for name, on in (
                 ("--monet-direct", args.monet_direct),
+                ("--monet-image-direct", args.monet_image_direct),
                 ("--edit-direct", args.edit_direct),
                 ("--fill-training", args.fill_training),
                 ("--cache-captions-only", args.cache_captions_only),
@@ -3120,9 +3195,11 @@ def main() -> None:
     if args.fill_training and args.edit_direct:
         raise SystemExit("--fill-training and --edit-direct are separate phases (E1/E2); "
                          "pick one per run.")
-    if args.edit_direct and (args.monet_direct or args.cache_captions_only):
+    if args.edit_direct and (
+        args.monet_direct or args.monet_image_direct or args.cache_captions_only
+    ):
         raise SystemExit("--edit-direct streams pixel pairs; it cannot combine with "
-                         "--monet-direct or --cache-captions-only.")
+                         "--monet-direct, --monet-image-direct, or --cache-captions-only.")
     if args.fill_training or args.edit_direct:
         expected_extra = args.latent_channels + 1
         if args.extra_input_channels != expected_extra:
@@ -3227,7 +3304,10 @@ def main() -> None:
 
     hf_token = hf_token_value(args.hf_token)
 
-    if args.monet_direct or args.cache_captions_only or args.edit_direct or args.t2i_direct:
+    if (
+        args.monet_direct or args.monet_image_direct or args.cache_captions_only
+        or args.edit_direct or args.t2i_direct
+    ):
         # On-the-fly text: text_seq_len is the fixed encode length and text_dim comes
         # from the encoder's config.json. --monet-direct also skips the shard peek
         # entirely (monet's 512px f32c32 latents are the --latent-* defaults);
@@ -3242,6 +3322,7 @@ def main() -> None:
             args.text_dim *= len(fusion_layers)
         tag = (
             "monet-direct" if args.monet_direct
+            else "monet-image-direct" if args.monet_image_direct
             else "edit-direct" if args.edit_direct
             else "t2i-direct" if args.t2i_direct
             else "captions-only"
@@ -3252,7 +3333,7 @@ def main() -> None:
             f"({layer_desc}) -> text=({args.text_seq_len},{args.text_dim})",
             flush=True,
         )
-    if args.monet_direct or args.edit_direct or args.t2i_direct:
+    if args.monet_direct or args.monet_image_direct or args.edit_direct or args.t2i_direct:
         args.skip_peek = True
 
     if args.skip_peek:
@@ -3275,6 +3356,7 @@ def main() -> None:
         config,
         hf_token=hf_token,
         monet_direct=args.monet_direct,
+        monet_image_direct=args.monet_image_direct,
         fill_training=args.fill_training,
         fill_mask_probs=args.fill_mask_probs,
         cond_input_dropout=args.cond_input_dropout,
@@ -3397,6 +3479,9 @@ def main() -> None:
         parquet_range_size_mib=args.parquet_range_size_mib,
         captions_only=args.cache_captions_only,
         monet_direct=args.monet_direct,
+        monet_image_direct=args.monet_image_direct,
+        monet_image_resolution=args.monet_image_resolution,
+        monet_image_min_short_side=args.monet_image_min_short_side,
         monet_latent_key=args.monet_latent_key,
         monet_caption_keys=tuple(
             key.strip() for key in args.monet_caption_keys.split(",") if key.strip()
@@ -3492,7 +3577,8 @@ def main() -> None:
             max_length=args.text_seq_len,
             hf_token=hf_token,
             encode_on_the_fly=(
-                args.monet_direct or args.cache_captions_only or args.edit_direct
+                args.monet_direct or args.monet_image_direct
+                or args.cache_captions_only or args.edit_direct
                 or args.t2i_direct
             ),
             prompts_file=args.sample_prompts_file,

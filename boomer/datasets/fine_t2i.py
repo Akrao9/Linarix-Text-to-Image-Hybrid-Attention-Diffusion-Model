@@ -289,6 +289,8 @@ class FineT2IStreamingDataset(IterableDataset):
     stream_reconnect_backoff: float = 5.0
     # Best-effort GC cadence for long-lived workers holding ~3 MB pixel records.
     memory_trim_every: int = 256
+    # Subclasses can reuse the streaming engine while keeping diagnostics honest.
+    log_tag: str = "t2i-direct"
     _fs: Any = field(init=False, repr=False, default=None)  # lazy HfFileSystem
     _caption_rng: random.Random = field(init=False, repr=False)
     _sources: tuple[str, ...] = field(init=False, repr=False, default=())
@@ -518,14 +520,15 @@ class FineT2IStreamingDataset(IterableDataset):
             pass
         return int(os.environ.get("RANK", "0")), int(os.environ.get("WORLD_SIZE", "1"))
 
-    @staticmethod
-    def _split_files(files: list[str], offset: int, stride: int, tag: str) -> list[str]:
+    def _split_files(
+        self, files: list[str], offset: int, stride: int, tag: str
+    ) -> list[str]:
         """This (rank, worker)'s disjoint shard slice. More readers than shards →
         fall back to all shards (duplication beats a starved empty worker)."""
         mine = files[offset::stride] if stride > 1 else list(files)
         if not mine:
             print(
-                f"[t2i-direct] {tag}: more readers ({stride}) than shards "
+                f"[{self.log_tag}] {tag}: more readers ({stride}) than shards "
                 f"({len(files)}); reading ALL shards (rows duplicate across readers)",
                 flush=True,
             )
@@ -575,7 +578,7 @@ class FineT2IStreamingDataset(IterableDataset):
                     self._fs = None
                     if reconnects > self.stream_reconnect_max_retries:
                         raise RuntimeError(
-                            f"[t2i-direct] {reconnects} consecutive transient errors "
+                            f"[{self.log_tag}] {reconnects} consecutive transient errors "
                             f"streaming {tag}; giving up. Last: {exc!r}"
                         ) from exc
                     delay = min(
@@ -585,7 +588,7 @@ class FineT2IStreamingDataset(IterableDataset):
                     # in lockstep (monet is naturally staggered mid-shard; we are not).
                     delay *= random.uniform(0.75, 1.25)
                     print(
-                        f"[t2i-direct] transient error on {path} "
+                        f"[{self.log_tag}] transient error on {path} "
                         f"({type(exc).__name__}: {exc}); skipping shard "
                         f"(retry {reconnects}/{self.stream_reconnect_max_retries}) "
                         f"after {delay:.0f}s",
@@ -596,7 +599,7 @@ class FineT2IStreamingDataset(IterableDataset):
             if yielded == 0:
                 if transient_skips > 0:
                     print(
-                        f"[t2i-direct] pass over {tag} yielded 0 rows with "
+                        f"[{self.log_tag}] pass over {tag} yielded 0 rows with "
                         f"{transient_skips} transient shard skip(s); retrying pass "
                         f"(reconnect budget {reconnects}/"
                         f"{self.stream_reconnect_max_retries})",
@@ -605,7 +608,7 @@ class FineT2IStreamingDataset(IterableDataset):
                     epoch += 1
                     continue
                 raise RuntimeError(
-                    f"[t2i-direct] streamed 0 usable rows for {tag} across "
+                    f"[{self.log_tag}] streamed 0 usable rows for {tag} across "
                     f"{len(files)} shard(s) ({rows} rows read; all filtered?) "
                     "— refusing to spin an empty epoch loop."
                 )
@@ -621,7 +624,7 @@ class FineT2IStreamingDataset(IterableDataset):
             files = self._cached_shard_files(source)
             mine = self._split_files(files, offset, stride, tag=source)
             print(
-                f"[t2i-direct] mix[{i}] w={self._weights[i]:g} "
+                f"[{self.log_tag}] mix[{i}] w={self._weights[i]:g} "
                 f"{len(mine)}/{len(files)} shard(s) {source}",
                 flush=True,
             )
@@ -659,7 +662,7 @@ class FineT2IStreamingDataset(IterableDataset):
             self.shuffle_buffer, max(1, num_workers)
         )
         print(
-            f"[t2i-direct rank {rank}/{world} worker {worker_id}/{num_workers}] "
+            f"[{self.log_tag} rank {rank}/{world} worker {worker_id}/{num_workers}] "
             f"repo={self.repo_id} shuffle_buffer={buffer_cap} "
             f"(global={self.shuffle_buffer}) trim_every={self.memory_trim_every}"
             + (f" mix_weights={list(self._weights)}" if self._weights else ""),
@@ -678,7 +681,7 @@ class FineT2IStreamingDataset(IterableDataset):
                 files, offset, stride, tag=f"rank {rank} worker {worker_id}"
             )
             print(
-                f"[t2i-direct rank {rank}/{world} worker {worker_id}/{num_workers}] "
+                f"[{self.log_tag} rank {rank}/{world} worker {worker_id}/{num_workers}] "
                 f"{len(mine)}/{len(files)} shard(s)"
                 + (f" data_dir={source}" if source else ""),
                 flush=True,
