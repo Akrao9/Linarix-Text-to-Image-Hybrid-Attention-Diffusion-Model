@@ -300,7 +300,11 @@ class FineT2IStreamingDataset(IterableDataset):
     stream_reconnect_backoff: float = 5.0
     # Best-effort GC cadence for long-lived workers holding ~3 MB pixel records.
     memory_trim_every: int = 256
-    # Rows one SHARD may screen out before we abandon it. A shard whose rows all fail
+    # CONSECUTIVE rejected rows one SHARD may produce before we abandon it. Consecutive,
+    # not cumulative: an accepted row resets the counter. A cumulative count silently
+    # truncated every healthy shard -- fine-t2i's synthetic shards yielded ~64 good rows,
+    # hit their first filtered row, and were dropped with a log line claiming "none
+    # passed", which is how the bug was found. A shard whose rows all fail
     # the record filters is not merely slow: _stream_files_forever skips None
     # internally, so the _interleave_sources `next()` on that source never returns and
     # the worker streams the shard forever at full line rate, producing nothing. This
@@ -621,7 +625,8 @@ class FineT2IStreamingDataset(IterableDataset):
             for path in order:
                 try:
                     shard = self._iter_shard(path)
-                    screened_here = 0
+                    misses_here = 0  # consecutive rejects since this shard last yielded
+                    accepted_here = 0
                     while True:
                         try:
                             record = next(shard)
@@ -629,19 +634,30 @@ class FineT2IStreamingDataset(IterableDataset):
                             break
                         reconnects = 0
                         screened += 1
-                        screened_here += 1
                         if record is None:
+                            misses_here += 1
                             if (
                                 self.max_screened_per_shard <= 0
-                                or screened_here < self.max_screened_per_shard
+                                or misses_here < self.max_screened_per_shard
                             ):
                                 continue
-                            # Barren shard: abandon it the way a transient error would,
-                            # so one unusable shard costs a bounded read instead of
-                            # parking the worker on it forever.
+                            # Abandon the shard the way a transient error would, so an
+                            # unusable stretch costs a bounded read instead of parking
+                            # the worker on it forever. Only a shard that gave us
+                            # NOTHING is barren; one that yielded and then hit a long
+                            # rejected run is merely exhausted, and must not count
+                            # toward the "this source cannot work" streak.
+                            if accepted_here:
+                                print(
+                                    f"[{self.log_tag}] {path}: {misses_here} rows in a "
+                                    f"row filtered out after {accepted_here} accepted; "
+                                    "moving to the next shard",
+                                    flush=True,
+                                )
+                                break
                             barren_shards += 1
                             print(
-                                f"[{self.log_tag}] {path}: {screened_here} rows, none "
+                                f"[{self.log_tag}] {path}: {misses_here} rows, none "
                                 f"passed the record filters (min_short_side="
                                 f"{self.min_short_side}, min_aesthetic="
                                 f"{self.min_aesthetic}); skipping shard "
@@ -668,6 +684,8 @@ class FineT2IStreamingDataset(IterableDataset):
                             break
                         rows += 1
                         yielded += 1
+                        accepted_here += 1
+                        misses_here = 0
                         barren_shards = 0
                         yield record
                         if self.memory_trim_every > 0 and rows % self.memory_trim_every == 0:

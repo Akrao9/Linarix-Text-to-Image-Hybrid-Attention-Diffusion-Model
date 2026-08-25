@@ -374,6 +374,54 @@ def test_barren_shard_is_skipped_not_fatal():
     assert got is rec, "a barren shard must be abandoned and the next one tried"
 
 
+def test_a_healthy_shard_is_not_truncated_by_one_filtered_row():
+    """The screen counts CONSECUTIVE rejects, not rows inspected.
+
+    Counting cumulatively truncated every healthy shard: fine-t2i's synthetic shards
+    yielded ~64 good rows, hit their first filtered row with the counter already past
+    the cap, and were abandoned -- logged as "none passed the record filters" while
+    they had in fact passed 64. The tell in the log was the row count drifting (64, 65,
+    ... 90) where a real barren shard breaks at exactly the cap, and every skip
+    reporting "1 barren in a row" because each accepted row reset the streak.
+    """
+    rec = t2i_example_to_record(_example(), resolution=32, caption_mode="short")
+    # 20 good rows, one filtered row, 20 more good rows -- all 40 must come through.
+    rows = [rec] * 20 + [None] + [rec] * 20
+
+    ds = FineT2IStreamingDataset(
+        repo_id="ma-xu/fine-t2i", resolution=32, shuffle_buffer=0,
+        max_screened_per_shard=10, max_barren_shards=20,
+    )
+    ds._fs = None
+    ds._iter_shard = lambda path: iter(rows)  # type: ignore[method-assign]
+
+    stream = ds._stream_files_forever(["a.tar"], seed_offset=0, tag="s")
+    got = [next(stream) for _ in range(40)]
+    assert all(r is rec for r in got), "one filtered row must not end a productive shard"
+
+
+def test_a_long_rejected_run_ends_the_shard_without_calling_it_barren():
+    """Bounded cost still applies mid-shard, but it is not evidence about the source."""
+    rec = t2i_example_to_record(_example(), resolution=32, caption_mode="short")
+    shards = {
+        "a.tar": [rec] + [None] * 100,  # yields, then a rejected run past the cap
+        "b.tar": [rec],
+    }
+
+    ds = FineT2IStreamingDataset(
+        repo_id="ma-xu/fine-t2i", resolution=32, shuffle_buffer=0,
+        # A source that only ever yields once per shard must never trip the fatal
+        # guard: max_barren_shards=1 would fire immediately if such a shard counted.
+        max_screened_per_shard=10, max_barren_shards=1,
+    )
+    ds._fs = None
+    ds._iter_shard = lambda path: iter(shards[path])  # type: ignore[method-assign]
+
+    stream = ds._stream_files_forever(["a.tar", "b.tar"], seed_offset=0, tag="s")
+    assert next(stream) is rec
+    assert next(stream) is rec, "a shard that yielded is exhausted, not barren"
+
+
 def test_source_with_no_usable_partition_raises_instead_of_streaming_forever():
     """The failure that hung the 1024 monet-image runs, now bounded.
 
