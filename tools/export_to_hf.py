@@ -310,7 +310,7 @@ def _write_model_card(
         f"{index}. {prompt}" for index, prompt in enumerate(SHOWCASE_PROMPTS, 1)
     )
     card = f"""---
-license: apache-2.0
+license: other
 library_name: diffusers
 pipeline_tag: text-to-image
 tags:
@@ -417,6 +417,20 @@ All {config['latent_size'] * 32}px, EMA weights, {meta.sampler.upper()} / {meta.
 `flow_shift={meta.flow_shift}`. Prompts (left→right, top→bottom):
 
 {prompt_list}
+
+## Licensing
+
+The weights are released under a custom license; the terms are not finalised, so no
+open-source license is asserted here. Treat the tag as "all rights reserved pending the
+published terms" and ask before relying on these weights in anything you ship.
+
+The runtime code bundled in this repo (`pipeline_boomer.py`, `modeling_boomer_fla.py`,
+`qwen_connector.py`) is covered by the same pending terms. `STORKScheduler.py` and
+`STORK_constants/` are third-party (Tan et al. 2025, arXiv:2505.24210) and keep their
+own upstream license.
+
+The text encoder (`{meta.te_repo}`) and the VAE (`{meta.vae_repo}`) are separate
+downloads under their own licenses; nothing here relicenses them.
 """
     (out_dir / "README.md").write_text(card)
 
