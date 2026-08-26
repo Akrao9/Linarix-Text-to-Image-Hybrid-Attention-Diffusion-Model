@@ -18,9 +18,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from boomer.datasets.fine_t2i import (  # noqa: E402
+    _EPOCH_END,
     FineT2IStreamingDataset,
     T2IRecord,
     UnusableSourceError,
+    _parse_screen_caps,
     collate_t2i_records,
     t2i_example_to_record,
 )
@@ -420,6 +422,51 @@ def test_a_long_rejected_run_ends_the_shard_without_calling_it_barren():
     stream = ds._stream_files_forever(["a.tar", "b.tar"], seed_offset=0, tag="s")
     assert next(stream) is rec
     assert next(stream) is rec, "a shard that yielded is exhausted, not barren"
+
+
+def test_head_screening_pins_a_sparse_source_to_the_same_rows_every_pass():
+    """Why the per-source override exists.
+
+    The cap screens a FIXED window at each shard's head, so a source whose usable rows
+    are sparse there returns the identical subset every pass. Measured on fine-t2i
+    `curated`: two runs, one resumed with a salted stream seed, accepted the same
+    counts from the same shards (train-000024 -> 10, -000027 -> 11, -000051 -> 23).
+    """
+    rec = t2i_example_to_record(_example(), resolution=32, caption_mode="short")
+    # Two usable rows up front, then a long rejected run, then more usable rows that a
+    # head screen can never reach.
+    rows = [rec] * 2 + [None] * 40 + [rec] * 20
+
+    def _stream(cap, seed):
+        ds = FineT2IStreamingDataset(
+            repo_id="ma-xu/fine-t2i", resolution=32, shuffle_buffer=0, seed=seed,
+            max_screened_per_shard=cap, max_barren_shards=0,
+        )
+        ds._fs = None
+        ds._iter_shard = lambda path: iter(list(rows))  # type: ignore[method-assign]
+        return ds._stream_files_forever(["a.tar"], seed_offset=0, tag="curated")
+
+    # Capped: two records per pass, forever. Salting the seed cannot move the window,
+    # which is exactly what the two production runs showed.
+    pattern = [False, False, True, False, False, True]  # rec, rec, epoch-end, ...
+    for seed in (42, 15042):
+        got = list(islice(_stream(10, seed), 6))
+        assert [r is _EPOCH_END for r in got] == pattern, f"seed={seed}: {got}"
+
+    # cap=0 reads to the end, so all 22 usable rows become reachable.
+    got = list(islice(_stream(0, 42), 22))
+    assert not any(r is _EPOCH_END for r in got), "cap=0 must reach rows past the run"
+
+
+def test_per_source_screen_cap_applies_to_the_right_source():
+    caps = _parse_screen_caps("64,0", 2)
+    assert caps == (64, 0)
+    assert _parse_screen_caps(0, 2) == (0, 0), "one value applies to every source"
+    assert _parse_screen_caps(None, 2) is None
+    with pytest.raises(ValueError, match="one value for all, or one each"):
+        _parse_screen_caps("64,0,32", 2)
+    with pytest.raises(ValueError, match=">= 0"):
+        _parse_screen_caps("-1", 1)
 
 
 def test_source_with_no_usable_partition_raises_instead_of_streaming_forever():

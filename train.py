@@ -1173,6 +1173,7 @@ class BoomerData(pl.LightningDataModule):
         t2i_config: str | None = None,
         t2i_data_dir: str | None = None,
         t2i_weights: str | None = None,
+        max_screened_per_shard: str | None = None,
         t2i_split: str = "train",
         t2i_resolution: int = 1024,
         t2i_caption_mode: str = "sample",
@@ -1198,6 +1199,7 @@ class BoomerData(pl.LightningDataModule):
         self.t2i_config = t2i_config
         self.t2i_data_dir = t2i_data_dir
         self.t2i_weights = t2i_weights
+        self.max_screened_per_shard = max_screened_per_shard
         self.t2i_split = t2i_split
         self.t2i_resolution = t2i_resolution
         self.t2i_caption_mode = t2i_caption_mode
@@ -1276,6 +1278,7 @@ class BoomerData(pl.LightningDataModule):
                 max_nsfw=self.monet_max_nsfw,
                 max_watermark=self.monet_max_watermark,
                 stream_block_size=self.stream_block_size,
+                max_screened_per_shard_per_source=self.max_screened_per_shard,
                 rank=rank,
                 world_size=world,
             )
@@ -1298,6 +1301,7 @@ class BoomerData(pl.LightningDataModule):
                 min_short_side=self.t2i_min_short_side,
                 min_aesthetic=self.t2i_min_aesthetic,
                 stream_block_size=self.stream_block_size,
+                max_screened_per_shard_per_source=self.max_screened_per_shard,
                 rank=rank,
                 world_size=world,
             )
@@ -2563,6 +2567,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "this much in one Range GET. Above ~2 MiB, HF truncates the "
                         "response under many parallel streams and huggingface_hub "
                         "re-fetches the whole range with backoff, stalling the run.")
+    p.add_argument("--max-screened-per-shard", type=str, default=None,
+                   help="Consecutive filtered rows a shard may produce before the "
+                        "streaming loaders move on. One value for all sources, or a "
+                        "comma list aligned with --t2i-data-dir / --cache-wds. 0 reads "
+                        "shards to the end. The default (64) screens a FIXED window at "
+                        "each shard's head, so a source whose usable rows are sparse "
+                        "there yields the same few rows every pass no matter the seed "
+                        "-- measured on fine-t2i curated at --t2i-min-short-side 1024. "
+                        "Set 0 for such a source; leave the default where the filter "
+                        "passes most rows, since 0 removes the cost bound.")
     p.add_argument("--persistent-workers", action=bo, default=None,
                    help="Keep DataLoader workers alive between epochs. Default: on when --num-workers > 0.")
     p.add_argument("--parquet-read-batch-size", type=int, default=32,
@@ -3528,6 +3542,7 @@ def main() -> None:
         t2i_config=args.t2i_config,
         t2i_data_dir=args.t2i_data_dir,
         t2i_weights=args.t2i_weights,
+        max_screened_per_shard=args.max_screened_per_shard,
         t2i_split=args.t2i_split,
         t2i_resolution=args.t2i_resolution,
         t2i_caption_mode=args.t2i_caption_mode,

@@ -120,6 +120,35 @@ def _parse_sources(value: Any) -> tuple[str, ...]:
     return tuple(str(part).strip() for part in value if str(part).strip())
 
 
+def _parse_screen_caps(value: Any, num_sources: int) -> tuple[int, ...] | None:
+    """Per-source overrides for ``max_screened_per_shard``.
+
+    One value applies to every source; a list must align 1:1 with ``data_dir``. 0 means
+    "read the shard to its end", which is the setting a source needs when its usable
+    rows are NOT clustered in the head -- see the field's comment for why the default
+    cap silently pins such a source to the same rows forever.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = [part for part in value.split(",") if part.strip()]
+    if isinstance(value, int):
+        value = [value]
+    caps = tuple(int(part) for part in value)
+    if not caps:
+        return None
+    if len(caps) == 1:
+        caps = caps * max(1, num_sources)
+    if len(caps) != max(1, num_sources):
+        raise ValueError(
+            f"max_screened_per_shard_per_source has {len(caps)} values for "
+            f"{num_sources} data_dir entries; pass one value for all, or one each"
+        )
+    if min(caps) < 0:
+        raise ValueError("max_screened_per_shard_per_source must be >= 0")
+    return caps
+
+
 def _parse_weights(value: Any, num_sources: int) -> tuple[float, ...] | None:
     """Validate mixing weights against the resolved subfolder list."""
     if value is None:
@@ -341,6 +370,24 @@ class FineT2IStreamingDataset(IterableDataset):
     # rolled again each epoch. 0.88^50 is ~0.2%. The check must fire on a source that
     # truly cannot work, never on an unlucky shuffle.
     max_barren_shards: int = 50
+    # Per-source override for max_screened_per_shard; one value for all, or one each.
+    #
+    # The cap above bounds cost by screening a WINDOW at the head of each shard, and
+    # that window is deterministic: same shard, same rows, every pass. For a source
+    # whose usable rows are dense in the head that is harmless. For one where they are
+    # sparse it is not -- the source stops being a sample of its shards and becomes a
+    # fixed, tiny subset of them, replayed forever.
+    #
+    # Measured on fine-t2i `curated` at min_short_side=1024: two independent runs, one
+    # from scratch and one resumed at step 15000 with a salted stream seed, accepted
+    # IDENTICAL counts from the same shards (train-000024 -> 10, train-000027 -> 11,
+    # train-000051 -> 23). The salt reshuffles shard order; it cannot move the window.
+    # At 25% of the mix that made ~2k images a quarter of every batch for a 20k run.
+    #
+    # Set 0 for such a source to read its shards to the end. Safe wherever the source
+    # does yield: the unbounded-stream hang the cap exists to prevent needs a source
+    # that yields NOTHING, and max_barren_shards still covers that case.
+    max_screened_per_shard_per_source: Any = None
     # fsspec ReadAheadCache fetch unit. Every tarfile read that misses the cache asks
     # HF for `stream_block_size + 10 KiB` in ONE Range request. At the fsspec default
     # (5 MiB) HF closed the connection ~1.8 MB in once many streams ran in parallel
@@ -356,6 +403,7 @@ class FineT2IStreamingDataset(IterableDataset):
     _caption_rng: random.Random = field(init=False, repr=False)
     _sources: tuple[str, ...] = field(init=False, repr=False, default=())
     _weights: tuple[float, ...] | None = field(init=False, repr=False, default=None)
+    _screen_caps: tuple[int, ...] | None = field(init=False, repr=False, default=None)
     # source subfolder -> its shard file list (repo-relative paths, or absolute locals).
     _file_cache: dict[str | None, list[str] | None] = field(
         init=False, repr=False, default_factory=dict
@@ -380,6 +428,9 @@ class FineT2IStreamingDataset(IterableDataset):
             raise ValueError("max_barren_shards must be >= 0")
         self._sources = _parse_sources(self.data_dir)
         self._weights = _parse_weights(self.data_dir_weights, len(self._sources))
+        self._screen_caps = _parse_screen_caps(
+            self.max_screened_per_shard_per_source, len(self._sources)
+        )
         if len(self._sources) > 1 and self.data_files is not None:
             raise ValueError(
                 "data_files applies to a single stream; it cannot be combined with a "
@@ -607,11 +658,17 @@ class FineT2IStreamingDataset(IterableDataset):
         return mine
 
     def _stream_files_forever(
-        self, files: list[str], *, seed_offset: int, tag: str
+        self, files: list[str], *, seed_offset: int, tag: str,
+        max_screened: int | None = None,
     ) -> Iterator[Any]:
         """Infinite record stream over ``files``: fresh shard order every pass,
         transient-error shard skip on a reconnect budget, hard error if a full
-        pass yields zero usable rows. Emits ``_EPOCH_END`` between passes."""
+        pass yields zero usable rows. Emits ``_EPOCH_END`` between passes.
+
+        ``max_screened`` overrides ``max_screened_per_shard`` for this source (0 reads
+        each shard to its end); None uses the dataset-wide default."""
+        if max_screened is None:
+            max_screened = self.max_screened_per_shard
         epoch = 0
         reconnects = 0
         rows = 0
@@ -636,10 +693,7 @@ class FineT2IStreamingDataset(IterableDataset):
                         screened += 1
                         if record is None:
                             misses_here += 1
-                            if (
-                                self.max_screened_per_shard <= 0
-                                or misses_here < self.max_screened_per_shard
-                            ):
+                            if max_screened <= 0 or misses_here < max_screened:
                                 continue
                             # Abandon the shard the way a transient error would, so an
                             # unusable stretch costs a bounded read instead of parking
@@ -748,14 +802,17 @@ class FineT2IStreamingDataset(IterableDataset):
         for i, source in enumerate(self._sources):
             files = self._cached_shard_files(source)
             mine = self._split_files(files, offset, stride, tag=source)
+            cap = self._screen_caps[i] if self._screen_caps else self.max_screened_per_shard
             print(
                 f"[{self.log_tag}] mix[{i}] w={self._weights[i]:g} "
-                f"{len(mine)}/{len(files)} shard(s) {source}",
+                f"{len(mine)}/{len(files)} shard(s) {source}"
+                + (" (shards read to the end)" if cap <= 0 else f" (screen cap {cap})"),
                 flush=True,
             )
             streams.append(
                 self._stream_files_forever(
-                    mine, seed_offset=offset + 7919 * (i + 1), tag=source
+                    mine, seed_offset=offset + 7919 * (i + 1), tag=source,
+                    max_screened=cap,
                 )
             )
         weights = [float(w) for w in self._weights]  # type: ignore[arg-type]
@@ -826,7 +883,8 @@ class FineT2IStreamingDataset(IterableDataset):
                 flush=True,
             )
             stream = self._stream_files_forever(
-                mine, seed_offset=offset, tag=str(source or self.repo_id)
+                mine, seed_offset=offset, tag=str(source or self.repo_id),
+                max_screened=self._screen_caps[0] if self._screen_caps else None,
             )
 
         buffer: list[T2IRecord] = []

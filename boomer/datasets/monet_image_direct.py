@@ -374,9 +374,15 @@ class MonetImageStreamingDataset(FineT2IStreamingDataset):
         for index, source in enumerate(self._sources):
             files = self._cached_shard_files(source)
             mine = self._split_files(files, offset, stride, tag=source)
+            cap = (
+                self._screen_caps[index]
+                if self._screen_caps
+                else self.max_screened_per_shard
+            )
             print(
                 f"[monet-image-direct] mix[{index}] w={self._weights[index]:g} "
-                f"{len(mine)}/{len(files)} shard(s) {source}",
+                f"{len(mine)}/{len(files)} shard(s) {source}"
+                + (" (shards read to the end)" if cap <= 0 else f" (screen cap {cap})"),
                 flush=True,
             )
             streams.append(
@@ -384,6 +390,7 @@ class MonetImageStreamingDataset(FineT2IStreamingDataset):
                     mine,
                     seed_offset=offset + 7919 * (index + 1),
                     tag=source,
+                    max_screened=cap,
                 )
             )
         indices = list(range(len(streams)))
