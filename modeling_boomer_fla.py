@@ -371,11 +371,32 @@ def hilbert_permutation(height: int, width: int) -> torch.Tensor:
     n = height
     if n <= 0 or (n & (n - 1)) != 0:
         raise ValueError(f"hilbert_mixer_order needs a power-of-two grid, got {n}")
-    perm = torch.empty(n * n, dtype=torch.long)
-    for d in range(n * n):
-        x, y = _hilbert_d2xy(n, d)
-        perm[d] = y * n + x
-    return perm
+    # Vectorized _hilbert_d2xy over all d at once: O(log n) tensor steps, not O(n^2)
+    # Python ones. The scalar loop wrote `perm[d] = ...` element by element, and under
+    # torch.compile Dynamo traced every one of those writes -- Inductor then emitted a
+    # `where` chain n*n deep. At 32x32 (1024 tokens) that compiled; at the 2048px
+    # phase's 64x64 it is 4096 deep and blows up in the scheduler. _hilbert_d2xy is
+    # kept as the scalar reference this is tested against.
+    d = torch.arange(n * n, dtype=torch.long)
+    t = d.clone()
+    x = torch.zeros_like(d)
+    y = torch.zeros_like(d)
+    s = 1
+    while s < n:
+        rx = 1 & (t // 2)
+        ry = 1 & (t ^ rx)
+        # Branchless form of the scalar rotation: reflect only where (ry==0 and rx==1),
+        # then swap x/y wherever ry==0. Both `where`s read the pre-swap x and y.
+        reflect = (ry == 0) & (rx == 1)
+        x = torch.where(reflect, s - 1 - x, x)
+        y = torch.where(reflect, s - 1 - y, y)
+        swap = ry == 0
+        x, y = torch.where(swap, y, x), torch.where(swap, x, y)
+        x = x + s * rx
+        y = y + s * ry
+        t = t // 4
+        s *= 2
+    return y * n + x
 
 
 class ConvLayer(nn.Module):
