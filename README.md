@@ -2,12 +2,11 @@
 
 Hybrid linear-attention diffusion for text-to-image generation.
 
-Linarix-v2 uses the Boomer V8 architecture: a bidirectional GatedDeltaNet-2 condition
-encoder and a full-attention DDT velocity decoder. The denoiser has approximately
-890M parameters; text conditioning comes from frozen Qwen3.5-4B features and images
-use DC-AE latents.
+Linarix combines a bidirectional GatedDeltaNet-2 condition encoder with a
+full-attention DDT velocity decoder. The denoiser has approximately 890M parameters;
+text conditioning comes from frozen Qwen3.5-4B features and images use DC-AE latents.
 
-[Model weights](https://huggingface.co/Akrao9/Linarix-v2) ·
+[Model weights](https://huggingface.co/akrao9/Linarix-v2) ·
 [Demo](https://huggingface.co/spaces/akrao9/Linarix-v2-T2I) ·
 [Training](docs/training.md)
 
@@ -34,7 +33,7 @@ import torch
 from diffusers import DiffusionPipeline
 
 pipe = DiffusionPipeline.from_pretrained(
-    "Akrao9/Linarix-v2",
+    "akrao9/Linarix-v2",
     custom_pipeline="pipeline_boomer",
     trust_remote_code=True,
     torch_dtype=torch.bfloat16,
@@ -48,7 +47,7 @@ image.save("lighthouse.png")
 ```
 
 The export supplies the resolution, text readout, and sampling defaults. The
-published Linarix-v2 checkpoint generates at 1024px; 2048px finishing is experimental.
+published Linarix checkpoint generates at 1024px; 2048px finishing is experimental.
 
 ## Train
 
@@ -68,7 +67,7 @@ The [training guide](docs/training.md) covers the 512px MONET, 1024px MONET,
 
 ## Code
 
-- [`boomer/`](boomer/) — models, data loaders, flow matching, and sampling.
+- [Model and data code](boomer/) — models, data loaders, flow matching, and sampling.
 - [`train.py`](train.py) — Lightning training entry point.
 - [`tools/`](tools/) — caching, sampling, evaluation, and Hugging Face export.
 - [`tests/`](tests/) — regression coverage.
@@ -85,8 +84,9 @@ python -m pytest tests/ -q
 python tools/gen_modeling_file.py --check
 ```
 
-Edit the model under `boomer/models/`; regenerate `modeling_boomer_fla.py` with
-`python tools/gen_modeling_file.py` after model changes.
+Edit the [model source](boomer/models/); regenerate the
+[export model](modeling_boomer_fla.py) with `python tools/gen_modeling_file.py`
+after model changes.
 
 ## License
 
