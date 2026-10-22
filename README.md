@@ -70,8 +70,9 @@ The 1024px fine-tuning phase used
 [`ma-xu/fine-t2i`](https://huggingface.co/datasets/ma-xu/fine-t2i), also streamed
 from Hugging Face.
 
-The [training guide](docs/training.md) covers the 512px MONET, 1024px MONET,
-and 1024px FineT2I phases.
+Launch commands: [512px MONET](docs/training.md#512px-monet),
+[1024px MONET](docs/training.md#1024px-monet), and
+[1024px FineT2I](docs/training.md#1024px-finet2i).
 
 ## Code
 
