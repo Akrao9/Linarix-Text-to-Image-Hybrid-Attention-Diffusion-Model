@@ -10,19 +10,22 @@ text conditioning comes from frozen Qwen3.5-4B features and images use DC-AE lat
 [Demo](https://huggingface.co/spaces/akrao9/Linarix-v2-T2I) ·
 [Training](docs/training.md)
 
+<!-- Paste the showcase image from the Hugging Face model card here. -->
+
 ## Setup
 
-Use Linux with an NVIDIA GPU and a CUDA-compatible PyTorch installation. Install
-the project and the FLA revision used by V8:
+For inference, use Linux with an NVIDIA GPU and a CUDA-compatible PyTorch
+installation:
 
 ```bash
-python -m pip install -e .
-python -m pip install --no-deps "git+https://github.com/fla-org/flash-linear-attention.git@3c4c54ae7397d37130d7101edd0f4eb596af896d"
-python -m pip install --no-build-isolation causal-conv1d
+python -m pip install -U "diffusers>=0.38.0" transformers accelerate safetensors torchvision scipy
+python -m pip install "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@3c4c54ae7397d37130d7101edd0f4eb596af896d"
 ```
 
-CUDA extensions must match your Python, PyTorch, and CUDA versions. See the
-[training guide](docs/training.md) for the training environment and optional dependencies.
+FLA is required for the linear mixers and Block AttnRes. Image attention uses
+PyTorch SDPA. The Hugging Face model bundles STORK and its coefficient files;
+inference needs no separate `flash-attn` or STORK installation. Training setup is
+documented in the [training guide](docs/training.md).
 
 ## Generate
 
@@ -46,8 +49,13 @@ image = pipe(
 image.save("lighthouse.png")
 ```
 
-The export supplies the resolution, text readout, and sampling defaults. The
-published Linarix checkpoint generates at 1024px.
+The published checkpoint uses EMA weights and generates at 1024px. Defaults are
+STORK-4, 20 steps, `derivative_order=1`, `substeps=14`, `cfg_scale=4.0`,
+`cfg_rescale=0.5`, guidance interval `[0.1, 0.9]`, and `flow_shift=5.0`.
+
+Qwen and DC-AE download from their upstream repositories on first use. Pass a list
+of prompts for batched inference. VAE slicing is enabled by default. For throughput
+benchmarks, pass `offload_text_encoder=False` to keep the text encoder on the GPU.
 
 ## Train
 
