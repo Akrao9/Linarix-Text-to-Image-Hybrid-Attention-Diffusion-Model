@@ -49,11 +49,10 @@ Effective batch is per-device batch × gradient accumulation on one GPU.
 | `512` | MONET parquet latents, six-source mix | 512 | 64 × 2 | 1e-4 | 300,000 |
 | `1024-monet` | MONET synthetic images | 1024 | 16 × 4 | 2e-5 | 50,000 |
 | `1024-finet2i` | FineT2I synthetic / curated, 75% / 25% | 1024 | 16 × 4 | 2e-5 | 35,000 |
-| `2048` | MONET diffusion-aesthetic-4k images | 2048 | 4 × 16 | 5e-6 | 1,000 |
 
-The intended sequence is `512` → `1024-monet` → `1024-finet2i` → `2048`.
-The source runs used step 245,000 from 512, step 47,500 from 1024 MONET, and
-step 35,000 from FineT2I to seed the next phase. The 2048 phase remains experimental.
+The training sequence is `512` → `1024-monet` → `1024-finet2i`.
+Step 245,000 from 512 seeded the 1024 MONET phase; step 47,500 from 1024 MONET
+seeded FineT2I fine-tuning. The published model uses the step 35,000 FineT2I EMA.
 
 512 training reuses MONET's precomputed DC-AE latents. The higher-resolution
 phases decode source images and run the frozen DC-AE encoder in chunks on the GPU.

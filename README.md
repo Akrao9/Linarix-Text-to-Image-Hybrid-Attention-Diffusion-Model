@@ -47,23 +47,23 @@ image.save("lighthouse.png")
 ```
 
 The export supplies the resolution, text readout, and sampling defaults. The
-published Linarix checkpoint generates at 1024px; 2048px finishing is experimental.
+published Linarix checkpoint generates at 1024px.
 
 ## Train
 
 The MONET training phases streamed
 [`jasperai/monet`](https://huggingface.co/datasets/jasperai/monet), version `v1.2.0`,
 directly from Hugging Face during training. The 512px phase read MONET's precomputed
-DC-AE latents from Parquet shards. The 1024px MONET phase and experimental 2048px
-finishing phase streamed image TAR shards and encoded the images with DC-AE on the
-GPU. Captions were encoded with frozen Qwen during training.
+DC-AE latents from Parquet shards. The 1024px MONET phase streamed image TAR shards
+and encoded the images with DC-AE on the GPU. Captions were encoded with frozen
+Qwen during training.
 
 The 1024px fine-tuning phase used
 [`ma-xu/fine-t2i`](https://huggingface.co/datasets/ma-xu/fine-t2i), also streamed
 from Hugging Face.
 
 The [training guide](docs/training.md) covers the 512px MONET, 1024px MONET,
-1024px FineT2I, and experimental 2048px phases.
+and 1024px FineT2I phases.
 
 ## Code
 

@@ -36,7 +36,6 @@ attention. Its total attention cost is not linear in image-token count.
 | --- | --- | --- | --- |
 | 512px | 16 × 16 | 256 | 1.0 |
 | 1024px | 32 × 32 | 1024 | 2.0 |
-| 2048px | 64 × 64 | 4096 | 4.0 |
 
 ## Training and inference
 
