@@ -385,7 +385,12 @@ def test_every_text_encoder_arg_is_forwarded_to_boomerlit() -> None:
     """
     import ast
 
-    tree = ast.parse((ROOT / "train.py").read_text())
+    import inspect
+
+    from boomer.training.cli import build_parser
+    from boomer.training.runner import main
+
+    tree = ast.parse(inspect.getsource(build_parser) + "\n" + inspect.getsource(main))
 
     parsed: set[str] = set()
     forwarded: set[str] = set()

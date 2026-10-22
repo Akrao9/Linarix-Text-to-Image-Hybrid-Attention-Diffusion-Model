@@ -3,6 +3,12 @@
 `train.py` is the training entry point. These are the V8 experiment settings;
 notebooks and saved experiment outputs stay local.
 
+The implementation lives under `boomer/training/`: `module.py` contains the
+Lightning module, `data.py` selects loaders, `cli.py` defines arguments,
+`config.py` builds model configuration, `callbacks/` handles EMA, previews, and
+checkpoints, and `runner.py` wires the components together. Existing CLI commands
+and imports such as `from train import BoomerLit` continue to work.
+
 ## Environment
 
 Training uses Linux, an NVIDIA GPU, and CUDA-compatible PyTorch. The original V8

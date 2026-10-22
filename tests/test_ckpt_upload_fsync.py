@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import train  # noqa: E402
+from boomer.training.callbacks import checkpoints as checkpoint_callbacks  # noqa: E402
 
 
 def _cb(tmp_path: Path) -> "train.CheckpointUploadCallback":
@@ -39,7 +40,7 @@ def test_upload_one_copies_and_fsyncs_file_and_dir(tmp_path) -> None:
     src = _write_ckpt(cb, "boomer-step=100.ckpt", b"weights" * 1000)
 
     fsynced: list[int] = []
-    with mock.patch.object(train.os, "fsync", side_effect=lambda fd: fsynced.append(fd)):
+    with mock.patch.object(checkpoint_callbacks.os, "fsync", side_effect=lambda fd: fsynced.append(fd)):
         cb._upload_one(src)
 
     dest = Path(cb.remote) / src.name
@@ -56,7 +57,7 @@ def test_upload_one_survives_mount_without_fsync(tmp_path) -> None:
     cb = _cb(tmp_path)
     Path(cb.remote).mkdir()
     src = _write_ckpt(cb, "boomer-step=200.ckpt", b"x" * 500)
-    with mock.patch.object(train.os, "fsync", side_effect=OSError("fsync unsupported")):
+    with mock.patch.object(checkpoint_callbacks.os, "fsync", side_effect=OSError("fsync unsupported")):
         cb._upload_one(src)
     assert (Path(cb.remote) / src.name).read_bytes() == src.read_bytes()
 
@@ -68,7 +69,7 @@ def test_finalize_uploads_flushes_and_syncs(tmp_path) -> None:
     b = _write_ckpt(cb, "boomer-step=200.ckpt", b"b" * 10)
 
     synced = {"n": 0}
-    with mock.patch.object(train.os, "sync", side_effect=lambda: synced.__setitem__("n", synced["n"] + 1)):
+    with mock.patch.object(checkpoint_callbacks.os, "sync", side_effect=lambda: synced.__setitem__("n", synced["n"] + 1)):
         cb.finalize_uploads(SimpleNamespace(global_rank=0))
 
     assert (Path(cb.remote) / a.name).exists()
@@ -85,5 +86,5 @@ def test_finalize_uploads_skips_sync_for_rclone(tmp_path) -> None:
         checkpoint_dir=str(local), remote="gdrive:Boomer/ckpts"
     )
     assert cb.use_rclone
-    with mock.patch.object(train.os, "sync", side_effect=AssertionError("must not sync")):
+    with mock.patch.object(checkpoint_callbacks.os, "sync", side_effect=AssertionError("must not sync")):
         cb.finalize_uploads(SimpleNamespace(global_rank=0))  # no local ckpts -> no-op

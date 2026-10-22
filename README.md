@@ -84,7 +84,7 @@ Launch commands: [512px MONET](docs/training.md#512px-monet),
 ## Code
 
 - [Model and data code](boomer/) — models, data loaders, flow matching, and sampling.
-- [`train.py`](train.py) — Lightning training entry point.
+- [`train.py`](train.py) — training entry point; components live in [`boomer/training/`](boomer/training/).
 - [`tools/`](tools/) — caching, sampling, evaluation, and Hugging Face export.
 - [`tests/`](tests/) — regression coverage.
 - [`Space/`](Space/) — Hugging Face demo.
