@@ -1,0 +1,5 @@
+# Collapse the generated export model in GitHub diffs.
+modeling_boomer_fla.py linguist-generated=true
+
+# Keep the upstream scheduler separate from original project code in GitHub stats.
+STORKScheduler.py linguist-vendored=true

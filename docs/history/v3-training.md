@@ -7,7 +7,7 @@ Hardware: **RTX PRO 6000 (96 GB, sm_120 Blackwell), 175 GB RAM, Colab Pro+** · 
 
 ## Data
 
-- **Corpus:** [`jasperai/monet`](https://huggingface.co/datasets/jasperai/monet) → cached to `hf://datasets/Akrao9/boomer-monet-cache/commoncatalog-cc-by/*.tar` (see [BOOMER_MONET_CACHE_CARD.md](BOOMER_MONET_CACHE_CARD.md)).
+- **Corpus:** [`jasperai/monet`](https://huggingface.co/datasets/jasperai/monet) → cached to `hf://datasets/Akrao9/boomer-monet-cache/commoncatalog-cc-by/*.tar` (see [MONET cache card](../datasets/monet-cache.md)).
 - **Cache complete:** ~5M samples (commoncatalog-cc-by), 4 GB WDS shards.
 - **Latents:** DC-AE f32c32, pre-scaled (scaling_factor 0.41407). Verified **global std ≈ 0.93, mean ≈ 0.07** → no extra normalization (`--latent-mean/--latent-std` left at 0/1).
 - **Captions:** **InternVL-3-8B** (gemini column is NULL on commoncatalog-cc-by; fallback chain selects it). 100% coverage, **0% truncated** at `--text-seq-len 224` (instr+template overhead ~48 tok, full p99 ≈ 178).

@@ -5,6 +5,23 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .ipynb_checkpoints/
+*.ipynb
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Credentials and local editor/agent state
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.claude/
+.codex/
+.codex_tmp/
+.agents/
 
 # Local/runtime artifacts
 wandb/
@@ -28,3 +45,11 @@ make_windowed_doc.py
 
 # local-only scratch/decks/docs
 archive/
+tmp/
+preview/
+Linarix-v1/
+boomer_quality_comparison/
+comparison_*/
+*_Application.md
+docs/v7.2-moe-spec.md
+tests/test_comparison_notebook.py
