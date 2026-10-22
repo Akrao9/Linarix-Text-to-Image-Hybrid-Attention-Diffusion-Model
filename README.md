@@ -66,6 +66,9 @@ DC-AE latents from Parquet shards. The 1024px MONET phase streamed image TAR sha
 and encoded the images with DC-AE on the GPU. Captions were encoded with frozen
 Qwen during training.
 
+At 512px, REPA weight was `0.25` for the first 100,000 steps. Training then resumed
+with REPA weight `0`; the 1024px phases also used REPA weight `0`.
+
 The 1024px fine-tuning phase used
 [`ma-xu/fine-t2i`](https://huggingface.co/datasets/ma-xu/fine-t2i), also streamed
 from Hugging Face.

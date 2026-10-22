@@ -41,9 +41,10 @@ Parquet or TAR shards as needed; a separate local training-cache build is not
 required. FineT2I likewise streams
 [`ma-xu/fine-t2i`](https://huggingface.co/datasets/ma-xu/fine-t2i) from the Hub.
 
-The commands below reproduce the notebook's training flags. Checkpoint paths and
-W&B names use portable names; Drive copying is optional. Run them from the project
-root in a Bash shell. Effective batch is batch size × accumulation on one GPU.
+The commands below use the notebook's model and training settings, with the 512px
+REPA schedule recorded from the training history. Checkpoint paths and W&B names
+use portable names; Drive copying is optional. Run them from the project root in
+a Bash shell. Effective batch is batch size × accumulation on one GPU.
 
 | Phase | Data | Image size | Batch × accumulation | LR | Configured step limit |
 | --- | --- | --- | --- | --- | --- |
@@ -61,12 +62,57 @@ The checkpoint sequence used for the published model is:
 
 512 training reads MONET's precomputed DC-AE latents. Both 1024 phases stream images
 and run the frozen DC-AE encoder on the GPU. Qwen encodes captions on the GPU in
-every phase. REPA is disabled (`--repa-weight 0`) throughout.
+every phase. At 512px, REPA weight was `0.25` for the first 100,000 optimizer steps,
+then training resumed with REPA weight `0`. Both 1024px phases use REPA weight `0`.
 
 ## 512px MONET
 
 Start from scratch with the six-source latent mix. Adjust batch size and
-accumulation for the available VRAM.
+accumulation for the available VRAM. The first launch below stops at step 100,000
+with a constant REPA weight of `0.25` (`--repa-anneal-steps 0`). `--monet-dino`
+explicitly enables MONET's precomputed DINOv2 targets for the alignment loss.
+
+```bash
+export WANDB_RUN_ID=linarix-512
+export WANDB_RESUME=allow
+
+python -u train.py \
+  --monet-direct --monet-dino --devices 1 \
+  --cache-wds 'hf://datasets/jasperai/monet/v1.2.0/synthetic/*/*/*.parquet,hf://datasets/jasperai/monet/v1.2.0/cc12m/*/*.parquet,hf://datasets/jasperai/monet/v1.2.0/megalith10m/*/*.parquet,hf://datasets/jasperai/monet/v1.2.0/laion/*/*.parquet,hf://datasets/jasperai/monet/v1.2.0/coyo/*/*.parquet,hf://datasets/jasperai/monet/v1.2.0/commoncatalog-cc-by/*/*.parquet' \
+  --monet-weights 0.15,0.10,0.15,0.30,0.15,0.15 \
+  --monet-caption-probs '0,0,0,0,1;.25,.25,.25,.25,0;.25,.25,.25,.25,0;.25,.25,.25,.25,0;.25,.25,.25,.25,0;.25,.25,.25,.25,0' \
+  --text-encoder-id Qwen/Qwen3.5-4B --text-encoder-layers 9,18,27 --text-encoder-max-length 320 \
+  --text-encoder-instruction --compile-text-encoder --hf-token true --latent-channels 32 --latent-size 16 \
+  --extra-input-channels 33 --latent-mean 0.0 --latent-std 1.0 --num-workers 16 --prefetch-factor 4 \
+  --persistent-workers --pin-memory --wds-shuffle-buffer 20000 --parquet-read-batch-size 64 \
+  --parquet-range-mib 128 --hidden-dim 1152 --depth 28 --ddt-decoder-depth 6 --num-heads 18 --mlp-ratio 2.5 \
+  --mixer-type fla_gdn2 --fla-mode chunk --fla-bidirectional --use-short-conv --conv-size 4 \
+  --image-attn-every 0 --image-attn-backend flash2 --image-rope --image-rope-theta 10000 \
+  --cross-attn-backend sdpa --image-attn-qk-rmsnorm --cross-attn-qk-rmsnorm --joint-attn-backend sdpa \
+  --ddt-norm-impl native --shared-adaln --fourier-timestep --hilbert-order --parallel-block \
+  --dual-stream-depth 4 --multimodal-coord-ids --joint-refresh-attn --refresh-layers 7,11,15,21 \
+  --refresh-no-mixer --block-attnres --sandwich-rmsnorm --rope-ntk-factor 1.0 --no-abs-pos-embed --y-norm \
+  --y-norm-scale-factor 0.01 --patch-size 1 --repa-dim 1536 --repa-layer 7 --repa-weight 0.25 \
+  --repa-anneal-steps 0 --batch-size 64 --accumulate 2 --optimizer cmuon --lr 1e-4 --weight-decay 0.0 \
+  --beta1 0.9 --beta2 0.95 --fused-adamw --grad-clip 1.0 --lr-scheduler linear-warmup-constant \
+  --warmup-steps 5000 --cond-dropout 0.1 --t-sampler logit-normal --logit-mean 0.0 --logit-std 1.0 \
+  --flow-shift 1.5 --min-snr-gamma 0 --t-sampler-final uniform --t-sampler-final-step 300000 \
+  --ema-decay 0.9999 --ema-update-every 1 --dtype bf16 --max-steps 100000 --seed 42 --compile \
+  --compile-mode default --checkpoint-dir checkpoints/v8-512 --save-every-steps 5000 \
+  --checkpoint-local-retain 2 --checkpoint-keep-uploaded 10 --sample-every-steps 10000 \
+  --sample-prompts-file eval_prompts.txt --sample-weights ema --sample-steps 20 --sample-sampler stork4 \
+  --sample-stork-derivative-order 1 --sample-stork-substeps 9 --sample-flow-shift 5 --sample-cfg-scale 3.0 \
+  --sample-cfg-rescale 0.5 --sample-cfg-interval-low 0.1 --sample-cfg-interval-high 0.9 --sample-seed 42 \
+  --log-every-steps 50 --wandb --wandb-project linarix --wandb-run-name linarix-512
+```
+
+### Continue 512px with REPA disabled
+
+At step 100,000, resume the same run with `--repa-weight 0`. This is a full resume:
+retain optimizer, scheduler, EMA, and global step. Keep `--repa-dim 1536` and the
+same model layout so checkpoint tensor shapes match. The continuation keeps the
+notebook's overall `--max-steps 300000` limit; the checkpoint used to seed 1024px
+was step 245,000.
 
 ```bash
 export WANDB_RUN_ID=linarix-512
@@ -99,7 +145,8 @@ python -u train.py \
   --sample-prompts-file eval_prompts.txt --sample-weights ema --sample-steps 20 --sample-sampler stork4 \
   --sample-stork-derivative-order 1 --sample-stork-substeps 9 --sample-flow-shift 5 --sample-cfg-scale 3.0 \
   --sample-cfg-rescale 0.5 --sample-cfg-interval-low 0.1 --sample-cfg-interval-high 0.9 --sample-seed 42 \
-  --log-every-steps 50 --wandb --wandb-project linarix --wandb-run-name linarix-512
+  --log-every-steps 50 --wandb --wandb-project linarix --wandb-run-name linarix-512 \
+  --resume checkpoints/v8-512/boomer-step=100000.ckpt
 ```
 
 ## Prepare an EMA seed
@@ -265,8 +312,9 @@ phase, for example:
 
 Omit `--resume-weights-only` on a full resume so optimizer, scheduler, global step,
 and EMA are restored. Keep the rest of the phase's command unchanged. For an
-interrupted 512 run, append `--resume checkpoints/v8-512/boomer-step=STEP.ckpt`
-to its original command.
+interrupted 512 run, choose the REPA-enabled or REPA-disabled command according
+to the checkpoint step, and resume from `checkpoints/v8-512/boomer-step=STEP.ckpt`.
+At or after step 100,000, use the REPA-disabled continuation.
 
 Keep the phase's `WANDB_RUN_ID` when resuming so W&B continues the same run.
 Use a new ID and checkpoint directory for a separate experiment.

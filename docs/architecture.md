@@ -43,6 +43,10 @@ Training interpolates clean latents toward Gaussian noise:
 `x_t = (1 - t) * x_0 + t * noise`. The velocity target is `noise - x_0`.
 The V8 recipes use CMuon with auxiliary AdamW and an EMA of the denoiser.
 
+512px training also used REPA alignment to MONET's precomputed DINOv2 features,
+with weight `0.25` for the first 100,000 steps. It then resumed with REPA weight
+`0`, which was also used for both 1024px phases.
+
 The training model reserves 33 extra input channels for a masked latent and mask.
 Text-to-image training supplies zeros there. The text-to-image export removes
 those columns and the optional REPA head.
