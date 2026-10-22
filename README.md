@@ -10,6 +10,8 @@ text conditioning comes from frozen Qwen3.5-4B features and images use DC-AE lat
 [Demo](https://huggingface.co/spaces/akrao9/Linarix-v2-T2I) ·
 [Training](docs/training.md)
 
+
+![Linarix-v2 samples](showcase.png)
 <!-- Paste the showcase image from the Hugging Face model card here. -->
 
 ## Setup
