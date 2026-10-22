@@ -4,7 +4,8 @@ Hybrid linear-attention diffusion for text-to-image generation.
 
 Linarix combines a bidirectional GatedDeltaNet-2 condition encoder with a
 full-attention DDT velocity decoder. The denoiser has approximately 890M parameters;
-text conditioning comes from frozen Qwen3.5-4B features and images use DC-AE latents.
+text conditioning comes from frozen Qwen3.5-4B features. Image decoding uses
+[SANA 1.1 DC-AE f32c32](https://huggingface.co/mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers).
 
 [Model weights](https://huggingface.co/akrao9/Linarix-v2) ·
 [Demo](https://huggingface.co/spaces/akrao9/Linarix-v2-T2I) ·

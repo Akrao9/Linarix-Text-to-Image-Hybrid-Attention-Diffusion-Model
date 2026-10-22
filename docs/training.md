@@ -65,6 +65,10 @@ and run the frozen DC-AE encoder on the GPU. Qwen encodes captions on the GPU in
 every phase. At 512px, REPA weight was `0.25` for the first 100,000 optimizer steps,
 then training resumed with REPA weight `0`. Both 1024px phases use REPA weight `0`.
 
+The frozen autoencoder is
+[SANA 1.1 DC-AE f32c32](https://huggingface.co/mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers),
+with 32 latent channels and 32× spatial compression.
+
 ## 512px MONET
 
 Start from scratch with the six-source latent mix. Adjust batch size and

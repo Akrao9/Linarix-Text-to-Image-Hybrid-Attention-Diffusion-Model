@@ -13,7 +13,7 @@ approximately 890M parameters; Qwen and DC-AE are frozen components.
 | Residual routing | Block AttnRes over encoder block contributions |
 | Text | Qwen3.5-4B layers 9, 18, 27; normalized and concatenated to 7680 features |
 | Text length | 320 tokens, including instruction and chat template |
-| Image latent | DC-AE f32c32; 32 channels and 32× spatial compression |
+| Image latent | [SANA 1.1 DC-AE f32c32](https://huggingface.co/mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers); 32 channels and 32× spatial compression |
 
 ## Forward pass
 
