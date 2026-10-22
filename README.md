@@ -11,7 +11,8 @@ text conditioning comes from frozen Qwen3.5-4B features and images use DC-AE lat
 [Training](docs/training.md)
 
 
-![Linarix-v2 samples](showcase.png)
+<img width="2048" height="1536" alt="showcase" src="https://github.com/user-attachments/assets/13021b6c-1bec-4c4f-a8f1-d83375a16849" />
+
 <!-- Paste the showcase image from the Hugging Face model card here. -->
 
 ## Setup
