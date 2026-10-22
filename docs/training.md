@@ -35,6 +35,12 @@ git clone https://github.com/ZT220501/STORK.git ../STORK
 
 ## Phases
 
+The MONET phases stream [`jasperai/monet`](https://huggingface.co/datasets/jasperai/monet)
+`v1.2.0` directly from the Hugging Face Hub during training. The loaders read remote
+Parquet or TAR shards as needed; a separate local training-cache build is not
+required. The FineT2I phase likewise streams
+[`ma-xu/fine-t2i`](https://huggingface.co/datasets/ma-xu/fine-t2i) from the Hub.
+
 These are the command settings extracted from the V8 experiment notebook.
 Effective batch is per-device batch × gradient accumulation on one GPU.
 

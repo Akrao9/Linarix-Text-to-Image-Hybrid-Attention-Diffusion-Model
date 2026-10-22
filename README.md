@@ -1,10 +1,11 @@
-# Boomer
+# Linarix
 
 Hybrid linear-attention diffusion for text-to-image generation.
 
-Boomer V8 combines a bidirectional GatedDeltaNet-2 condition encoder with a
-full-attention DDT velocity decoder. The denoiser has approximately 890M parameters;
-text conditioning comes from frozen Qwen3.5-4B features and images use DC-AE latents.
+Linarix-v2 uses the Boomer V8 architecture: a bidirectional GatedDeltaNet-2 condition
+encoder and a full-attention DDT velocity decoder. The denoiser has approximately
+890M parameters; text conditioning comes from frozen Qwen3.5-4B features and images
+use DC-AE latents.
 
 [Model weights](https://huggingface.co/Akrao9/Linarix-v2) ·
 [Demo](https://huggingface.co/spaces/akrao9/Linarix-v2-T2I) ·
@@ -51,6 +52,17 @@ published Linarix-v2 checkpoint generates at 1024px; 2048px finishing is experim
 
 ## Train
 
+The MONET training phases streamed
+[`jasperai/monet`](https://huggingface.co/datasets/jasperai/monet), version `v1.2.0`,
+directly from Hugging Face during training. The 512px phase read MONET's precomputed
+DC-AE latents from Parquet shards. The 1024px MONET phase and experimental 2048px
+finishing phase streamed image TAR shards and encoded the images with DC-AE on the
+GPU. Captions were encoded with frozen Qwen during training.
+
+The 1024px fine-tuning phase used
+[`ma-xu/fine-t2i`](https://huggingface.co/datasets/ma-xu/fine-t2i), also streamed
+from Hugging Face.
+
 The [training guide](docs/training.md) covers the 512px MONET, 1024px MONET,
 1024px FineT2I, and experimental 2048px phases.
 
@@ -63,7 +75,7 @@ The [training guide](docs/training.md) covers the 512px MONET, 1024px MONET,
 - [`Space/`](Space/) — Hugging Face demo.
 
 Architecture details are in [docs/architecture.md](docs/architecture.md).
-Earlier dataset cards and run notes live in [docs/](docs/).
+Historical cache dataset cards and run notes live in [docs/](docs/).
 
 ## Development
 
